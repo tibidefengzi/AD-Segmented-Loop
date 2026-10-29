@@ -1,0 +1,11 @@
+[project]
+name = "ad-segmented-loop"
+version = "0.4.9"
+description = "分段循环：素材时间线、逐段生成与审核、持久化进度"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-only"}
+dependencies = ["numpy>=1.24", "av>=14", "scipy>=1.10", "imageio-ffmpeg>=0.5", "librosa>=0.10"]
+
+[tool.comfy]
+DisplayName = "AD-Segmented-Loop"
+Icon = ""

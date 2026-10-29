@@ -1,0 +1,6 @@
+numpy>=1.24
+av>=14
+scipy>=1.10
+imageio-ffmpeg>=0.5
+# torch and torchaudio must match the existing ComfyUI installation.
+librosa>=0.10
