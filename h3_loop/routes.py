@@ -11,6 +11,8 @@ import re
 import shutil
 from urllib.parse import urlsplit
 import uuid
+from collections import OrderedDict
+import copy
 
 from aiohttp import web
 from server import PromptServer
@@ -34,7 +36,7 @@ def _storage_busy():
 async def storage_usage(request):
     result = await asyncio.to_thread(cleanup.usage)
     result["busy"] = _storage_busy()
-    return web.json_response(result)
+    return web.json_response(result, headers={"Cache-Control":"no-store, max-age=0"})
 
 
 async def startup_storage_cleanup(app):
@@ -96,6 +98,9 @@ async def clear_storage_cache(request):
     confirmed = data.get("confirmed") is True
     if _storage_busy():
         return web.json_response({"error": "当前有任务运行或排队，请完成后再清理缓存"}, status=409)
+    if confirmed:
+        from .assets import PREPARED_MEDIA
+        PREPARED_MEDIA.clear()
     result = await asyncio.to_thread(cleanup.clean_cache, confirmed)
     if result["blocked"]:
         return web.json_response({"error": "有任务进行中或进度无法核对，已保留缓存"}, status=409)
@@ -232,7 +237,8 @@ async def open_folder(request):
     from . import layout
     data = await request.json()
     mode = str(data.get("mode") or "input")
-    folder = layout.active_output_library() if mode == "generated" else layout.active_input_library()
+    libraries = layout.output_libraries() if mode == "generated" else layout.input_libraries()
+    folder = libraries[0] if libraries else None
     if folder is None:
         raise ValueError("找不到 ComfyUI 的 input/output 目录")
     folder.mkdir(parents=True, exist_ok=True)
@@ -380,11 +386,12 @@ async def library_pick(request):
     libraries = [library for library in libraries if library is not None]
     if not libraries:
         raise ValueError("找不到 ComfyUI 的素材目录")
-    folder = next((library for library in libraries if library.is_dir()), libraries[0])
+    folder = libraries[0]
+    folder.mkdir(parents=True, exist_ok=True)
     patterns = tuple(f"*{suffix}" for suffix in sorted(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS))
     from .dialogs import pick_files
     selected = await asyncio.to_thread(pick_files, str(folder),
-                                       "选择生成结果" if mode == "generated" else "选择素材", patterns)
+                                       "打开", patterns)
     selected = [item for item in selected if item]
     if not selected:
         return web.json_response({"sources": [], "mode": mode, "cancelled": True})
@@ -576,7 +583,10 @@ async def manifest(request):
 
 
 def public_state(state):
-    return {key: value for key, value in state.items() if key not in {"template", "active"}}
+    result = {key: value for key, value in state.items() if key not in {"template", "active", "retired_segments", "run_origins"}}
+    active = state.get("active") or {}
+    result["execution"] = {"index": active.get("index"), "prompt_id": active.get("prompt_id")}
+    return result
 
 
 @routes.get("/aiden_h3/session/{session_id}")
@@ -635,8 +645,7 @@ async def sync_from_graph(data):
 @routes.post("/aiden_h3/save_to_desktop")
 @guarded
 async def save_to_desktop(request):
-    """把预览中的素材复制到系统桌面（AD-H3下载 文件夹）。"""
-    import platform
+    """把预览中的素材复制到当前用户桌面的 AD-生成 文件夹。"""
     import shutil
     from pathlib import Path
     data = await request.json()
@@ -655,14 +664,8 @@ async def save_to_desktop(request):
     source = next((path for path in candidates if path.is_file()), None)
     if source is None:
         raise ValueError(f"找不到素材文件：{name}")
-    if platform.system() == "Windows":
-        desktop = Path.home() / "Desktop"
-        if not desktop.is_dir():
-            import os
-            desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
-    else:
-        desktop = Path.home() / "Desktop"
-    target_dir = desktop / "AD-H3下载"
+    from .save_target import default_directory
+    target_dir = default_directory()
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / source.name
     counter = 1
@@ -781,8 +784,8 @@ async def action(request):
         except Exception:
             pass
     else:
-        state = STORE.action(session_id, command, **{k: data[k] for k in ("confirmed", "index", "version", "merge_options", "reason", "preview_id") if k in data})
-        if command in {"start", "redo", "approve", "auto"}:
+        state = STORE.action(session_id, command, **{k: data[k] for k in ("confirmed", "index", "indices", "version", "merge_options", "reason", "preview_id") if k in data})
+        if command in {"start", "redo", "approve", "auto"} and data.get("frontend_queue") is not True:
             template = state.get("template") or {}
             has_commit = any(node.get("class_type") == "AidenH3Commit" for node in (template.get("prompt") or {}).values())
             # 纯预览/外部工作流：没有结果记录节点时不在后端重复排队，由预览侧“开始/分段循环”驱动
@@ -862,8 +865,11 @@ async def pick_save_path(request):
     """弹出标准 Windows「另存为」框，返回用户选择的绝对路径（取消为空）。"""
     from .dialogs import save_file as choose_save_file
     data = await request.json()
+    from .save_target import configured_directory
+    initial_dir = configured_directory(data.get("initial_dir"))
+    initial_dir.mkdir(parents=True, exist_ok=True)
     path = await asyncio.to_thread(choose_save_file, str(data.get("default_name") or ""),
-                                   str(data.get("initial_dir") or ""), "选择保存位置",
+                                   str(initial_dir), "另存为",
                                    (".mp4", ".png", ".jpg", ".jpeg", ".webp", ".wav", ".mp3", ".flac"))
     return web.json_response({"path": path or ""})
 
@@ -873,7 +879,11 @@ async def pick_save_path(request):
 async def pick_folder(request):
     """弹出系统文件夹选择框（服务端桌面会话；不依赖 tkinter）。"""
     from .dialogs import pick_folder as choose_folder_dialog
-    path = await asyncio.to_thread(choose_folder_dialog, "", "选择保存文件夹")
+    data = await request.json()
+    from .save_target import configured_directory
+    initial_dir = configured_directory(data.get("initial_dir"))
+    initial_dir.mkdir(parents=True, exist_ok=True)
+    path = await asyncio.to_thread(choose_folder_dialog, str(initial_dir), "选择保存文件夹")
     return web.json_response({"path": path or ""})
 
 
@@ -940,6 +950,31 @@ async def thumb(request):
     return response
 
 
+_DETECTION_CACHE = OrderedDict()
+_DETECTION_TASKS = {}
+
+
+async def _cached_detection(path, kind, options, retained, worker, *args, **kwargs):
+    stamp = path.stat()
+    key = digest([str(path.resolve()), stamp.st_mtime_ns, stamp.st_size, kind, options, retained])
+    if key in _DETECTION_CACHE:
+        _DETECTION_CACHE.move_to_end(key)
+        return copy.deepcopy(_DETECTION_CACHE[key])
+    task = _DETECTION_TASKS.get(key)
+    if task is None:
+        task = asyncio.create_task(asyncio.to_thread(worker, *args, **kwargs))
+        _DETECTION_TASKS[key] = task
+    try:
+        result = await asyncio.shield(task)
+        _DETECTION_CACHE[key] = copy.deepcopy(result)
+        while len(_DETECTION_CACHE) > 16:
+            _DETECTION_CACHE.popitem(last=False)
+        return copy.deepcopy(result)
+    finally:
+        if task.done():
+            _DETECTION_TASKS.pop(key, None)
+
+
 @routes.post("/aiden_h3/detect_cuts")
 @guarded
 async def detect_cuts(request):
@@ -955,23 +990,25 @@ async def detect_cuts(request):
     if not path.is_file():
         raise ValueError("素材文件不存在，请重新导入")
     options = data.get("options") or {}
+    retained = data.get("range") or {}
+    range_options = {"start_time": retained.get("start", 0), "end_time": retained.get("end")}
     if kind == "beats":
         mode = str(options.get("mode") or "beat")
         default_gap = 0.4 if mode == "beat" else 1.0
-        result = await asyncio.to_thread(detect_beats, path, mode,
+        result = await _cached_detection(path, kind, options, retained, detect_beats, path, mode,
                                          float(options.get("min_gap") or default_gap),
-                                         float(options.get("max_gap") or 15.0))
+                                         float(options.get("max_gap") or 15.0), **range_options)
     elif kind == "shots":
-        result = await asyncio.to_thread(detect_shots, path, float(options.get("threshold") or 0.3),
+        result = await _cached_detection(path, kind, options, retained, detect_shots, path, float(options.get("threshold") or 0.3),
                                          float(options.get("min_shot") or 1.0),
-                                         float(options.get("max_gap") or 15.0))
+                                         float(options.get("max_gap") or 15.0), **range_options)
     elif kind == "breaths":
-        result = await asyncio.to_thread(detect_breaths, path, float(options.get("sensitivity") or 0.5),
+        result = await _cached_detection(path, kind, options, retained, detect_breaths, path, float(options.get("sensitivity") or 0.5),
                                          float(options.get("min_seg") or 1.5),
                                          float(options.get("max_seg") or 15.0),
                                          float(options.get("min_breath") or 0.15),
                                          float(options.get("buffer") or 0.05),
-                                         bool(options.get("vocals")))
+                                         bool(options.get("vocals")), **range_options)
     else:
         raise ValueError("未知的检测类型")
     result["kind"] = kind

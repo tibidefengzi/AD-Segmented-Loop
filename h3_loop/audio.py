@@ -51,6 +51,49 @@ def load_audio(path):
     return _decode(str(path), stat.st_mtime_ns, stat.st_size)
 
 
+@lru_cache(maxsize=2)
+def _decode_range(path, modified, size, first, last):
+    """Seek to the retained audio range; no resampling, re-encoding or temporary file."""
+    import av
+    import torch
+    from comfy_extras.nodes_audio import f32_pcm
+    chunks = []
+    with av.open(path) as media:
+        if not media.streams.audio:
+            raise ValueError("素材没有音轨")
+        stream = media.streams.audio[0]
+        rate = int(stream.codec_context.sample_rate)
+        channels = stream.codec_context.channels
+        origin = (stream.start_time or 0) * stream.time_base
+        lo, hi = round(first * rate), round(last * rate)
+        if first > 0:
+            media.seek(int(max(0, first - .1) / stream.time_base) + (stream.start_time or 0), stream=stream, backward=True)
+        for frame in media.decode(audio=0):
+            if frame.pts is None:
+                raise ValueError("音频缺少定位时间戳")
+            offset = round(float(frame.pts * frame.time_base - origin) * rate)
+            if offset >= hi:
+                break
+            start, end = max(0, lo - offset), min(frame.samples, hi - offset)
+            if end <= start:
+                continue
+            wave = torch.from_numpy(frame.to_ndarray())
+            if wave.shape[0] != channels:
+                wave = wave.view(-1, channels).t()
+            chunks.append(f32_pcm(wave[:, start:end]))
+    if not chunks:
+        raise ValueError("裁后音频范围没有有效样本")
+    return {"waveform": torch.cat(chunks, dim=-1).unsqueeze(0), "sample_rate": rate}
+
+
+def load_audio_range(path, first, last):
+    path = Path(path)
+    stat = path.stat()
+    from .assets import cached_media
+    return cached_media("source-audio-range", path, [float(first), float(last)],
+                        lambda: _decode_range(str(path), stat.st_mtime_ns, stat.st_size, float(first), float(last)))
+
+
 def read_audio_entry(entry):
     if "timeline_audio" in entry:
         return read_timeline_audio(entry)
@@ -90,6 +133,14 @@ def _match_channels(chunk, channels):
 
 
 def read_timeline_audio(entry):
+    from .assets import cached_media
+    tracks = entry["timeline_audio"]["tracks"]
+    sources = [piece for lane in tracks for piece in lane]
+    return cached_media("timeline-audio", sources, [tracks, entry["seconds_float"]],
+                        lambda: _read_timeline_audio(entry))
+
+
+def _read_timeline_audio(entry):
     """段音频：各音频轨在段区间内的片段按时间线位置混音，空缺补静音。"""
     import torch
     spec = entry["timeline_audio"]
@@ -125,6 +176,11 @@ def read_timeline_audio(entry):
 
 
 def read_pieces(pieces):
+    from .assets import cached_media
+    return cached_media("reference-audio-pieces", pieces, pieces, lambda: _read_pieces(pieces))
+
+
+def _read_pieces(pieces):
     """参考口内容：片段按时间线顺序直接拼接，不补静音。"""
     import torch
     chunks = [chunk for chunk in (_piece_chunk(piece) for piece in pieces) if chunk is not None]

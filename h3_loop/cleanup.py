@@ -65,9 +65,10 @@ def _files(root):
                     except OSError: continue
         except OSError: continue
 
-def _dir_usage(root):
+def _dir_usage(root, seen=None):
     """按实际数据块统计：硬链接去重后的多个文件名只算一次占用。"""
-    seen, total, count = set(), 0, 0
+    seen = set() if seen is None else seen
+    total, count = 0, 0
     for _, info in _files(root):
         key = (getattr(info, 'st_dev', 0), getattr(info, 'st_ino', 0))
         if key[1] and key in seen:
@@ -211,13 +212,19 @@ def plan_cache(min_age=CACHE_MIN_AGE):
 
 def usage(include_cache=True):
     media_bytes=sessions_bytes=frame_bytes=staging_bytes=media_files=sessions_files=0
+    seen = set()
     for root in _roots():
-        size,count=_dir_usage(root/'media'); media_bytes+=size; media_files+=count
-        size,count=_dir_usage(root/'sessions'); sessions_bytes+=size; sessions_files+=count
-        size,_=_dir_usage(root/'frame-cache'); frame_bytes+=size
-        staging_bytes+=sum(info.st_size for _,info in _files(root/'import-staging') if time.time()-info.st_mtime>=CACHE_MIN_AGE)
+        size,count=_dir_usage(root/'media', seen); media_bytes+=size; media_files+=count
+        size,count=_dir_usage(root/'sessions', seen); sessions_bytes+=size; sessions_files+=count
+        size,_=_dir_usage(root/'frame-cache', seen); frame_bytes+=size
+        for _, info in _files(root/'import-staging'):
+            if time.time()-info.st_mtime < CACHE_MIN_AGE: continue
+            key = (getattr(info, 'st_dev', 0), getattr(info, 'st_ino', 0))
+            if key[1] and key in seen: continue
+            if key[1]: seen.add(key)
+            staging_bytes += info.st_size
     imported=import_root()
-    import_bytes,import_files=_dir_usage(imported) if imported else (0,0)
+    import_bytes,import_files=_dir_usage(imported, seen) if imported else (0,0)
     used=media_bytes+sessions_bytes+frame_bytes+staging_bytes+import_bytes
     limit=int(default_limit_gb()*1024**3)
     return {'used_bytes':used,'limit_bytes':limit,'percent':round(used/limit,4),

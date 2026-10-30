@@ -118,10 +118,12 @@ const CSS = `
 .ad-glass .h3-max-frames-input{width:50px!important}
 .ad-glass .h3-split-group .h3-unit button{min-height:26px;height:26px;padding:0 5px}
 .ad-glass [data-apply-split]{height:26px!important;padding:0 8px!important}
-.ad-glass .h3-inspector-meta{justify-content:center!important;text-align:center;gap:18px!important;flex-wrap:nowrap!important}
-.ad-glass .h3-inspector-name{flex:0 1 auto;max-width:44%;text-align:center}
-.ad-glass .h3-inspector-selection{flex:0 1 auto;max-width:44%;text-align:center}
-.ad-glass .h3-inspector-selection .h3-selection-summary{text-align:center!important}
+.ad-glass .h3-inspector-meta{justify-content:flex-start!important;text-align:left;gap:16px!important;flex-wrap:nowrap!important;box-sizing:border-box;max-width:100%;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
+.ad-glass .h3-inspector-name,.ad-glass .h3-inspector-selection,.ad-glass .h3-inspector-frames{flex:0 0 auto;min-width:0;width:auto;max-width:none;text-align:left}
+.ad-glass .h3-inspector-name,.ad-glass .h3-inspector-selection .h3-selection-summary{overflow:visible!important;text-overflow:clip!important;white-space:nowrap!important;font-size:12px!important;text-align:left!important;line-height:1.6}
+.ad-glass .h3-frame-summary{display:flex;flex-wrap:nowrap;gap:16px;font-size:12px;line-height:1.6;font-variant-numeric:tabular-nums;color:#dceaff;white-space:nowrap}
+.ad-glass .h3-frame-summary span{white-space:nowrap}
+.ad-glass .h3-inspector-meta .h3-recipe-meta{display:none!important}
 .ad-glass .h3-recipe-meta{justify-content:center!important;text-align:center}
 .ad-h3-tabs .ad-h3-preview-tools{position:static!important;right:auto!important;bottom:auto!important;margin-left:auto!important;z-index:auto;background:transparent!important;border:0!important;border-radius:0!important;padding:0!important;backdrop-filter:none!important;display:flex;gap:8px;align-items:center;flex:0 0 auto}
 .ad-h3-tabs .ad-h3-preview-tools button{min-height:26px;height:26px;font-size:12px;padding:0 10px}
@@ -323,8 +325,9 @@ export function mountGlassTimeline(root) {
     library.append(root.querySelector("[data-pool]"));
     const player=root.querySelector("[data-player]");
     const inspector=document.createElement("aside"); inspector.className="h3-glass-inspector"; inspector.setAttribute("aria-label","素材与分段设置");
-    inspector.innerHTML='<div class="h3-inline-segment-controls"></div><div class="h3-inspector-meta"><div class="h3-inspector-name" data-glass-source>素材信息：未选择素材</div><div class="h3-inspector-selection"></div></div>';
+    inspector.innerHTML='<div class="h3-inline-segment-controls"></div><div class="h3-inspector-meta"><div class="h3-inspector-name" data-glass-source>素材信息：未选择素材</div><div class="h3-inspector-selection"></div><div class="h3-inspector-frames"></div></div>';
     inspector.querySelector(".h3-inspector-selection").append(root.querySelector("[data-selection-summary]"));
+    inspector.querySelector(".h3-inspector-frames").append(root.querySelector("[data-frame-summary]"));
     inspector.querySelector(".h3-inline-segment-controls").append(root.querySelector(".h3-split-group"));
     inspector.querySelector(".h3-inspector-meta").append(root.querySelector(".h3-recipe-meta"));
     workspace.append(player); load.after(workspace);

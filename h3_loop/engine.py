@@ -66,6 +66,11 @@ def generation_graph(prompt, segment_node):
             node["inputs"].pop("h3_editor_state", None)
         elif node["class_type"] == "AidenH3VideoQueue":
             node["inputs"].pop("video_queue_state", None)  # Per-segment identity is added separately.
+        elif node["class_type"] == "AidenH3VideoPreview":
+            # 预览节点的播放器界面/保存下载配置只影响浏览与导出，不影响生成画面；
+            # 不能因为改保存目录/模板/只看B 就把整轮进度判为失效。
+            node["inputs"].pop("video_oasis_ui", None)
+            node["inputs"].pop("save_config", None)
     return digest(shape), commit, seen
 
 
@@ -125,6 +130,9 @@ def segment_signatures(prompt, segment_node, entries, fps, video_segments=None):
             # 若把它算进分段签名，每跑一段都会把整轮进度重置回第 1 段。
             for name in [name for name in inputs if "seed" in str(name).lower()]:
                 inputs.pop(name, None)
+            if node["class_type"] == "AidenH3VideoPreview":
+                inputs.pop("video_oasis_ui", None)
+                inputs.pop("save_config", None)
             shape[key] = {"class_type": node["class_type"], "inputs": inputs}
             asset=input_asset(node)
             if asset is not None:shape[key]["source_file"]=asset

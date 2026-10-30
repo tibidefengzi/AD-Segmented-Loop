@@ -10,12 +10,128 @@ import subprocess
 from pathlib import Path
 from collections import OrderedDict
 from threading import RLock
+from functools import lru_cache
+from concurrent.futures import Future
 
 _IMAGE_CACHE = OrderedDict()
 _IMAGE_CACHE_BYTES = 0
 _IMAGE_CACHE_LIMIT = 128 * 1024 * 1024
 _IMAGE_CACHE_LOCK = RLock()
 _VIDEO_MUTE_LOCK = RLock()
+
+
+class PreparedMediaCache:
+    """Reuse decoded data, never loop context/results. Large existing mmap output has one slot."""
+    def __init__(self, budget=1024**3, limit=64):
+        self.budget, self.limit = budget, limit
+        self.entries, self.pending = OrderedDict(), {}
+        self.large = None
+        self.bytes = 0
+        self.hits = self.misses = 0
+        self.lock = RLock()
+        self.epoch = 0
+        self.signatures = OrderedDict()
+
+    @staticmethod
+    def size(value, seen=None):
+        seen = set() if seen is None else seen
+        if id(value) in seen:
+            return 0
+        seen.add(id(value))
+        if hasattr(value, "numel") and hasattr(value, "element_size"):
+            return value.numel() * value.element_size()
+        if hasattr(value, "nbytes"):
+            return int(value.nbytes)
+        if isinstance(value, dict):
+            return sum(PreparedMediaCache.size(v, seen) for v in value.values())
+        if isinstance(value, (tuple, list)):
+            return sum(PreparedMediaCache.size(v, seen) for v in value)
+        if hasattr(value, "images"):
+            return sum(PreparedMediaCache.size(getattr(value, name, None), seen) for name in ("images", "audio", "alpha"))
+        return 0
+
+    def get(self, key, loader, allow_large=False):
+        with self.lock:
+            if key in self.entries:
+                self.hits += 1
+                value, size = self.entries[key]
+                self.entries.move_to_end(key)
+                return value
+            if self.large is not None and self.large[0] == key:
+                self.hits += 1
+                return self.large[1]
+            pending = self.pending.get(key)
+            owner = pending is None
+            if owner:
+                pending = Future()
+                self.pending[key] = pending
+                self.misses += 1
+            epoch = self.epoch
+        if not owner:
+            return pending.result()
+        try:
+            value = loader()
+            size = self.size(value)
+            with self.lock:
+                if value is not None and epoch == self.epoch:
+                    if size > self.budget:
+                        if allow_large:
+                            self.large = (key, value, size)
+                    else:
+                        self.entries[key] = (value, size)
+                        self.bytes += size
+                        while self.bytes > self.budget or len(self.entries) > self.limit:
+                            _, (_, evicted) = self.entries.popitem(last=False)
+                            self.bytes -= evicted
+                pending.set_result(value)
+            return value
+        except BaseException as error:
+            pending.set_exception(error)
+            raise
+        finally:
+            with self.lock:
+                if self.pending.get(key) is pending:
+                    self.pending.pop(key, None)
+
+    def clear(self):
+        with self.lock:
+            self.epoch += 1
+            self.entries.clear()
+            self.pending.clear()
+            self.large = None
+            self.bytes = 0
+
+    def bind(self, owner, signature):
+        with self.lock:
+            if owner in self.signatures and self.signatures[owner] != signature:
+                self.clear()
+            self.signatures[owner] = signature
+            self.signatures.move_to_end(owner)
+            while len(self.signatures) > 64:
+                self.signatures.popitem(last=False)
+
+
+PREPARED_MEDIA = PreparedMediaCache()
+
+
+def cached_media(role, sources, settings, loader, *, allow_large=False):
+    """Only stat source identities on a hit; source edits/ranges/settings create new keys."""
+    from .storage import digest
+    sources = sources if isinstance(sources, (tuple, list)) else [sources]
+    identities = []
+    try:
+        for source in sources:
+            path = resolve_source(source) if isinstance(source, dict) else Path(source)
+            stamp = path.stat()
+            identities.append((str(path.resolve()), stamp.st_mtime_ns, stamp.st_size))
+            if isinstance(source, dict) and source.get("original"):
+                original = resolve_source({**source, **source["original"]})
+                version = original.stat()
+                identities.append((str(original.resolve()), version.st_mtime_ns, version.st_size))
+    except (OSError, ValueError, KeyError, TypeError):
+        return loader()
+    key = digest([role, identities, settings])
+    return PREPARED_MEDIA.get(key, loader, allow_large=allow_large)
 
 
 def _image_pixels(path):
@@ -107,6 +223,10 @@ def _exec(arguments):
 
 
 def has_audio_stream(path):
+    return cached_media("audio-stream", Path(path), [], lambda: _has_audio_stream(path))
+
+
+def _has_audio_stream(path):
     """ffprobe 可用则直接查询；否则用 ffmpeg 映射音轨到空输出探测（无音轨时映射报错）。"""
     probe = shutil.which("ffprobe")
     if probe:
@@ -189,6 +309,11 @@ def resolve_source(source):
 
 
 def load_image_tensor(source, *, normalize=True):
+    return cached_media("image-tensor", source, [normalize, source.get("normalization")],
+                        lambda: _load_image_tensor(source, normalize=normalize))
+
+
+def _load_image_tensor(source, *, normalize=True):
     """图片素材 → IMAGE 张量 (1,H,W,3) 0..1。"""
     import numpy as np
     import torch
@@ -197,6 +322,32 @@ def load_image_tensor(source, *, normalize=True):
     source = normalize_source({**source, "kind": "image"}) if normalize else dict(source)
     frame = _image_pixels(resolve_source(source)).astype(np.float32) / 255.0
     return torch.from_numpy(frame).unsqueeze(0)
+
+
+@lru_cache(maxsize=128)
+def _retained_frame_count(filename, size, modified, start, duration):
+    """Use CFR metadata, otherwise count presentation timestamps without decoding pixels."""
+    import av
+    count = 0
+    with av.open(filename) as container:
+        stream = container.streams.video[0]
+        origin = (stream.start_time or 0) * stream.time_base
+        if stream.frames and stream.average_rate and stream.average_rate == stream.base_rate:
+            import math
+            rate = float(stream.average_rate)
+            first = min(stream.frames, max(0, math.ceil(start * rate - 1e-7)))
+            last = min(stream.frames, math.ceil((start + duration) * rate - 1e-7)) if duration else stream.frames
+            return max(0, last - first)
+        for packet in container.demux(stream):
+            if packet.pts is None or not packet.size:
+                continue
+            stamp = float(packet.pts * stream.time_base - origin)
+            if stamp + 1e-7 < start:
+                continue
+            if duration and stamp >= start + duration - 1e-7:
+                continue
+            count += 1
+    return count
 
 
 def load_video_object(source, *, start_time=0.0, duration=0.0, normalize=True):
@@ -219,10 +370,25 @@ def load_video_object(source, *, start_time=0.0, duration=0.0, normalize=True):
                 if result.returncode:
                     raise ValueError("轨道视频静音失败：" + (result.stderr or b"").decode("utf-8", errors="replace")[-500:])
         path = target
-    return VideoFromFile(str(path), start_time=start_time, duration=duration)
+    class PreparedVideoFromFile(VideoFromFile):
+        def get_components(self):
+            return cached_media("video-components", path, [float(start_time), float(duration)],
+                                lambda: super(PreparedVideoFromFile, self).get_components())
+
+        def get_frame_count(self):
+            if not normalize and (start_time or duration):
+                stamp = path.stat()
+                return _retained_frame_count(str(path), stamp.st_size, stamp.st_mtime_ns, float(start_time), float(duration))
+            return super().get_frame_count()
+    return PreparedVideoFromFile(str(path), start_time=start_time, duration=duration)
 
 
 def video_first_frame(source, start_time, end_time):
+    return cached_media("video-first-frame", source, [float(start_time), float(end_time)],
+                        lambda: _video_first_frame(source, start_time, end_time))
+
+
+def _video_first_frame(source, start_time, end_time):
     """取分段范围内的第一帧，按源时间戳定位，不缩放或重编码素材。"""
     import av
     import numpy as np

@@ -3,14 +3,15 @@
 // CACHEBUST 2026-10-25-cursor-timeline
 // AD-H3 素材清单库：剪映式时间线编辑器（图片 / 视频 / 音频统一管理，片段切分驱动循环）。
 import "./ad_theme.js?v=20261026-ui219-final-layout";
-import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js?v=20261026-ui219-final-layout";
+import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js?v=20261029-frame-info";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, clearImageSources, repairSourceInstances } from "./timeline_state.js?v=20261028-v049-repeated-sources";
-import { mountStoragePanel } from "./storage_panel.js?v=20261028-clear-sources";
+import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, clearImageSources, repairSourceInstances, retainedSourceBounds } from "./timeline_state.js?v=20261029-instant-crop";
+import { mountStoragePanel } from "./storage_panel.js?v=20261029-usage-refresh";
 import {generationClips, commitGeneration, changeGeneration, deleteGeneration} from "./generation_edit.js?v=20261027-independent-generation";
 import { bindWidgetWidth, timelineOrigin, markWidthBreakpoint, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261026-ui219-final-layout";
 import { PreviewCache } from "./timeline_performance.js?v=20261027-perf1";
+import { setMaterialProgress } from "./run_progress.js?v=20261030-v0417";
 
 const FPS = 24, FRAME = 1 / FPS;
 const PORT_LIMITS = { image: 9, video: 3, audio: 3 };  // H3 参考输出口数量（图片 9，视频/音频各 3）
@@ -20,7 +21,7 @@ const uid = (prefix = "id") => `${prefix}-${crypto.randomUUID().replaceAll("-", 
 const snapFrame = t => Math.round(t * FPS) / FPS;
 const clipEnd = clip => clip.tl_start + (clip.src_out - clip.src_in);
 const fmtClock = t => `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, "0")}`;
-const mediaURL = source => `/aiden_h3/media/${source.origin}/${String(source.file).replaceAll("\\", "/").split("/").map(encodeURIComponent).join("/")}`;
+const mediaURL = source => {const view=source?.crop_target && source.preview?.file ? source.preview : source;return `/aiden_h3/media/${view.origin}/${String(view.file).replaceAll("\\", "/").split("/").map(encodeURIComponent).join("/")}`;};
 
 const style = document.createElement("style");
 style.textContent = `
@@ -42,10 +43,13 @@ style.textContent = `
 .h3-tl .h3-split-group [data-count]{width:44px}
 .h3-tl .h3-split-group [data-every]{appearance:textfield;-moz-appearance:textfield}
 .h3-tl .h3-split-group [data-every]::-webkit-outer-spin-button,.h3-tl .h3-split-group [data-every]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
-.h3-smart-row{display:flex;flex-wrap:nowrap;align-items:center;gap:8px;font-size:13px;width:100%;padding:4px 0 6px;color:var(--ad-text-dim)}
+.h3-smart-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:13px;width:100%;padding:4px 0 6px;color:var(--ad-text-dim)}
 .h3-smart-row select,.h3-smart-row input{background:#1b2433;border:1px solid #3d5a80;color:#dbe6f5;border-radius:6px;padding:3px 6px;font-size:13px}
 .h3-smart-row input[type=number]{width:58px}
-.h3-smart-row button{white-space:nowrap}
+ .h3-smart-row button{white-space:nowrap}
+.h3-tl .h3-smart-row .h3-vocals-toggle{background:#1b2433;border-color:#3d5a80;color:#9fb0c7;font-weight:600;white-space:nowrap}
+.h3-tl .h3-smart-row .h3-vocals-toggle:hover{border-color:#5b9bff;color:#dbe6f5}
+.h3-tl .h3-smart-row .h3-vocals-toggle.on{background:#2f6fd0!important;border-color:#5b9bff!important;color:#fff!important;box-shadow:0 0 8px rgba(91,155,255,.55)}
 .h3-smart-info{margin-left:auto;color:#FFD166;font-weight:600;white-space:nowrap}
 .h3-smartcut{position:absolute;top:0;bottom:0;width:2px;background:#FFD166;z-index:7;cursor:col-resize}
 .h3-smartcut::before{content:"";position:absolute;top:0;left:-4px;width:10px;height:8px;background:#FFD166;border-radius:2px}
@@ -401,7 +405,7 @@ export function updateSegmentMaterialOutputs(node, state) {
         }
         if (specs.length) linkSnap.set(output.name, specs);
     }
-    const slots = [...fixed, ...refSlots];
+    const slots = [...fixed, ...refSlots, {name: "mask_frames", label: "遮罩专用", localized_name: "遮罩专用", type: "IMAGE", h3_key: "name:mask_frames"}];
     const alias = { "宽度": "width", "高度": "height", width: "width", height: "height" };
     for (const output of (node.outputs || [])) {
         const raw = output.name;
@@ -506,8 +510,8 @@ export function mountTimelineEditor(node) {
             applyLayoutHeight();
         }, delay);
     };
-    const doUndo = () => { if (!undoStack.length) return; redoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(undoStack.pop()); afterEdit(false); };
-    const doRedo = () => { if (!redoStack.length) return; undoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(redoStack.pop()); afterEdit(false); };
+    const doUndo = () => { if (!undoStack.length) return; redoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(undoStack.pop()); afterEdit(false);hint("已撤销上一步操作。"); };
+    const doRedo = () => { if (!redoStack.length) return; undoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(redoStack.pop()); afterEdit(false);hint("已重做上一步操作。"); };
     const syncHistory = () => { root.querySelector("[data-undo]").disabled = !undoStack.length; root.querySelector("[data-redo]").disabled = !redoStack.length; };
     // 开关类按钮补 aria-pressed，读屏能读出磁吸与秒/帧当前状态。
     const syncToggleA11y = () => {
@@ -569,15 +573,16 @@ export function mountTimelineEditor(node) {
     <option value="shots">智能镜头分割</option>
     <option value="breaths">智能气口分割</option>
   </select>
-  <label>最小间隔 <input data-smart-gap type="number" min="0.2" step="0.05" value="0.35"></label>
+  <label>最小间隔 <input data-smart-gap type="number" min="0.2" step="0.05" value="0.5"></label>
   <label>最大段长 <input data-smart-max type="number" min="2" step="1" value="15"></label>
-  <label>灵敏度 <input data-smart-sens type="number" min="0.1" max="0.95" step="0.05" value="0.5"></label>
-  <label title="气口检测时用中置声道提取人声，减少伴奏干扰"><input data-smart-vocals type="checkbox"> 人声增强</label>
+  <label>灵敏度 <input data-smart-sens type="number" min="0.1" max="0.95" step="0.05" value="0.75"></label>
+  <button type="button" class="h3-vocals-toggle" data-smart-vocals aria-pressed="false" title="气口检测时用中置声道提取人声，减少伴奏干扰；点亮=人声增强开启">人声增强</button>
   <button data-smart-detect>检测</button>
   <button data-smart-apply class="primary">应用切分</button>
   <button data-smart-clear>清空候选</button>
-  <button data-smart-add title="在白色游标位置添加黄色候选切分线；应用切分后生效">添加切分线</button>
-  <span class="h3-smart-info" data-smart-info></span>
+  <button data-smart-add class="primary" title="在白色游标位置添加黄色候选切分线；应用切分后生效">添加切分线</button>
+  <button type="button" data-smart-cut class="primary" title="在白色游标位置立即切分视频（音视频一起切断，可撤销）">切分视频</button>
+  <button type="button" data-run-affected class="primary" title="选中分段后仅运行所选段；未选择时重跑受影响段，完成后回原进度">运行此段</button>
 </div>
 <div class="h3-view" data-view>
   <div class="h3-canvas" data-canvas>
@@ -586,11 +591,14 @@ export function mountTimelineEditor(node) {
 </div>
 <div class="h3-transport">
   <div class="h3-trim-cluster">
+    <button data-cursor-step="-2" aria-label="后退2帧" title="白线游标后退2帧">◀</button>
     <span class="h3-clock" data-clock title="当前帧 / 总帧（24 FPS）">0 / 0</span>
+    <button data-cursor-step="2" aria-label="前进2帧" title="白线游标前进2帧">▶</button>
     <button data-play class="primary" title="从白线游标位置开始播放到时间线结尾。空格=播放/暂停">▶ 播放</button>
     <button type="button" data-mute title="切换预览声音">取消静音</button>
   </div>
   <div class="h3-selection-summary" data-selection-summary hidden></div>
+  <div class="h3-frame-summary" data-frame-summary><span data-timeline-frames></span><span data-segment-frames></span><span data-segment-bounds></span></div>
 </div>
   <div class="h3-hint" data-hint>无音视频：总长 = 每段长度 × 分段数。有音视频：分段数≥1 均分；分段数填 0 则按每段长度切开。</div>
 
@@ -735,8 +743,22 @@ export function mountTimelineEditor(node) {
         if (announce) renderSelectionSummary();
     };
 
+    function renderFrameSummary(cur=Math.max(0,Math.round(T.playhead*FPS)), total=Math.max(0,Math.round(duration()*FPS))) {
+        const cached=T.frameInfo||{spans:[],selectedIndex:-1};
+        const spans=cached.spans;
+        const probe=cur===total&&total>0?cur-1:cur;
+        const index=cached.selectedIndex>=0?cached.selectedIndex:spans.findIndex(span=>probe>=span.start&&probe<span.end);
+        const span=spans[index];
+        const timeline=$("[data-timeline-frames]"), segment=$("[data-segment-frames]"), range=$("[data-segment-bounds]");
+        const values=[`时间线：${cur} / ${total} 帧`,
+            span?`本段：${Math.max(0,Math.min(span.count,cur-span.start))} / ${span.count} 帧`:"本段：未选择或游标位于空隙",
+            span?`本段范围：${span.start}–${span.end}帧（不含末端）`:""];
+        [timeline,segment,range].forEach((element,i)=>{if(element&&element.textContent!==values[i])element.textContent=values[i];});
+    }
+
     function renderSelectionSummary() {
         const element = $("[data-selection-summary]"), selected = [];
+        const spans=intervals();
         const sources = sourcesOf();
         for (const [key,name] of [["video_tracks","视频"],["audio_tracks","音频"]])
             T.state[key].forEach((lane,i) => lane.forEach(clip => {
@@ -745,14 +767,20 @@ export function mountTimelineEditor(node) {
         let text = "";
         if (selected.length === 1) {
             const {clip,track,name} = selected[0];
-            text = `已选中：${track} · ${name} ｜ 时间线 ${fmtClock(clip.tl_start)}–${fmtClock(clipEnd(clip))} ｜ 源范围 ${fmtClock(clip.src_in)}–${fmtClock(clip.src_out)} ｜ 时长 ${(clip.src_out-clip.src_in).toFixed(2)} 秒`;
+            text = `已选：${track} ｜ 源范围 ${fmtClock(clip.src_in)}–${fmtClock(clip.src_out)}`;
+            element.title = `${name} ｜ 时间线 ${fmtClock(clip.tl_start)}–${fmtClock(clipEnd(clip))} ｜ 时长 ${(clip.src_out-clip.src_in).toFixed(2)} 秒`;
         } else if (selected.length > 1) {
             text = `已选中 ${selected.length} 个片段：${[...new Set(selected.map(item=>`${item.track} · ${item.name}`))].join("、")} ｜ 时间线 ${fmtClock(Math.min(...selected.map(item=>item.clip.tl_start)))}–${fmtClock(Math.max(...selected.map(item=>clipEnd(item.clip))))}`;
         } else if (!hasAvClips() && T.segment >= 0 && intervals()[T.segment]) {
             const [a,b] = intervals()[T.segment];
             text = `已选中第 ${T.segment+1} 段 ｜ 时间线 ${fmtClock(a)}–${fmtClock(b)} ｜ 时长 ${(b-a).toFixed(2)} 秒`;
         }
-        element.hidden = !text; element.textContent = text;
+        const layoutChanged=element.textContent!==text;
+        element.hidden = !text;if(layoutChanged)element.textContent = text;
+        const selectedIndex=selected.length===1?segmentIndexForClip(selected[0].clip)
+            : (!hasAvClips()&&T.segment>=0?T.segment:-1);
+        T.frameInfo={spans:spans.map(([a,b])=>({start:Math.round(a*FPS),end:Math.round(b*FPS),count:Math.round((b-a)*FPS)})),selectedIndex};
+        renderFrameSummary();
         const info = root.querySelector("[data-glass-source]");
         if (info) {
             const kindName = {image: "图片", video: "视频", audio: "音频"};
@@ -772,6 +800,7 @@ export function mountTimelineEditor(node) {
         }
         const message = $("[data-hint]");
         message.hidden = !!text && !message.classList.contains("error");
+        if(layoutChanged)scheduleLayout(40);
     }
 
     const sourcesOf = () => Object.fromEntries(T.state.sources.map(source => [source.id, source]));
@@ -1117,6 +1146,7 @@ export function mountTimelineEditor(node) {
         const clock = $("[data-clock]");
         const text = `${cur} / ${tot}`;
         if (clock && clock.textContent !== text) clock.textContent = text;
+        renderFrameSummary(cur,tot);
         if (!seekPreview) return;
         if (interactionLock) {
             // 连续拖动也持续更新，下一屏幕帧只取最新游标；不等鼠标松开。
@@ -1776,6 +1806,8 @@ export function mountTimelineEditor(node) {
             const total = files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
             if (!await storagePanel.canImport(total)) { hint("导入将超过素材容量上限，请先清理缓存或整理素材。", true); return; }
         } catch (error) { hint(error.message, true); return; }
+        let finished = 0, failed = false;
+        setMaterialProgress(node, {busy: true, phase: "running", fraction: null, text: `导入中 0/${files.length}`});
         try {
             for (const file of files) {
                 const form = new FormData();
@@ -1783,12 +1815,18 @@ export function mountTimelineEditor(node) {
                 try {
                     const response = await api.fetchApi("/aiden_h3/upload", { method: "POST", body: form });
                     const data = await response.json();
-                    if (data.error) { hint(data.error, true); if (data.code === "storage_limit") break; continue; }
+                    if (data.error) { failed = true; hint(data.error, true); if (data.code === "storage_limit") break; continue; }
                     if (referenceOnly) data.source.reference_only = true;
                     addSource(data.source);
-                } catch (error) { hint(`导入失败：${error.message}`, true); }
+                    finished++;
+                    setMaterialProgress(node, {busy: true, phase: "running", fraction: finished/files.length, text: `已导入 ${finished}/${files.length}`});
+                } catch (error) { failed = true; hint(`导入失败：${error.message}`, true); }
             }
-        } finally { void storagePanel.refresh().catch(() => {}); }
+        } finally {
+            setMaterialProgress(node, {busy: false, phase: failed ? "error" : "completed", fraction: finished/files.length,
+                text: `${failed ? "部分导入失败" : "导入完成"} ${finished}/${files.length}`});
+            void storagePanel.refresh().catch(() => {});
+        }
     }
     async function loadLibrary(mode) {
         try {
@@ -1810,6 +1848,7 @@ export function mountTimelineEditor(node) {
     // 「素材目录 / 生成目录」：打开系统文件选择框，选完直接载入（与“加载图片”一致）。
     async function pickLibraryFiles(mode) {
         const name = mode === "generated" ? "生成结果" : "素材库";
+        setMaterialProgress(node, {busy: true, phase: "running", fraction: null, text: "选择并载入素材"});
         try {
             hint(`正在打开${name}选择框…`);
             const response = await api.fetchApi("/aiden_h3/library/pick", {
@@ -1817,13 +1856,14 @@ export function mountTimelineEditor(node) {
             });
             const data = await response.json();
             if (!response.ok || data.error) throw new Error(data.error || "打开选择框失败");
-            if (data.cancelled) { hint("已取消选择。"); return; }
+            if (data.cancelled) { setMaterialProgress(node, {busy: false, phase: "paused", fraction: 0, text: "已取消载入"}); hint("已取消选择。"); return; }
             const added = data.sources || [];
             for (const source of added) addSource(source);
             afterEdit();
             void storagePanel.refresh().catch(() => {});
             hint(added.length ? `${name}已载入 ${added.length} 个` : "没有可载入的素材");
-        } catch (error) { hint(`载入失败：${error.message}`, true); }
+            setMaterialProgress(node, {busy: false, phase: "completed", fraction: added.length ? 1 : 0, text: `已载入 ${added.length} 个`});
+        } catch (error) { setMaterialProgress(node, {busy: false, phase: "error", fraction: 0, text: "载入失败"}); hint(`载入失败：${error.message}`, true); }
     }
 
     // ---------- 素材库 / 生成结果 选择面板（勾选后载入，不再全量） ----------
@@ -2064,7 +2104,8 @@ export function mountTimelineEditor(node) {
         if (!source) { if (playerPh) playerPh.style.display = "flex"; return; }
         if (playerPh) playerPh.style.display = "none";
         playerTitle.textContent = source.name || "视频预览";
-        playerMeta.textContent = `${source.duration ? `总时长 ${fmtClock(source.duration)} · ` : ""}帧率 24 fps`;
+        const targetSpan=Number.isFinite(clip.retained_src_in)?clip.retained_src_out-clip.retained_src_in:source.duration;
+        playerMeta.textContent = `${targetSpan ? `目标时长 ${fmtClock(targetSpan)} · ` : ""}时间线 24 fps`;
         playerVideo.muted = videoMuted(clip);
         if (playerVideo.dataset.src !== mediaURL(source)) {
             playerVideo.src = mediaURL(source);
@@ -2472,6 +2513,7 @@ export function mountTimelineEditor(node) {
     }
     function dragClip(event, element) {
         if (event.button !== 0) return;
+        
         event.preventDefault();
         const resume = T.playing;
         if (resume) stopPlayback();
@@ -2499,6 +2541,8 @@ export function mountTimelineEditor(node) {
         const startX = event.clientX, startTL = clip.tl_start, startIn = clip.src_in, startOut = clip.src_out;
         const dragScale = viewScale();
         const startLen = startOut - startIn;
+        const retained=Number.isFinite(clip.retained_src_in)&&Number.isFinite(clip.retained_src_out)
+            ? [clip.retained_src_in,clip.retained_src_out] : retainedSourceBounds(T.state,clip.source)||[0,sourcesOf()[clip.source]?.duration??Infinity];
         const startEnd = startTL + startLen;
         const locate0 = item => {
             for (const key of ["video_tracks", "audio_tracks"]) {
@@ -2518,7 +2562,7 @@ export function mountTimelineEditor(node) {
             moved = true;
             const delta = xToTime((moveEvent.clientX - startX) / dragScale);
             const sources = sourcesOf();
-            const maxSrc = sources[clip.source]?.duration ?? Infinity;
+            const maxSrc = Math.min(sources[clip.source]?.duration ?? Infinity,retained[1]);
             if (!edge) {
                 const length = startLen;
                 let next = snapTo(startTL + delta);
@@ -2625,7 +2669,7 @@ export function mountTimelineEditor(node) {
                 const maxStart = startEnd - FRAME;
                 next = Math.max(frozen.prevEnd, Math.min(next, maxStart));
                 let shift = next - startTL;
-                if (startIn + shift < 0) { shift = -startIn; next = startTL + shift; }
+                if (startIn + shift < retained[0]) { shift = retained[0]-startIn; next = startTL + shift; }
                 if (next < frozen.prevEnd) { next = frozen.prevEnd; shift = next - startTL; }
                 clip.tl_start = next;
                 clip.src_in = startIn + shift;
@@ -2645,9 +2689,12 @@ export function mountTimelineEditor(node) {
             window.removeEventListener("pointerup", up);
             if (raf) { cancelAnimationFrame(raf); raf = 0; patchClipsDuringDrag(); }
             endInteraction();
-            if (moved) afterEdit();
+            if (moved) {
+                if(edge&&(Math.abs(clip.src_in-startIn)>1e-7||Math.abs(clip.src_out-startOut)>1e-7)){clip.retained_src_in=clip.src_in;clip.retained_src_out=clip.src_out;}
+                afterEdit();
+            }
             else {
-                if (!edge) T.playhead = snapTo(Math.min(duration(),locateCanvas(event)), { withPlayhead: false });
+                // 单击片段只选中素材：白线游标保持原位，不跟随点击位置移动（改走标尺/白线才定位）。
                 paintSelection(); renderOverlays(); renderClock(); syncButtons();
                 if (resume) void play();
             }
@@ -2750,6 +2797,12 @@ export function mountTimelineEditor(node) {
     root.addEventListener("click", async event => {
         const button = event.target.closest("button");
         if (!button || button.disabled) return;
+        if(button.dataset.cursorStep){
+            if(T.playing)stopPlayback();
+            clearSourcePreview(root);
+            T.playhead=Math.max(0,Math.min(Math.round(duration()*FPS),Math.round(T.playhead*FPS)+Number(button.dataset.cursorStep)))/FPS;
+            renderOverlays();renderClock();syncButtons();return;
+        }
         if (button.dataset.libraryPick) { void pickLibraryFiles(button.dataset.libraryPick); return; }
         if (button.hasAttribute("data-clear-images")) { clearReferenceImages(); return; }
         if (button.dataset.libraryPanel) { void openLibraryPanel(button.dataset.libraryPanel); return; }
@@ -2906,6 +2959,7 @@ export function mountTimelineEditor(node) {
                 return;
             }
             pushUndo();
+            const changed=[];
             const clips = [...T.state.video_tracks, ...T.state.audio_tracks].flat()
                 .filter(clip => T.selected.size === 0 || T.selected.has(clip.id));
             for (const clip of clips) {
@@ -2913,13 +2967,15 @@ export function mountTimelineEditor(node) {
                     if (t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME) {
                         clip.src_in += t - clip.tl_start;
                         clip.tl_start = snapFrame(t);
+                        changed.push(clip);
                     }
                 } else {
-                    if (t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME) clip.src_out = clip.src_in + (t - clip.tl_start);
+                    if (t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME) {clip.src_out = clip.src_in + (t - clip.tl_start);changed.push(clip);}
                 }
             }
+            for(const clip of changed){clip.retained_src_in=clip.src_in;clip.retained_src_out=clip.src_out;}
             afterEdit();
-            hint(action === "left" ? "已裁掉播放头左侧，保留右侧。" : "已裁掉播放头右侧，保留左侧。");
+            hint(changed.length?"已即时裁剪；拖边不能找回已裁内容，可用撤销恢复。":"播放头未落在片段内部。");
             return;
         }
     });
@@ -3117,34 +3173,62 @@ export function mountTimelineEditor(node) {
         info.textContent = `${extra}候选 ${cuts.length} 个｜最长 ${longest.toFixed(1)}s｜最短 ${shortest.toFixed(1)}s`;
     }
     async function smartDetect() {
+        if(T.detecting){hint("正在分析保留范围，请勿重复检测。",true);return;}
         const source = smartSource();
         if (!source) { hint("请先导入并选中音频或视频素材", true); return; }
+        const clips=[...T.state.video_tracks,...T.state.audio_tracks].flat().filter(clip=>clip.source===source.id);
+        const selected=clips.filter(clip=>T.selected.has(clip.id));
+        const ranges=selected.length?selected:clips;
+        const retained=selected.length===1&&Number.isFinite(selected[0].retained_src_in)
+            ? [selected[0].retained_src_in,selected[0].retained_src_out] : retainedSourceBounds(T.state,source.id);
+        const selection=[...T.selected].sort().join("|");
+        const scope=JSON.stringify(ranges.map(clip=>[clip.id,clip.source,clip.tl_start,clip.src_in,clip.src_out]));
         const kindValue = $("[data-smart-kind]")?.value || "beats-beat";
         const kind = kindValue.startsWith("beats") ? "beats" : kindValue;
         const gap = Number($("[data-smart-gap]")?.value) || 1;
         const maxGap = Number($("[data-smart-max]")?.value) || 15;
         const sensitivity = Number($("[data-smart-sens]")?.value) || 0.5;
-        const vocals = !!$("[data-smart-vocals]")?.checked;
+        const vocals = $("[data-smart-vocals]")?.getAttribute("aria-pressed") === "true";
         const options = kind === "beats"
             ? {mode: kindValue === "beats-bar" ? "bar" : "beat", min_gap: gap, max_gap: maxGap}
             : kind === "shots" ? {threshold: Math.max(0.15, 0.6 - sensitivity * 0.6), min_shot: Math.max(0.5, gap / 2), max_gap: maxGap}
             : {sensitivity, min_seg: Math.max(0.8, gap / 2), max_seg: maxGap, min_breath: 0.15, buffer: 0.05, vocals};
-        hint("正在检测，请稍候…");
+        T.detecting=true;$("[data-smart-detect]").disabled=true;
+        setMaterialProgress(node, {busy: true, phase: "running", fraction: null, text: "检测中"});
+        hint("正在检测裁后保留范围，请稍候…");
         try {
             const response = await api.fetchApi("/aiden_h3/detect_cuts", {
-                method: "POST", headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({kind, origin: source.origin, file: source.file, options}),
+                method: "POST", timeoutMs:null, headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({kind, origin: source.origin, file: source.file, options, ...(retained?{range:{start:retained[0],end:retained[1]}}:{})}),
             });
             const data = await response.json();
-            if (data.error) { hint(data.error, true); return; }
-            const clips=[...T.state.video_tracks,...T.state.audio_tracks].flat().filter(clip=>clip.source===source.id);
-            const selected=clips.filter(clip=>T.selected.has(clip.id));
-            const ranges=selected.length?selected:clips;
+            if (data.error) { setMaterialProgress(node, {busy: false, phase: "error", fraction: 0, text: "检测失败"}); hint(data.error, true); return; }
+            const now=[...T.state.video_tracks,...T.state.audio_tracks].flat();
+            if(selection!==[...T.selected].sort().join("|")||scope!==JSON.stringify(ranges.map(old=>now.find(clip=>clip.id===old.id)).filter(Boolean).map(clip=>[clip.id,clip.source,clip.tl_start,clip.src_in,clip.src_out]))){hint("素材范围已变化，本次旧检测结果不再应用。",true);return;}
             T.smartCuts=[...new Set((data.cuts||[]).flatMap(frame=>ranges.filter(clip=>frame/FPS>clip.src_in&&frame/FPS<clip.src_out).map(clip=>Math.round((clip.tl_start+frame/FPS-clip.src_in)*FPS))))].filter(frame=>frame>0&&frame<Math.round(duration()*FPS)).sort((a,b)=>a-b);
             root._adH3SmartCuts = [...T.smartCuts];
             renderOverlays(); paintSmartInfo();
             hint(`检测完成：${T.smartCuts.length} 个候选切点（黄色线，双击可删、可拖动、单击定位试听）`);
-        } catch (error) { hint(`检测失败：${error.message}`, true); }
+            setMaterialProgress(node, {busy: false, phase: "completed", fraction: 1, text: "检测完成"});
+        } catch (error) { setMaterialProgress(node, {busy: false, phase: "error", fraction: 0, text: "检测失败"}); hint(`检测失败：${error.message}`, true); }
+        finally{T.detecting=false;$("[data-smart-detect]").disabled=false;if(node._adH3LocalProgress)node._adH3LocalProgress.busy=false;}
+    }
+    function splitVideoAtPlayhead() {
+        if (T.playing) return;
+        if (!hasAvClips()) { hint("时间线上没有音视频片段，无法切分", true); return; }
+        const t = Math.round(T.playhead * FPS) / FPS;
+        const total = Math.round(duration() * FPS) / FPS;
+        if (t <= 0.5 / FPS || t >= total - 0.5 / FPS) {
+            hint("请把白色游标移到时间线内部，再点「切分视频」。", true); return;
+        }
+        const targets = [...T.state.video_tracks, ...T.state.audio_tracks].flat()
+            .filter(clip => t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME);
+        if (!targets.length) { hint("当前位置没有可切分的片段（游标要落在片段内部）。", true); return; }
+        pushUndo();
+        splitSelectedClips(targets, [t]);
+        afterEdit();
+        paintSmartInfo();
+        hint(`已在 ${fmtClock(t)} 切分视频；可继续移动游标再点按钮切分，或按撤销恢复。`);
     }
     function smartApply() {
         if (smartApply._busy) return;
@@ -3200,6 +3284,69 @@ export function mountTimelineEditor(node) {
     }
 
 
+    const smartCutButton = $("[data-smart-cut]");
+    if (smartCutButton && !smartCutButton.dataset.adH3Bound) {
+        smartCutButton.dataset.adH3Bound = "1";
+        smartCutButton.addEventListener("click", () => splitVideoAtPlayhead());
+    }
+    let followedPlayhead = null;
+    node._adH3FollowSegment = (seconds, {remember = false} = {}) => {
+        const value = Number(seconds);
+        if (!Number.isFinite(value)) return;
+        if (remember && followedPlayhead === null) followedPlayhead = T.playhead;
+        T.playhead = Math.max(0, Math.min(duration(), value));
+        renderOverlays();
+        renderClock({seekPreview: true});
+        syncButtons();
+    };
+    node._adH3FollowRestore = () => {
+        if (followedPlayhead === null) return;
+        T.playhead = Math.max(0, Math.min(duration(), followedPlayhead));
+        followedPlayhead = null;
+        renderOverlays();
+        renderClock({seekPreview: true});
+        syncButtons();
+    };
+    const runAffectedButton = $("[data-run-affected]");
+    if (runAffectedButton && !runAffectedButton.dataset.adH3Bound) {
+        runAffectedButton.dataset.adH3Bound = "1";
+        runAffectedButton.addEventListener("click", () => {
+            const graph = node.graph;
+            let segmentNode = null;
+            const links = graph?.links;
+            const values = typeof links?.values === "function" ? [...links.values()] : Object.values(links || {});
+            for (const link of values) {
+                if (!link) continue;
+                if (String(link.origin_id) !== String(node.id) || Number(link.origin_slot) !== 0) continue;
+                const target = graph.getNodeById?.(link.target_id)
+                    || (graph._nodes || []).find(item => String(item.id) === String(link.target_id));
+                if (target && (target.comfyClass || target.type) === "AidenH3Segment") { segmentNode = target; break; }
+            }
+            if (!segmentNode) { hint("请先把素材清单连接到「AD-分段生成」的 queue 输入口。", true); return; }
+            if (typeof segmentNode._adH3RunAffected !== "function") { hint("请保存工作流后 Ctrl+F5 刷新页面，再使用运行此段。", true); return; }
+            const videos = (T.state.video_tracks || []).flat().filter(clip => T.selected.has(clip.id));
+            const audios = (T.state.audio_tracks || []).flat().filter(clip => T.selected.has(clip.id));
+            const generated = generationClips(T.state).filter(clip => T.selected.has(clip.id));
+            const selected = videos.length ? videos : (audios.length ? audios : generated);
+            const indices = [...new Set(selected.map(segmentIndexForClip).filter(index => index >= 0))].sort((a,b) => a-b);
+            if (!indices.length && T.segment >= 0) indices.push(T.segment);
+            if (T.selected.size && !indices.length) { hint("所选片段没有对应的生成分段，请先应用分段。", true); return; }
+            hint(indices.length ? `正在准备运行所选第 ${indices.map(i => i+1).join("、")} 段，完成后回到原进度。`
+                : "正在检查并重跑受影响段，完成后回到原运行位置。");
+            void segmentNode._adH3RunAffected(indices.length ? {indices} : {}).then(result => {
+                if (result === false) hint("选段运行未完成，请查看预览审批中的提示。", true);
+            });
+        });
+    }
+    const vocalsButton = $("[data-smart-vocals]");
+    if (vocalsButton && !vocalsButton.dataset.adH3Bound) {
+        vocalsButton.dataset.adH3Bound = "1";
+        vocalsButton.addEventListener("click", () => {
+            const on = vocalsButton.getAttribute("aria-pressed") !== "true";
+            vocalsButton.setAttribute("aria-pressed", String(on));
+            vocalsButton.classList.toggle("on", on);
+        });
+    }
     let contentWidgetH = MIN_H;
     let layoutBusy = false;
     let applySizeGuard = 0;  // 我们自己 setSize 时忽略 onResize/afterResize，避免误锁高度

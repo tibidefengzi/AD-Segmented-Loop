@@ -2,13 +2,16 @@
 // cachebust 20261025-0440 segment-dedupe-materials
 // CACHEBUST 2026-10-25-restore-v027-approved-043100
 import "./ad_theme.js?v=20261027-v039-share";
-import { installGlassTheme } from "./glass_ui.js?v=20261028-v046";
+import { installGlassTheme } from "./glass_ui.js?v=20261029-frame-info";
 import { executeQueueOnce } from "./queue_runner.js?v=20261027-v039-share";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs } from "./timeline_editor.js?v=20261028-v049-repeated-sources-final";
-import { mountNativePlayer } from "./native_player.js?v=20261028-v049-stopped-redraw-final";
+import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs } from "./timeline_editor.js?v=20261030-selected-run-v0417";
+import { mountNativePlayer } from "./native_player.js?v=20261030-save-default-v0419";
 import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261027-v039-share";
+import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261030-v0417";
+
+installProgressEvents(api);
 
 const styles = document.createElement("style");
 styles.id="ad-h3-loop-ref-links-20261025-053810";
@@ -117,7 +120,7 @@ const label = {ready:"待生成",queued:"已排队",running:"生成中",review:"
 const natural = new Intl.Collator(undefined, {numeric:true, sensitivity:"base"});
 const esc = value => String(value).replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 const mediaUrl = (origin, file) => api.apiURL(`/aiden_h3/media/${origin}/${file.split("/").map(encodeURIComponent).join("/")}`);
-const chineseLabels={index:"段号",multiple:"对齐倍数",media:"媒体",positive_prompt:"正向提示词",negative_prompt:"反向提示词",round_image:"本段图像",round_audio:"本段音频",round_video:"本段视频",source_latent:"源视频编码",latent:"音视频潜变量",queue:"分段清单",queue_state:"素材清单",video_queue:"(已弃用)视频分段清单",video_queue_state:"视频分段清单（JSON）",audio_oasis_ui:"音频预览",session_id:"进度名称",fps:"帧率",run_token:"执行标识",overlap_frames:"重叠帧数",guard_frames:"保护帧数",aspect_ratio:"宽高比",megapixels:"百万像素",reanchor_every:"重锚定间隔（段）",max_frames:"单段生成帧数上限",context:"当前段上下文",audio:"本段音频",guide_audio:"含重叠前导音频",prompt_index:"索引号",multiline:"多行模式",seconds_float:"时长（小数秒）",seconds_int:"时长（整数秒）",generation_frames:"本段帧数",start_frame:"起始帧（源）",target_frames:"目标帧数",filename:"素材文件名",video_frames:"视频画面",mask:"遮罩",segment:"覆盖段号（0为全局）",mode:"参考模式",previous:"上一级参考",references:"参考设置",frames:"历史画面帧数",previous_tail:"前段保真尾帧",best_handoff:"最佳交接参考帧",has_history:"存在前段历史",video:"视频",detect_bad_frames:"剔除边界坏帧",strict_sync:"严格音画同步",prompt_text:"实际提示词",video_oasis_ui:"视频预览",strings:"分段提示词",select:"生成段号",global_prefix:"统一提示词前缀",global_suffix:"统一提示词后缀",prompt:"提示词",width:"画面宽度",height:"画面高度"};
+const chineseLabels={index:"段号",multiple:"对齐倍数",media:"媒体",positive_prompt:"正向提示词",negative_prompt:"反向提示词",round_image:"本段图像",round_audio:"本段音频",round_video:"本段视频",source_latent:"源视频编码",latent:"音视频潜变量",queue:"分段清单",queue_state:"素材清单",video_queue:"(已弃用)视频分段清单",video_queue_state:"视频分段清单（JSON）",audio_oasis_ui:"音频预览",session_id:"进度名称",fps:"帧率",run_token:"执行标识",overlap_frames:"重叠帧数",guard_frames:"保护帧数",aspect_ratio:"宽高比",megapixels:"百万像素",reanchor_every:"重锚定间隔（段）",max_frames:"单段生成帧数上限",context:"当前段上下文",audio:"本段音频",guide_audio:"含重叠前导音频",prompt_index:"索引号",multiline:"多行模式",seconds_float:"时长（小数秒）",seconds_int:"时长（整数秒）",generation_frames:"本段帧数",start_frame:"起始帧（源）",target_frames:"目标帧数",filename:"素材文件名",video_frames:"视频画面",mask:"遮罩",segment:"覆盖段号（0为全局）",mode:"参考模式",previous:"上一级参考",references:"参考设置",frames:"历史画面帧数",previous_tail:"前段保真尾帧",best_handoff:"最佳交接参考帧",has_history:"存在前段历史",video:"视频",strict_sync:"严格音画同步",prompt_text:"实际提示词",video_oasis_ui:"视频预览",strings:"分段提示词",select:"生成段号",global_prefix:"统一提示词前缀",global_suffix:"统一提示词后缀",prompt:"提示词",width:"画面宽度",height:"画面高度"};
 const chineseTitles={AidenH3EditMask:"角色替换遮罩适配",AidenH3AudioQueue:"素材准备",AidenH3VideoQueue:"视频分段清单",AidenH3Segment:"分段生成",AidenH3SegmentMedia:"视频与遮罩取段",AidenH3References:"全局与本段参考",AidenH3PickReferences:"当前段参考",AidenH3PreviousFrames:"前段末尾画面",AidenH3Commit:"记录分段结果",AidenH3VideoPreview:"预览审批",AidenH3Prompt:"分段提示词",AidenH3Resolution:"分辨率",AidenH3MergedVideo:"读取合并结果",AidenH3ContinuumStatus:"续段检测",AidenH3ContinuumPrepare:"续段准备",AidenH3ContinuumCapture:"续段存档",AidenH3ContinuumRecall:"续段调取",};
 
 function adEnsureWidgetOptions(widget){
@@ -263,6 +266,28 @@ function upstreamSegment(viewer) {
     return segment?.comfyClass==="AidenH3Segment" ? segment : null;
 }
 
+function runSelectedSegments(segment, options = {}) {
+    const viewer = (segment.graph?._nodes || []).find(candidate =>
+        candidate.comfyClass === "AidenH3VideoPreview" && upstreamSegment(candidate) === segment);
+    if (!viewer?._adH3RunAffected) return Promise.resolve(false);
+    return viewer._adH3RunAffected(options);
+}
+
+function followRunningSegment(viewer, state) {
+    if (!["queued", "running"].includes(state.status)) { viewer._adH3FollowedSegment = ""; return; }
+    const index = Number(state.cursor), row = state.segments?.[index];
+    const identity = `${state.id}:${row?.segment_key || index}`;
+    if (!row || viewer._adH3FollowedSegment === identity) return;
+    const segment = upstreamSegment(viewer), graph = segment?.graph;
+    const input = segment?.inputs?.find(item => item.name === "queue");
+    const link = graph?.links?.get?.(input?.link) || graph?.links?.[input?.link];
+    const queue = link && graph?.getNodeById?.(link.origin_id);
+    const seconds = Number(row.entry?.source_start);
+    if (!queue?._adH3FollowSegment || !Number.isFinite(seconds)) return;
+    queue._adH3FollowSegment(seconds);
+    viewer._adH3FollowedSegment = identity;
+}
+
 function mountReview(node) {
     if(node._aidenH3Review)return;
     node._aidenH3Review=true;
@@ -273,6 +298,7 @@ function mountReview(node) {
     const compare=document.createElement("div");compare.className="h3-compare";compare.hidden=true;
     let disposed=false,busy=false,lastState=null,lastSession="",lastRendered="",connectionFailed=false;
     let refreshing=false,lastPolled=0,lastPayload="";
+    node._adH3FollowCurrent = () => lastState && followRunningSegment(node, {...lastState, status: "queued"});
     const say=(text,error=false)=>{message.textContent=text;message.classList.toggle("error",error);try{node._adH3Hint?.(text,error);}catch{}};
     function sessionId(segment){
         const direct=segment?.widgets?.find(widget=>widget.name==="session_id")?.value;
@@ -290,6 +316,11 @@ function mountReview(node) {
     }
     function draw(state) {
         lastState=state;
+        followRunningSegment(node, state);
+        const segment = upstreamSegment(node), graph = segment?.graph;
+        const input = segment?.inputs?.find(item => item.name === "queue");
+        const link = graph?.links?.get?.(input?.link) || graph?.links?.[input?.link];
+        updateSessionProgress(node, segment, link && graph?.getNodeById?.(link.origin_id), state);
         node._adH3Preview?.updateState(state);
         status.textContent=`第 ${state.cursor+1}/${state.segments.length} 段 · ${label[state.status]||state.status}`;
         if(state.error)say(state.error,true);
@@ -297,7 +328,8 @@ function mountReview(node) {
         const row=state.segments[state.cursor];
         const canMerge=state.segments.every(item=>item.valid&&item.accepted);
         const enabled={start:!running&&!row.valid,approve:!running&&row.valid&&!row.accepted,
-            redo:!running,auto:!running,merge:!running&&canMerge,clear:!running};
+            redo:!running,auto:!running,merge:!running&&canMerge,clear:!running,
+            run_segment:!running,run_pending:!running};
         for(const button of root.querySelectorAll("[data-command]"))button.disabled=busy||!enabled[button.dataset.command];
         const renderKey=JSON.stringify([state.segments,state.cursor,state.merged,state.manifest,state.merge_options,running]);
         if(renderKey===lastRendered)return;
@@ -338,6 +370,7 @@ function mountReview(node) {
     let actionRevision=0;
     async function act(command,extra={}) {
         if(command==="stop") {node._adH3BatchStop=true;node._adH3StopEpoch=(Number(node._adH3StopEpoch)||0)+1;}
+        if(node._adH3AffectedRunning && command!=="stop") {say("正在运行所选段，请等待完成或先点停止。",true);return false;}
         if(busy && command !== "stop") {node._adH3LastActionError="上一项操作尚未结束，请稍后重试。";say(node._adH3LastActionError,true);return false;}
         const segment=upstreamSegment(node);
         if(!segment){say("请先连接当前段上下文。",true);return false;}
@@ -371,7 +404,9 @@ function mountReview(node) {
             }
             const messages={stop:"已停止：当前生成已中断，分段循环待命；可点任意预览后「本段抽卡」，抽完点「开始」续接分段循环。",
                 clear:"已清空本轮进度，已有文件保留。",redo:"已重置当前段，正在重新抽卡…",redo_preview:"正在本段抽卡（仅预览备选，不改变分段循环进度）…",
-                start:"已开始生成当前段…",approve:"已通过并准备下一段。",auto:"已开始分段循环。",merge:"合并操作已完成。"};
+                start:"已开始生成当前段…",approve:"已通过并准备下一段。",auto:"已开始分段循环。",merge:"合并操作已完成。",
+                run_segment:"已切换到指定段：点「开始」只生成这一段，通过后自动回到原进度位置。",
+                run_pending:"已定位到待生成/待更新段：点「开始」只生成这一段，通过后自动回到原进度位置。"};
             say(command==="redo_preview" && result?.preview_hold?.select_on_success
                 ? "正在重抽停止段；成功后作为待批准版本，不自动跳段…" : (messages[command] || "操作已完成。"));
             if(command==="redo_preview"){
@@ -469,6 +504,7 @@ function mountReview(node) {
             if(stopped()) return;
             const row=state.segments[state.cursor];
             if(!row.valid) {
+                followRunningSegment(node, {...state, status: "queued"});
                 say("正在生成第 "+(state.cursor+1)+"/"+state.segments.length+" 段…");
                 const result=await executeQueueOnce(app,api,segment.id,{isStopped:stopped});
                 if(result.stopped) return;
@@ -494,11 +530,119 @@ function mountReview(node) {
         }
     }
     node._adH3Batch=async options=>{
+        if(node._adH3AffectedRunning){say("正在运行所选段，请等待完成或先点停止。",true);return;}
         if(node._adH3BatchRunning){say("分段循环正在进行，请先停止当前任务。",true);return;}
         node._adH3BatchRunning=true;
         try{await batchRun(options);}
         catch(error){say(error.message,true);}
         finally{node._adH3BatchRunning=false;if(node._adH3BatchStop)say("分段循环已停止，流程待命；点「开始」继续。");void refresh();}
+    };
+    node._adH3RunAffected = async (options = {}) => {
+        if (node._adH3AffectedRunning) { say("正在重跑修改的段，请等待完成或先点停止。", true); return; }
+        const segment = upstreamSegment(node);
+        if (!segment) { say("请先连接当前段上下文。", true); return; }
+        if (!segment.inputs?.find(item => item.name === "queue")?.link) { say("请先连接素材清单后再使用运行此段。", true); return; }
+        const queueNodeOf = () => {
+            const input = (segment.inputs || []).find(item => item.name === "queue");
+            const link = input?.link != null ? (node.graph?.links?.[input.link] || node.graph?.links?.get?.(input.link)) : null;
+            return link ? (node.graph?.getNodeById?.(link.origin_id) || null) : null;
+        };
+        const follow = seconds => { try { queueNodeOf()?._adH3FollowSegment?.(seconds, {remember: true}); } catch (_error) {} };
+        const restore = () => { try { queueNodeOf()?._adH3FollowRestore?.(); } catch (_error) {} };
+        node._adH3AffectedRunning = true;
+        const stopEpoch = Number(node._adH3StopEpoch) || 0;
+        const explicitlyStopped = () => (Number(node._adH3StopEpoch) || 0) !== stopEpoch;
+        const resumeBatch = !!node._adH3BatchRunning;
+        if (resumeBatch) node._adH3BatchStop = true;
+        const stopped = () => explicitlyStopped() || !!node._adH3BatchStop;
+        let succeeded = false;
+        try {
+            // Yield the sequential driver without interrupting its current ComfyUI task.
+            for (let attempt = 0; node._adH3BatchRunning; attempt++) {
+                if (explicitlyStopped()) return false;
+                if (attempt >= 7200) throw new Error("等待分段循环让出任务超时，请先点停止检查");
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            for (let attempt = 0; attempt < 7200; attempt++) {
+                if (explicitlyStopped()) return false;
+                const response = await api.fetchApi("/aiden_h3/session/" + encodeURIComponent(sessionId(segment)), {cache: "no-store"});
+                if (response.status === 404) break;
+                const state = await response.json();
+                if (!response.ok) throw new Error(state.error || "读取进度失败");
+                draw(state);
+                if (!["queued", "running", "merging"].includes(state.status)) break;
+                if (attempt === 7199) throw new Error("等待当前任务完成超时，请先点停止检查");
+                say("等待当前任务结束后运行所选段…");
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            if (explicitlyStopped()) return false;
+            node._adH3BatchStop = false;
+            const serialized = await app.graphToPrompt();
+            if (stopped()) return false;
+            let state = await request("/aiden_h3/sync", {segment_node: String(segment.id), prompt: serialized.output,
+                workflow: serialized.workflow, client_id: api.clientId});
+            if (stopped()) return false;
+            draw(state);
+            state = await request("/aiden_h3/action", {command: "run_affected", session_id: state.id,
+                ...(options.indices ? {indices: options.indices} : {})});
+            if (stopped()) {
+                await request("/aiden_h3/action", {command: "stop", session_id: state.id});
+                return false;
+            }
+            draw(state);
+            const total = Number(state.affected_run?.remaining?.length || 0);
+            if (total) say(`检测到 ${total} 个需要重跑的段：自动逐个生成并批准，完成后回到原运行位置…`);
+            const limit = total + 1;
+            for (let guard = 0; guard < limit; guard++) {
+                if (stopped()) return;
+                for (let attempt = 0; attempt < 3600; attempt++) {
+                    if (stopped()) return;
+                    if (!["queued", "running", "merging"].includes(state.status)) break;
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    const response = await api.fetchApi("/aiden_h3/session/" + encodeURIComponent(state.id), {cache: "no-store"});
+                    state = await response.json();
+                    if (!response.ok) throw new Error(state.error || "读取进度失败");
+                    draw(state);
+                }
+                if (state.status === "error") throw new Error(state.error || "本次任务失败，请检查后重试");
+                if (!state.affected_run) break;
+                const index = Number(state.cursor);
+                const row = state.segments?.[index];
+                if (!row) throw new Error("找不到要重跑的段");
+                const start = Number(row.entry?.source_start);
+                if (Number.isFinite(start)) follow(start);
+                if (!row.valid) {
+                    say(`正在重跑第 ${index + 1} 段（自动处理受影响段）…`);
+                    const queued = await executeQueueOnce(app, api, segment.id, {isStopped: stopped});
+                    if (queued.stopped) return;
+                    for (let attempt = 0; attempt < 120; attempt++) {
+                        const response = await api.fetchApi("/aiden_h3/session/" + encodeURIComponent(state.id), {cache: "no-store"});
+                        state = await response.json();
+                        if (!response.ok) throw new Error(state.error || "读取进度失败");
+                        if (state.status === "error") throw new Error(state.error || "本次任务失败");
+                        if (state.segments?.[state.cursor]?.valid) break;
+                        if (stopped()) return;
+                        await new Promise(resolve => setTimeout(resolve, 250));
+                    }
+                    if (!state.segments?.[state.cursor]?.valid) throw new Error("本次任务没有有效结果，当前段未能批准");
+                }
+                if (stopped()) return false;
+                state = await request("/aiden_h3/action", {command: "approve", session_id: state.id, frontend_queue: true});
+                draw(state);
+            }
+            if (state.affected_run) throw new Error("所选段尚未全部完成，请检查当前进度");
+            succeeded = true;
+            say("指定的段已运行完成，已回到原运行位置。");
+            return true;
+        } catch (error) {
+            say(error?.message || String(error), true);
+            return false;
+        } finally {
+            node._adH3AffectedRunning = false;
+            restore();
+            void refresh();
+            if (succeeded && resumeBatch && !explicitlyStopped()) void node._adH3Batch({merge: false});
+        }
     };
     node._adH3ReviewStatus = say;
     async function refresh(force=true){
@@ -602,10 +746,12 @@ const AD_SEG_REF_NAMES = [
     ...Array.from({length: 3}, (_, i) => `ref_video_audio_${i}`),
     ...Array.from({length: 3}, (_, i) => `ref_audio_${i}`),
 ];
-const AD_SEG_OUTPUTS = [...AD_SEG_FIXED, ...AD_SEG_REF_NAMES];
+const AD_SEG_EXTRA = ["mask_frames"];
+const AD_SEG_OUTPUTS = [...AD_SEG_FIXED, ...AD_SEG_REF_NAMES, ...AD_SEG_EXTRA];
 const AD_SEG_TYPES = [
     "H3_LOOP_CONTEXT", "INT", "IMAGE", "INT", "FLOAT", "INT", "INT", "STRING", "STRING", "IMAGE", "AUDIO", "VIDEO", "VIDEO", "AUDIO",
     ...AD_SEG_REF_NAMES.map(name => name.startsWith("ref_image") || (name.startsWith("ref_video") && !name.startsWith("ref_video_audio")) ? "IMAGE" : "AUDIO"),
+    "IMAGE",
 ];
 function repairSegmentPromptLinks(node) {
     // 按采样器的 positive/negative 条件链反推：应当来自第 9/10 口，错了就自动纠正
@@ -687,7 +833,7 @@ function applySegmentOutputLabels(node) {
         generation_frames: "本段帧数", fps: "帧率", width: "画面宽度", height: "画面高度",
         positive_prompt: "正向提示词", negative_prompt: "反向提示词",
         round_image: "本段图像", round_audio: "本段音频", round_video: "本段视频",
-        source_video: "源视频", original_audio: "源音频"};
+        source_video: "源视频", original_audio: "源音频", mask_frames: "遮罩专用"};
     const refLabel = name => {
         const match = String(name || "").match(/^ref_(image|video_audio|video|audio)_(\d+)$/);
         if (!match) return "";
@@ -830,7 +976,7 @@ function mountResolutionBadge(node) {
         let mp = parseFloat(widgetValue("megapixels"));
         if (!Number.isFinite(mp)) mp = 0.5;
         mp = Math.max(0.05, Math.min(64.0, mp));
-        const step = Math.max(1, Math.round(Number(widgetValue("multiple")) || 16));
+        const step = Math.max(1, Math.round(Number(widgetValue("multiple")) || 32));
         const pyRound = value => {
             const floor = Math.floor(value);
             return value - floor === 0.5 ? (floor % 2 === 0 ? floor : floor + 1) : Math.round(value);
@@ -1111,6 +1257,7 @@ function startSegmentRepairTimer() {
 
 const savedSegmentSchemas = new Map();
 function setupNode(node) {
+    if (["AidenH3AudioQueue", "AidenH3Segment", "AidenH3VideoPreview"].includes(node.comfyClass)) mountNodeProgress(node);
     installGlassTheme();
     if(node.comfyClass==="AidenH3AudioQueue")mountTimelineEditor(node);
     if(node.comfyClass==="AidenH3Segment"){
@@ -1189,6 +1336,7 @@ function setupNode(node) {
     }
     if(node.comfyClass==="AidenH3Segment"){
         const token=node.widgets?.find(widget=>widget.name==="run_token");
+        node._adH3RunAffected = options => runSelectedSegments(node, options);
         // Keep 执行标识 visible (user requested); do not hide run_token.
         const session=node.widgets?.find(widget=>widget.name==="session_id");
         if(session && (session.value==="h3-session" || session.value==="AD-H3-session" || session.value==="")){
@@ -1219,7 +1367,7 @@ function setupNode(node) {
 
 const H3_ASPECT_16x9={0.2:[608,352],0.3:[736,416],0.4:[864,480],0.5:[960,544],0.6:[1056,608],0.7:[1152,640],0.8:[1216,672],0.9:[1280,736],0.98:[1344,768],1.0:[1376,768],1.2:[1504,832],1.5:[1664,928],1.8:[1824,1024],2.0:[1920,1088]};
 const H3_ASPECT_RATIOS={"1:1 (Square)":[1,1],"16:9 (Landscape)":[16,9],"9:16 (Portrait)":[9,16],"4:3":[4,3],"3:4":[3,4],"3:2":[3,2],"2:3":[2,3],"21:9":[21,9]};
-function h3ResolveCanvas(aspectRatio="16:9 (Landscape)", megapixels="0.5", multiple=16){
+function h3ResolveCanvas(aspectRatio="16:9 (Landscape)", megapixels="0.5", multiple=32){
     const mp=Number(megapixels); if(!Number.isFinite(mp)||mp<=0) return null;
     let label=String(aspectRatio||"16:9 (Landscape)");
     if(!(label in H3_ASPECT_RATIOS)){
@@ -1232,7 +1380,7 @@ function h3ResolveCanvas(aspectRatio="16:9 (Landscape)", megapixels="0.5", multi
     if(aw===9&&ah===16){const [w,h]=H3_ASPECT_16x9[nearest]; return [h,w];}
     const scale=Math.sqrt((mp*1024*1024)/(aw*ah));
     const pyRound=value=>{const floor=Math.floor(value);return value-floor===0.5?(floor%2===0?floor:floor+1):Math.round(value);};
-    const step=Math.max(1,Number(multiple)||16);
+    const step=Math.max(1,Number(multiple)||32);
     return [Math.max(step,pyRound((aw*scale)/step)*step),Math.max(step,pyRound((ah*scale)/step)*step)];
 }
 /* ad-res-footer-glue-widgets 20261025-0458 */
@@ -1294,6 +1442,7 @@ app.registerExtension({
             const desired = [...AD_SEG_FIXED];
             for (const [kind, prefix] of [["image","ref_image"],["video","ref_video"],["video_audio","ref_video_audio"],["audio","ref_audio"]])
                 for (let index=0; index<counts[kind]; index++) desired.push(`${prefix}_${index}`);
+            desired.push(...AD_SEG_EXTRA);
             const previous = info.outputs || [];
             const byName = new Map(previous.map(output => [output.name, output]));
             for (const link of links) {
@@ -1411,7 +1560,7 @@ app.registerExtension({
                     this.onDrawForeground=function(ctx){
                         previousDraw?.apply(this,arguments);
                         const value=name=>this.widgets?.find(widget=>widget.name===name)?.value;
-                        const resolved=h3ResolveCanvas(value("aspect_ratio"), value("megapixels"), Number(value("multiple"))||16);
+                        const resolved=h3ResolveCanvas(value("aspect_ratio"), value("megapixels"), Number(value("multiple"))||32);
                         const text=resolved?`分辨率 ${resolved[0]} x ${resolved[1]}`:`分辨率 -- x --`;
                         const connected=commitConnected(this);
                         // 放在全部可见控件（含执行标识）下方，节点底部不够时由 ensureFooterSpace 补足。

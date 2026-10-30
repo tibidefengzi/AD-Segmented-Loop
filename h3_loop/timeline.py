@@ -202,7 +202,7 @@ def validate_timeline(config):
         sources[sid] = {"id": sid, "kind": source["kind"], "origin": source["origin"],
                         "file": source["file"], "name": str(source.get("name") or source["file"]),
                         "duration": None if duration is None else float(duration)}
-        for field in ("priority", "original", "normalization", "preview", "width", "height", "fps", "frames", "has_audio", "muted"):
+        for field in ("priority", "original", "normalization", "preview", "width", "height", "fps", "frames", "has_audio", "muted", "crop_target"):
             if field in source:
                 sources[sid][field] = source[field]
 
@@ -236,6 +236,13 @@ def validate_timeline(config):
                 clips.append({"id": str(clip.get("id") or digest([source["id"], clip])[0:16]),
                               "source": source["id"], "tl_start": float(clip["tl_start"]),
                               "src_in": float(clip["src_in"]), "src_out": float(clip["src_out"])})
+                if "retained_src_in" in clip or "retained_src_out" in clip:
+                    lo, hi = clip.get("retained_src_in"), clip.get("retained_src_out")
+                    if not _finite(lo, positive=False) or not _finite(hi) or hi <= lo \
+                            or clip["src_in"] < lo - 1e-7 or clip["src_out"] > hi + 1e-7 \
+                            or (source["duration"] is not None and hi > source["duration"] + HALF_FRAME):
+                        raise ValueError("片段超出已裁剪保留范围，请撤销裁剪后再调整")
+                    clips[-1].update(retained_src_in=float(lo), retained_src_out=float(hi))
             clips.sort(key=lambda item: item["tl_start"])
             for left, right in zip(clips, clips[1:]):
                 if clip_span(right)[0] - clip_span(left)[1] < -HALF_FRAME:
@@ -396,6 +403,16 @@ def priority_sources(state, kind=None):
     return [source for source in items if kind is None or source.get("kind") == kind]
 
 
+def retained_source_range(state, source_id, clip=None):
+    if clip and "retained_src_in" in clip and "retained_src_out" in clip:
+        return clip["retained_src_in"], clip["retained_src_out"]
+    clips = [clip for key in ("video_tracks", "audio_tracks")
+             for lane in state.get(key) or [] for clip in lane if clip["source"] == source_id]
+    if not clips:
+        return None
+    return min(clip["src_in"] for clip in clips), max(clip["src_out"] for clip in clips)
+
+
 def segment_intervals(state):
     """clips 模式按素材片段计段（不含时间线空隙）；否则按 split_points 连续切。"""
     priority = priority_sources(state)
@@ -477,6 +494,8 @@ def derive_segments(state):
         if selected_video:
             whole_video = next((dict(source) for source in state["sources"] if source["kind"] == "video"
                                 and source["origin"] == selected_video["origin"] and source["file"] == selected_video["file"]), None)
+            if whole_video and selected_video.get("retained_range"):
+                whole_video["retained_range"] = selected_video["retained_range"]
         selected_lane = next((number for number, lane in enumerate(state["video_tracks"])
                               if selected_video and any(sources[clip["source"]]["file"] == selected_video["file"]
                               and min(end, clip_span(clip)[1]) - max(start, clip_span(clip)[0]) > HALF_FRAME
@@ -532,7 +551,8 @@ def audio_pieces(lane, sources, start, end):
         source = sources[clip["source"]]
         offset = float(clip["src_in"]) - clip_start
         pieces.append({"origin": source["origin"], "file": source["file"], "at": lo - start,
-                       "src_in": offset + lo, "src_out": offset + hi})
+                       "src_in": offset + lo, "src_out": offset + hi,
+                       **({"retained_range": [clip["retained_src_in"], clip["retained_src_out"]]} if "retained_src_in" in clip else {})})
     return pieces
 
 
@@ -550,7 +570,8 @@ def video_range(lanes, sources, start, end, index):
             source = sources[clip["source"]]
             offset = float(clip["src_in"]) - clip_start
             candidates.append((span, {"origin": source["origin"], "file": source["file"],
-                                      "name": source["name"], "src_in": offset + lo, "src_out": offset + hi}))
+                                      "name": source["name"], "src_in": offset + lo, "src_out": offset + hi,
+                                      **({"retained_range": [clip["retained_src_in"], clip["retained_src_out"]]} if "retained_src_in" in clip else {})}))
         if not candidates:
             continue
         if len(candidates) > 1:

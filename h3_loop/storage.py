@@ -214,6 +214,128 @@ class SessionStore:
         has_reference_nodes = any(node.get("class_type") in {"AidenH3References","AidenH3PickReferences"} for node in (template or {}).get("prompt",{}).values())
         return (has_images or has_reference_nodes) and all(base(row["entry"]) == base(entry) for row,entry in zip(old,entries))
 
+    @staticmethod
+    def _entry_span(entry):
+        try:
+            start = float(entry.get("source_start") or 0.0)
+            length = float(entry.get("seconds_float") or 0.0)
+        except (TypeError, ValueError):
+            start, length = 0.0, 0.0
+        return start, start + length
+
+    @staticmethod
+    def _entry_sources(entry):
+        """段内容的源时间范围：基础视频 + 本段音频轨道；参考素材不参与（改参考不失效）。"""
+        def piece_key(piece):
+            if not isinstance(piece, dict):
+                return None
+            source = piece.get("source") if isinstance(piece.get("source"), dict) else piece
+            if not isinstance(source, dict):
+                return None
+            return (source.get("origin"), source.get("file"),
+                    round(float(piece.get("src_in") or 0.0), 6),
+                    round(float(piece.get("src_out") or 0.0), 6))
+
+        keys = []
+        video = entry.get("video_source")
+        if isinstance(video, dict):
+            keys.append(piece_key(video))
+        for lane in (entry.get("timeline_audio") or {}).get("tracks") or []:
+            for piece in lane or []:
+                keys.append(piece_key(piece))
+        return tuple(sorted(key for key in keys if key))
+
+    @classmethod
+    def _entry_range(cls, entry):
+        entry = entry or {}
+        pieces = cls._entry_sources(entry)
+        if pieces:
+            return ("source", pieces)
+        start, end = cls._entry_span(entry)
+        return ("span", (round(start, 6), round(end, 6)))
+
+    @staticmethod
+    def _range_overlap(left, right):
+        if left[0] == right[0] == "source":
+            total = 0.0
+            for _, _, a1, a2 in left[1]:
+                for _, _, b1, b2 in right[1]:
+                    total += max(0.0, min(a2, b2) - max(a1, b1))
+            return total
+        if left[0] == right[0] == "span":
+            return max(0.0, min(left[1][1], right[1][1]) - max(left[1][0], right[1][0]))
+        return 0.0
+
+    @staticmethod
+    def _carry_row(row, entry, signature, stale=False):
+        return {"entry": entry, "signature": signature,
+                "segment_key": uuid.uuid4().hex if stale else row["segment_key"],
+                "versions": list(row.get("versions", [])),
+                "reroll": row.get("reroll", 0),
+                "selected": row.get("selected"),
+                "valid": False if stale else bool(row.get("valid", False)),
+                "accepted": False if stale else bool(row.get("accepted", False)),
+                "boundary_changed": bool(stale or row.get("boundary_changed"))}
+
+    @staticmethod
+    def _position(state, index):
+        row = state["segments"][index]
+        return {"cursor": index, "entry_id": row["entry"].get("id"),
+                "segment_key": row["segment_key"]}
+
+    @staticmethod
+    def _bind_active(state):
+        active = state.get("active")
+        if active and not active.get("segment_key") and 0 <= active.get("index", -1) < len(state["segments"]):
+            row = state["segments"][active["index"]]
+            active.update(segment_key=row["segment_key"], entry_snapshot=copy.deepcopy(row["entry"]))
+        if active and active.get("segment_key"):
+            origins = state.setdefault("run_origins", {})
+            origins[active["token"]] = {key: copy.deepcopy(active[key]) for key in
+                ("segment_key", "entry_snapshot", "index", "signature", "parent") if key in active}
+            if len(origins) > 128:
+                state["run_origins"] = dict(list(origins.items())[-128:])
+
+    @staticmethod
+    def _result_target(state, origin):
+        """Results follow the reserved content; removed/resized content stays archived."""
+        key = origin.get("segment_key")
+        if not key:
+            index = int(origin["index"])
+            if not 0 <= index < len(state["segments"]):
+                raise ValueError("生成结果段号超出当前分段；文件保留，不纳入当前进度")
+            return index, state["segments"][index], True
+        for index, row in enumerate(state["segments"]):
+            if row.get("segment_key") == key:
+                return index, row, True
+        retired = state.setdefault("retired_segments", [])
+        for row in retired:
+            if row.get("segment_key") == key:
+                return None, row, False
+        row = {"segment_key": key, "entry": copy.deepcopy(origin.get("entry_snapshot") or {}),
+               "signature": origin.get("signature", ""), "versions": [], "selected": None,
+               "reroll": 0, "valid": False, "accepted": False, "boundary_changed": True}
+        retired.append(row)
+        return None, row, False
+
+    @staticmethod
+    def _saved_cursor(state, saved):
+        """按段内容（entry id）找回原位置；切分导致段号变化时也能回对段。"""
+        target_key = (saved or {}).get("segment_key")
+        if target_key:
+            for index, row in enumerate(state.get("segments") or []):
+                if row.get("segment_key") == target_key:
+                    return index
+        target_id = (saved or {}).get("entry_id")
+        if target_id:
+            for index, row in enumerate(state.get("segments") or []):
+                if ((row.get("entry") or {}).get("id")) == target_id:
+                    return index
+        size = len(state.get("segments") or [])
+        if not size:
+            return 0
+        return max(0, min(int((saved or {}).get("cursor", 0)), size - 1))
+
     def sync(self, session_id, entries, signatures, template=None):
         if not entries:
             raise ValueError("请先在素材清单库加载素材，并设置总时长或段切分线")
@@ -225,37 +347,75 @@ class SessionStore:
                          "status": "ready", "auto": False, "pause_after": False,
                          "segments": [], "active": None, "merged": None, "error": ""}
             old = state["segments"]
-            changed = next((i for i, sig in enumerate(signatures)
-                            if i >= len(old) or old[i]["signature"] != sig), None)
-            if len(old) != len(entries) and changed is None:
-                changed = len(entries)
-            if changed is not None and state["status"] in {"queued", "running", "merging"}:
-                raise ValueError("当前段运行中，请等待完成后再修改素材或生成参数")
-            reference_only = self._reference_only_update(old, entries, template or state.get("template"))
-            by_id = {s["entry"]["id"]: s for s in old}
-            rows = []
-            for i, (entry, sig) in enumerate(zip(entries, signatures)):
-                previous = old[i] if reference_only else by_id.get(entry["id"], {})
-                same = i < len(old) and old[i]["entry"]["id"] == entry["id"] and old[i]["signature"] == sig
-                rows.append({"entry": entry, "signature": sig,
-                             "versions": previous.get("versions", []),
-                             "reroll":previous.get("reroll",0) if same else 0,
-                             "selected": previous.get("selected") if same else None,
-                             "valid": previous.get("valid", False) if same else False,
-                             "accepted": previous.get("accepted", False) if same else False})
+            for row in old:
+                row.setdefault("segment_key", uuid.uuid4().hex)
+            self._bind_active(state)
+            old_cursor = int(state.get("cursor", 0))
+            saved_position = self._position(state, old_cursor) if old and 0 <= old_cursor < len(old) else {}
+            old_ranges = [self._entry_range(row.get("entry") or {}) for row in old]
+            rows = [None] * len(entries)
+            used = set()
+            # 1) 同素材 ID：内容没变，连版本/选用/批准一起保留。
+            for i, entry in enumerate(entries):
+                for j, row in enumerate(old):
+                    if j in used:
+                        continue
+                    if row.get("entry", {}).get("id") == entry.get("id"):
+                        used.add(j)
+                        rows[i] = self._carry_row(row, entry, signatures[i])
+                        break
+            # 2) 源范围完全相同：段号移位但内容没变（例如前面插入别的素材）。
+            for i, entry in enumerate(entries):
+                if rows[i] is not None:
+                    continue
+                key = self._entry_range(entry)
+                for j in range(len(old)):
+                    if j in used or old_ranges[j] != key:
+                        continue
+                    used.add(j)
+                    rows[i] = self._carry_row(old[j], entry, signatures[i])
+                    break
+            # 3) 源范围有重叠：边界被移动/拆分/合并，旧版本保留但标“待更新”。
+            for i, entry in enumerate(entries):
+                if rows[i] is not None:
+                    continue
+                key = self._entry_range(entry)
+                best, best_overlap = None, 0.0
+                for j in range(len(old)):
+                    if j in used:
+                        continue
+                    overlap = self._range_overlap(key, old_ranges[j])
+                    if overlap > best_overlap + 1e-9:
+                        best, best_overlap = j, overlap
+                if best is not None and best_overlap > 1e-6:
+                    used.add(best)
+                    rows[i] = self._carry_row(old[best], entry, signatures[i], stale=True)
+            # 4) 全新段：无旧结果，等待生成。
+            for i, entry in enumerate(entries):
+                if rows[i] is None:
+                    rows[i] = {"entry": entry, "signature": signatures[i], "versions": [], "reroll": 0,
+                               "segment_key": uuid.uuid4().hex,
+                               "selected": None, "valid": False, "accepted": False, "boundary_changed": False}
+            # 5) 被删掉的旧段归档，记录与文件不丢；不参与生成/合并。
+            retired = [row for j, row in enumerate(old) if j not in used]
+            if retired:
+                state["retired_segments"] = (list(state.get("retired_segments") or []) + retired)[-200:]
             state["segments"] = rows
-            if changed is not None:
-                if reference_only:
-                    # 未变更段保留选用、批准和预览；改变参考的段由上面的 same 判断标记待重生成。
-                    state["merged"] = None
-                    state["manifest"] = None
-                else:
-                    self._invalidate(state, changed)
-                state.pop("preview_hold", None)
-                state.pop("sequential_stop", None)
-                state["cursor"] = min(changed, len(rows) - 1)
-                state["status"] = "ready"
-                state["active"] = None
+            if rows:
+                state["cursor"] = self._saved_cursor(state, saved_position)
+                active = state.get("active")
+                if active:
+                    for index, row in enumerate(rows):
+                        if row["segment_key"] == active.get("segment_key"):
+                            active["index"] = index
+                            break
+                affected = state.get("affected_run")
+                if affected and affected.get("keys"):
+                    affected["remaining"] = [i for i, row in enumerate(rows) if row["segment_key"] in affected["keys"]]
+                hold = state.get("preview_hold")
+                if hold:
+                    hold["cursor"] = self._saved_cursor(state, {"segment_key": hold.get("cursor_key"), "cursor": hold["cursor"]})
+                    hold["target"] = self._saved_cursor(state, {"segment_key": hold.get("target_key"), "cursor": hold["target"]})
             if template is not None:
                 state["template"] = template
             return self._save(state)
@@ -292,10 +452,15 @@ class SessionStore:
             if not state.get("preview_hold"):
                 state.pop("sequential_stop", None)
             token = uuid.uuid4().hex
+            try:
+                parent = self._parent(state, index)
+            except ValueError:
+                parent = None
             state["active"] = {"token": token, "index": index,
                                "reroll":state["segments"][index].get("reroll",0),
-                               "parent": self._parent(state, index),
+                               "parent": parent,
                                "signature": state["segments"][index]["signature"]}
+            self._bind_active(state)
             state["status"] = "queued"
             state["error"] = ""
             self._save(state)
@@ -312,6 +477,9 @@ class SessionStore:
         self._invalidate(state, 0)
         state.pop("preview_hold", None)
         state.pop("sequential_stop", None)
+        state.pop("run_return", None)
+        state.pop("affected_run", None)
+        state.pop("run_origins", None)
         for row in state["segments"]:
             row["selected"] = None
             row["reroll"] = 0
@@ -345,13 +513,18 @@ class SessionStore:
                 if not state.get("preview_hold"):
                     state.pop("sequential_stop", None)
                 fresh = uuid.uuid4().hex
+                try:
+                    parent = self._parent(state, index)
+                except ValueError:
+                    parent = None
                 state["active"] = {
                     "token": fresh,
                     "index": index,
                     "reroll": state["segments"][index].get("reroll", 0),
-                    "parent": self._parent(state, index),
+                    "parent": parent,
                     "signature": state["segments"][index]["signature"],
                 }
+                self._bind_active(state)
                 state["status"] = "queued"
                 state["error"] = ""
                 self._save(state)
@@ -377,42 +550,35 @@ class SessionStore:
             # auto-clear dirty token: empty / numeric megapixels leak / non-hex
             dirty = (not token) or bool(re.fullmatch(r"[-+]?\d+(?:\.\d+)?", token)) or (":" in token) or (not re.fullmatch(r"[0-9a-fA-F]{16,64}", token))
             if dirty or not active or active.get("token") != token:
-                # ready/paused/error + no matching active → reserve (wipe if busy mismatch)
-                # Aiden: 直接清掉重新开始 for dirty tokens.
-                if dirty or state.get("status") in {"ready", "paused", "error"} or not active:
-                    # release lock path: call ensure logic inline
-                    if state.get("status") not in {"ready", "paused", "error"}:
-                        self._invalidate(state, 0)
-                        for row in state["segments"]:
-                            row["selected"] = None
-                            row["reroll"] = 0
-                        state.update(cursor=0, status="ready", auto=False, active=None, pause_after=False,
-                                     epoch=state["epoch"] + 1, error="")
-                    state["active"] = None
-                    index = state["cursor"]
-                    fresh = uuid.uuid4().hex
-                    state["active"] = {"token": fresh, "index": index,
-                                       "reroll": state["segments"][index].get("reroll", 0),
-                                       "parent": self._parent(state, index),
-                                       "signature": state["segments"][index]["signature"]}
-                    state["status"] = "queued"
-                    state["error"] = ""
-                    token = fresh
-                    active = state["active"]
-                    self._save(state)
-                else:
-                    expected = (active or {}).get("token")
-                    raise ValueError(
-                        "运行令牌已过期：请清空队列后点 Segment 再点 Queue（需要 HotReload 管道一轮）；"
-                        f" session={session_id} status={state.get('status')}"
-                        f" got_token={token[:8] if token else None}…"
-                        f" expected_token={(expected[:8] + '…') if expected else None}"
-                        f" active_index={(active or {}).get('index')}"
-                    )
+                # 进度只增不减：停止后再开始、改完参数再开始、上一轮中断残留的 active，
+                # 都只在当前游标处重新预约，不清空结果、不回退游标。
+                if state.get("status") == "completed":
+                    self._reset_round(state)
+                state["active"] = None
+                index = max(0, min(int(state.get("cursor", 0)), len(state["segments"]) - 1))
+                try:
+                    parent = self._parent(state, index)
+                except ValueError:
+                    parent = None
+                fresh = uuid.uuid4().hex
+                state["active"] = {"token": fresh, "index": index,
+                                   "reroll": state["segments"][index].get("reroll", 0),
+                                   "parent": parent,
+                                   "signature": state["segments"][index]["signature"]}
+                self._bind_active(state)
+                state["status"] = "queued"
+                state["error"] = ""
+                token = fresh
+                active = state["active"]
+                self._save(state)
             if state["status"] not in {"queued", "running"}:
                 raise ValueError(
                     f"运行令牌已结束或未就绪，勿重复提交可结束；session={session_id} status={state.get('status')}"
                 )
+            if active.get("segment_key") and not any(row.get("segment_key") == active["segment_key"] for row in state["segments"]):
+                state.update(status="error", active=None, auto=False, error="预约分段范围已改变，请重新运行所选段。")
+                self._save(state)
+                raise ValueError(state["error"])
             state["status"] = "running"
             self._save(state)
             return copy.deepcopy(state)
@@ -445,11 +611,12 @@ class SessionStore:
             return False
         rows = state.get("segments") or []
         target = int(hold.get("target", 0))
-        if 0 <= target < len(rows):
+        if (0 <= target < len(rows) and
+                (not hold.get("target_key") or rows[target].get("segment_key") == hold["target_key"])):
             row = rows[target]
             if successful and hold.get("select_on_success"):
-                # 仅顺序运行主动停止后重抽停止段：保留成功的新选用，等待用户批准。
-                SessionStore._invalidate(state, target + 1)
+                # 仅顺序运行主动停止后重抽停止段：保留成功的新选用，等待用户批准；
+                # 后续段结果不再失效（进度只增不减）。
                 row["accepted"] = False
             else:
                 row["selected"] = hold.get("selected")
@@ -469,7 +636,7 @@ class SessionStore:
             active = state["active"]
             if not active or active["token"] != token or state["status"] != "running":
                 raise ValueError("生成结果所属任务已过期；文件保留，不纳入当前进度。请从当前段重新开始。")
-            row = state["segments"][active["index"]]
+            target, row, current = self._result_target(state, active)
             version = {"id": token, "file": filename, "parent": active["parent"],
                        "signature": active["signature"], "created_at": time.time()}
             version.update(details or {})
@@ -477,7 +644,12 @@ class SessionStore:
             row["selected"] = token
             row["valid"] = True
             row["accepted"] = False
+            row["boundary_changed"] = False
             state["active"] = None
+            if not current:
+                row["valid"] = False
+                state.update(status="error", auto=False, error="本次生成范围已被切分或删除；结果已保留在旧段记录，请重新运行所选段。")
+                return self._save(state)
             if self._restore_preview_hold(state, successful=True):
                 return self._save(state)
             state["status"] = "review"
@@ -490,29 +662,53 @@ class SessionStore:
             return self._save(state)
 
     def register_result(self, session_id, filename, details=None, context=None):
-        """外部工作流产出的视频在此登记为当前轮结果（等于自动 Commit），供合并与 A/B 使用。"""
+        """外部工作流产出的视频在此登记为当前轮结果（等于自动 Commit），供合并与 A/B 使用。
+
+        进度只增不减：停止/改参数/中断后再跑，只要段号有效且不是显式清空后的旧结果，
+        就作为该段的新版本追加，不再报“任务已过期”。
+        """
         with self.lock(session_id):
             state = self._load(session_id)
+            if not isinstance(context, dict) or not isinstance(context.get("index"), int):
+                raise ValueError("生成结果缺少段号上下文；文件保留，不纳入当前进度")
+            # 唯一真正的过期：期间被“清空全部进度/重启”重置过（epoch 变化）。
+            if context.get("epoch") is not None and int(context["epoch"]) != int(state.get("epoch", 0)):
+                raise ValueError("生成结果属于已被清空重置的进度；文件保留，不纳入当前进度")
             active = state.get("active")
-            if (not context or not active or context.get("token") != active.get("token")
-                    or context.get("index") != active.get("index")
-                    or context.get("index") != state["cursor"] or state["status"] != "running"):
-                raise ValueError("生成结果所属任务已过期；文件保留，不纳入当前进度")
-            index = state["cursor"]
-            if index >= len(state["segments"]):
-                raise ValueError("当前轮次已结束，无法登记结果")
-            row = state["segments"][index]
+            matched = bool(active) and context.get("token") == active.get("token")
+            reserved = (state.get("run_origins") or {}).get(context.get("token"), {})
+            origin = {**reserved, **context, **active} if matched else {**reserved, **context}
+            index, row, current = self._result_target(state, origin)
+            signature = origin.get("signature") or row["signature"]
+            try:
+                parent = self._parent(state, index) if current else origin.get("parent")
+            except ValueError:
+                parent = None
             version = {"id": uuid.uuid4().hex, "file": filename,
-                       "parent": self._parent(state, index),
-                       "signature": row["signature"], "created_at": time.time()}
+                       "parent": parent,
+                       "signature": signature or row["signature"], "created_at": time.time()}
             version.update(details or {})
             row["versions"].append(version)
             row["selected"] = version["id"]
             row["valid"] = True
             row["accepted"] = False
-            state["active"] = None
-            if not self._restore_preview_hold(state, successful=True):
-                state["status"] = "review"
+            row["boundary_changed"] = False
+            if not current:
+                row["valid"] = False
+                if matched:
+                    state.update(active=None, status="error", auto=False,
+                                 error="本次生成范围已被切分或删除；结果已保留在旧段记录，请重新运行所选段。")
+                return self._save(state)
+            if matched:
+                state["active"] = None
+                if not self._restore_preview_hold(state, successful=True):
+                    state["status"] = "review"
+            else:
+                # 停止/改参数/中断后才到达的结果：只追加版本并等待审核，不动当前运行状态。
+                state["error"] = ""
+                if state["status"] not in {"queued", "running"} and not state.get("preview_hold"):
+                    state["status"] = "review"
+                self._restore_preview_hold(state, successful=True)
             return self._save(state)
 
     def _accept(self, state):
@@ -542,6 +738,8 @@ class SessionStore:
                 if sequential_stop:
                     state["sequential_stop"] = state["cursor"]
                 state.update(auto=False, pause_after=False, active=None, status="paused", error="")
+                state.pop("run_return", None)
+                state.pop("affected_run", None)
                 state["epoch"] = int(state.get("epoch", 0)) + 1
             elif command == "cancel_preview":
                 hold=state.get("preview_hold") or {}
@@ -568,19 +766,99 @@ class SessionStore:
                     state["merged"] = None
                     state["manifest"] = None
             elif command == "approve":
+                current = state["cursor"]
                 self._accept(state)
                 state.pop("sequential_stop", None)
+                saved = state.pop("run_return", None)
+                if saved:
+                    # “运行此段”结束并批准后回到跳段前的位置（按段内容匹配，切分后也能回对）。
+                    state.update(cursor=self._saved_cursor(state, saved),
+                                 status=str(saved.get("status") or "ready"),
+                                 auto=bool(saved.get("auto", False)),
+                                 pause_after=bool(saved.get("pause_after", False)))
+                affected = state.get("affected_run")
+                if affected:
+                    remaining = [int(index) for index in affected.get("remaining", []) if int(index) > current]
+                    affected["keys"] = [state["segments"][i]["segment_key"] for i in remaining]
+                    back = affected.get("return") or {}
+                    if remaining:
+                        state["affected_run"]["remaining"] = remaining
+                        state.update(cursor=remaining[0], status="ready", auto=False, active=None, pause_after=False)
+                    else:
+                        state.pop("affected_run", None)
+                        state.update(cursor=self._saved_cursor(state, back),
+                                     status=str(back.get("status") or "ready"),
+                                     auto=bool(back.get("auto", False)),
+                                     pause_after=bool(back.get("pause_after", False)))
             elif command == "redo":
                 target = state["cursor"]
                 if options.get("index") is not None:
                     target = int(options["index"])
                     if not 0 <= target < len(state["segments"]):
                         raise ValueError("无效段号")
-                # 重抽指定段：该段及后续依赖段标记失效（旧版本文件保留），生成/审批游标切到该段。
-                self._invalidate(state, target)
+                # 重抽指定段：旧版本保留、后续段结果保留；只把目标段标为待重生成并切游标。
                 row = state["segments"][target]
                 row["reroll"] = row.get("reroll", 0) + 1
+                row["valid"] = False
+                row["accepted"] = False
+                state.pop("run_return", None)
+                state.pop("affected_run", None)
                 state.update(cursor=target, status="ready", auto=False, active=None, pause_after=False)
+            elif command in {"run_segment", "run_pending"}:
+                state.pop("affected_run", None)
+                # 方案 A：只跑指定段（新拆分出的段也能直接跑）。记住原位置，通过后回去。
+                if command == "run_pending":
+                    target = next((i for i, row in enumerate(state["segments"])
+                                   if not (row.get("valid") and row.get("accepted"))), None)
+                    if target is None:
+                        raise ValueError("没有待生成或待更新的段")
+                else:
+                    target = state["cursor"]
+                    if options.get("index") is not None:
+                        target = int(options["index"])
+                    if not 0 <= target < len(state["segments"]):
+                        raise ValueError("无效段号")
+                current_row = state["segments"][state["cursor"]] if state["segments"] else {}
+                state["run_return"] = {"cursor": state["cursor"], "status": state["status"],
+                                       "segment_key": current_row["segment_key"],
+                                       "auto": bool(state.get("auto", False)),
+                                       "pause_after": bool(state.get("pause_after", False)),
+                                       "entry_id": (current_row.get("entry") or {}).get("id")}
+                row = state["segments"][target]
+                row["reroll"] = row.get("reroll", 0) + 1
+                row["valid"] = False
+                row["accepted"] = False
+                state.update(cursor=target, status="ready", auto=False, active=None, pause_after=False, error="")
+            elif command == "run_affected":
+                # 自动重跑所有受影响段（切分/拉伸/延续/换素材导致的新段或待更新段）。
+                if "indices" in options:
+                    indices = options["indices"]
+                    if (not isinstance(indices, list) or not indices or any(type(i) is not int or
+                            not 0 <= i < len(state["segments"]) for i in indices)):
+                        raise ValueError("请选择有效的分段后运行")
+                    affected = sorted(set(indices))
+                else:
+                    affected = [index for index, row in enumerate(state["segments"])
+                                if row.get("boundary_changed") or not row.get("valid") or not row.get("versions")]
+                if not affected:
+                    raise ValueError("没有需要重跑的段（切分/素材没有变化，或所有段都已通过）")
+                current_row = state["segments"][state["cursor"]] if state["segments"] else {}
+                state.pop("run_return", None)
+                state["affected_run"] = {
+                    "remaining": affected,
+                    "keys": [state["segments"][i]["segment_key"] for i in affected],
+                    "return": {"cursor": state["cursor"], "status": state["status"],
+                               "segment_key": current_row["segment_key"],
+                               "auto": bool(state.get("auto", False)),
+                               "pause_after": bool(state.get("pause_after", False)),
+                               "entry_id": (current_row.get("entry") or {}).get("id")},
+                }
+                for index in affected:
+                    row = state["segments"][index]
+                    row["reroll"] = row.get("reroll", 0) + 1
+                    row["valid"] = False
+                    row["accepted"] = False
+                state.update(cursor=affected[0], status="ready", auto=False, active=None, pause_after=False, error="")
             elif command == "redo_preview":
                 target = state["cursor"]
                 if options.get("index") is not None:
@@ -590,6 +868,8 @@ class SessionStore:
                 # 本段抽卡只生成预览备选：不失效后续段、不动选用版本与循环游标，抽完恢复原循环位置。
                 row = state["segments"][target]
                 state["preview_hold"] = {
+                    "target_key": row["segment_key"],
+                    "cursor_key": state["segments"][state["cursor"]]["segment_key"],
                     "request_id": uuid.uuid4().hex,
                     "select_on_success": state["status"] == "paused" and state.get("sequential_stop") == target == state["cursor"],
                     "target": target,
@@ -620,9 +900,9 @@ class SessionStore:
                     raise ValueError("无效段号")
                 row = state["segments"][index]
                 version = next((v for v in row["versions"] if v["id"] == options["version"]), None)
-                if not version or version["signature"] != row["signature"] or version["parent"] != self._parent(state, index):
-                    raise ValueError("此版本的素材或前段依赖已变化，不能直接选用")
-                self._invalidate(state, index + 1)
+                if not version:
+                    raise ValueError("此版本不存在，不能选用")
+                # 进度只增不减：旧参数生成的版本仍可选用，后续段结果保留。
                 row.update(selected=version["id"], valid=True, accepted=False)
                 state.update(cursor=index, status="review", auto=False, active=None)
             elif command == "start":
@@ -651,16 +931,15 @@ class SessionStore:
 
     def selected_files(self, state):
         files = []
-        parent = None
         for row in state["segments"]:
             selected = next((v for v in row["versions"] if v["id"] == row["selected"]), None)
-            if not row["valid"] or not row["accepted"] or not selected or selected["parent"] != parent or selected["signature"] != row["signature"]:
+            # 进度只增不减：允许不同参数下生成的版本继续合并，只要求该段有已通过的有效选用。
+            if not row["valid"] or not row["accepted"] or not selected:
                 raise ValueError("仍有未通过或依赖失效的片段，暂不能合并")
             path = self.session_file(state["id"], selected["file"])
             if not path.is_file():
                 raise ValueError("选用版本文件缺失，请重做对应段")
             files.append(path)
-            parent = selected["id"]
         return files
 
 

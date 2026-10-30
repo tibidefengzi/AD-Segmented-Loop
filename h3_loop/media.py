@@ -19,13 +19,6 @@ def small_frame(frame):
     return frame[::max(1,frame.shape[0]//64),::max(1,frame.shape[1]//64)].astype(np.float32)
 
 
-def boundary_bad(frame):
-    image=small_frame(frame)
-    if not np.isfinite(image).all():return True
-    mean,std=float(image.mean()),float(image.std())
-    return std<.004 and (mean<.006 or mean>.994)
-
-
 def best_handoff(frames):
     results=[]
     for index,frame in enumerate(frames):
@@ -61,8 +54,15 @@ def snap_images_to_h3(images, alpha=None):
                            "crop_xy": [left, top]}
 
 
-def normalize_video(video,context,state,directory,detect_bad=True,strict_sync=False):
-    """Keep exactly the independent target frames; never freeze missing frames."""
+def normalize_video(video,context,state,directory,strict_sync=False):
+    """Keep exactly the independent target frames; never freeze missing frames.
+
+    帧序列对齐规则（用户 2026-10-29 确认）：
+    - 每段目标帧数 = floor(音频秒数 × 24 + 0.5)，H3 因 17k+5 上吸多生成的帧一律从**尾部**裁掉；
+    - 从头保留 target 帧（有 overlap 时先扣掉重叠前缀），**不剔除开头坏帧、不做坏帧检测**，
+      避免取帧窗口整体位移、画面节奏跟参考视频对不上；
+    - 帧数不足直接报错，不重复补帧；音频仍按严格模式锁到 target × 2000 个 48 kHz 采样点。
+    """
     import torch
     from comfy_api.input_impl import VideoFromComponents
     from comfy_api.latest._util import VideoComponents
@@ -74,10 +74,7 @@ def normalize_video(video,context,state,directory,detect_bad=True,strict_sync=Fa
     entry=state["segments"][context["index"]]["entry"]
     target=target_frames(entry["seconds_float"])
     overlap=int(context.get("overlap_frames",0))
-    window=min(8,len(images))
-    bad={i for i in [*range(window),*range(max(window,len(images)-window),len(images))]
-         if detect_bad and boundary_bad(images[i])}
-    good=[i for i in range(len(images)) if i not in bad]
+    available=int(images.shape[0])
     # Continuum Finish already strips Join context. Commit must keep the first
     # `target` frames and set overlap_frames=0 — never treat Continuum output as
     # pixel-handoff (prefix+body). The old length heuristic only caught the
@@ -94,19 +91,20 @@ def normalize_video(video,context,state,directory,detect_bad=True,strict_sync=Fa
         commit_target = target - trim
     else:
         commit_target = target
-    if len(good) < commit_target:
-        raise ValueError(f"有效生成帧不足：需要至少 {commit_target} 帧，实际 {len(good)} 帧。请加大 Continuum extend_seconds 或重做；不会冻结补帧。")
-    if not continuum_trimmed and len(good) < target + overlap:
-        raise ValueError(f"有效生成帧不足：需要 {target+overlap} 帧（含重叠），实际 {len(good)} 帧。请重做；不会冻结补帧。")
+    if available < commit_target:
+        raise ValueError(f"有效生成帧不足：需要至少 {commit_target} 帧，实际 {available} 帧。请加大 Continuum extend_seconds 或重做；不会冻结补帧。")
+    if not continuum_trimmed and available < target + overlap:
+        raise ValueError(f"有效生成帧不足：需要 {target+overlap} 帧（含重叠），实际 {available} 帧。请重做；不会冻结补帧。")
     if continuum_trimmed:
         why = "本次任务绑定的 Continuum 状态"
-        print(f"AidenH3: Continuum 已裁重叠（{why}），按目标 {commit_target} 帧入库（收到 {len(good)}）")
+        print(f"AidenH3: Continuum 已裁重叠（{why}），按目标 {commit_target} 帧入库（收到 {available}）")
         prefix = None
         overlap = 0
-        indices = good[:commit_target]
+        indices = list(range(commit_target))
     else:
-        prefix=images[good[:overlap]] if overlap else None
-        indices=good[overlap:overlap+target]
+        # 按参考视频帧序列裁剪：保留开头 target 帧，多生成的帧从尾部丢弃。
+        prefix=images[:overlap] if overlap else None
+        indices=list(range(overlap, overlap+target))
     body=images[indices]
     audio=components.audio or read_audio_entry(entry)
     if audio is not None:
@@ -145,7 +143,7 @@ def normalize_video(video,context,state,directory,detect_bad=True,strict_sync=Fa
     tail=body[-keep:].detach().cpu().numpy()
     with (directory/tail_name).open("xb") as handle:frames.save_frames(handle,tail)
     details={"frames":commit_target,"fps":FPS,"width":int(body.shape[2]),"height":int(body.shape[1]),
-             "tail_file":tail_name,"tail_frames":len(tail),"dropped_frames":sorted(bad),
+             "tail_file":tail_name,"tail_frames":len(tail),
              "overlap_frames":overlap,"strict_sync":bool(strict_sync),"handoff":best_handoff(tail)}
     if continuum_record:
         details["continuum_file"] = continuum_record["file"]

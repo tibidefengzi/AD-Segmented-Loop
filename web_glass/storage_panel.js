@@ -19,7 +19,7 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
     const showMessage = text => { message.textContent = text; message.hidden = !text; scheduleLayout?.(40); };
     const fetchUsage = () => {
         if (!pendingUsage) pendingUsage = (async () => {
-            const response = await api.fetchApi("/aiden_h3/storage");
+            const response = await api.fetchApi("/aiden_h3/storage", {cache:"no-store"});
             const data = await response.json();
             if (!response.ok || data.error) throw new Error(data.error || "占用统计接口尚未就绪，请安全重启后使用");
             return data;
@@ -60,6 +60,7 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
     if (clearSources) clearSources.onclick = () => {
         if (cleaning) return;
         if (typeof onClearAll === "function") onClearAll();
+        void refresh().catch(() => {});
     };
     button.onclick = async () => {
         if (cleaning) return;
@@ -78,7 +79,13 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
         } catch (error) { showMessage(error.message); }
         finally { cleaning = false; if (!disposed) void refresh().catch(() => {}); }
     };
-    const timer = setInterval(() => { if (!document.hidden && root.isConnected) void refresh().catch(() => {}); }, 60000);
+    const onFocus=()=>{if(!disposed&&!document.hidden&&root.isConnected)void refresh().catch(()=>{});};
+    const summary=panel.querySelector(".h3-storage-summary");
+    summary.title="点击刷新磁盘占用统计";summary.style.cursor="pointer";
+    summary.addEventListener("click",event=>{event.stopPropagation();onFocus();});
+    window.addEventListener("focus",onFocus);
+    document.addEventListener("visibilitychange",onFocus);
+    const timer = setInterval(onFocus, 15000);
     void refresh().catch(() => {});
-    return {refresh, canImport, dispose() { disposed = true; clearInterval(timer); }};
+    return {refresh, canImport, dispose() { disposed = true; clearInterval(timer);window.removeEventListener("focus",onFocus);document.removeEventListener("visibilitychange",onFocus); }};
 }

@@ -45,7 +45,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     const saveRow = document.createElement("div");
     saveRow.className = "ad-h3-save-row";
     saveRow.innerHTML = '<span class="ad-h3-save-label">保存路径</span>'
-        + '<input type="text" data-save-dir placeholder="留空：ComfyUI/output/AD-Segmented-Loop-output/（按类型归档）">'
+        + '<input type="text" data-save-dir placeholder="留空：用户桌面/AD-生成">'
         + '<button type="button" data-save-pick>选择目录</button>'
         + '<span class="ad-h3-save-label">文件名</span>'
         + '<input type="text" data-save-name placeholder="默认：AD-{index}-{date}">'
@@ -77,7 +77,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     // 下载前弹出系统文件夹选择框；选中后同步到保存路径输入框。
     async function chooseSaveFolder() {
         try {
-            const response = await fetch("/aiden_h3/pick_folder", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+            const response = await fetch("/aiden_h3/pick_folder", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({initial_dir: saveState.dir})});
             const result = await response.json();
             const path = String(result.path || "").trim();
             if (path) { dirInput.value = path; syncSaveConfig(); }
@@ -515,6 +515,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     });
     // 走 ComfyUI 原生“运行”按钮，保证顶部队列/活动任务状态同步显示
     node._adH3Run = () => {
+        if (node._adH3AffectedRunning) { node._adH3Hint?.("正在运行所选段，请等待完成或先点停止。", true); return false; }
+        node._adH3FollowCurrent?.();
         previewPinned = false;
         const buttons = [...document.querySelectorAll("button")];
         const native = buttons.find(button => /^(运行|Queue)$/.test((button.textContent || "").trim()))
@@ -884,6 +886,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     const interruptNow = () => { try { void fetch("/interrupt", { method: "POST", headers: { "Content-Type": "application/json" } }); } catch {} };
     for (const button of root.querySelectorAll("[data-loop]")) button.addEventListener("click", () => {
         const command = button.dataset.loop;
+        if (node._adH3AffectedRunning && command !== "pause") {
+            node._adH3Hint?.("正在运行所选段，请等待完成或先点停止。", true); return;
+        }
         // 用户主动开始生成/分段循环/批准/合并时解除预览固定，新结果照常自动显示。
         if (["start", "auto", "approve", "merge"].includes(command)) previewPinned = false;
         if (command === "start") {
@@ -913,6 +918,24 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
                 }
             }
             // 与 ComfyUI 蓝色“运行”按钮一致：把当前工作流加入执行队列
+            // 当前段已有有效但未批准的结果：点「开始」= 先按「通过」处理，再继续下一段，
+            // 不再把请求直接塞进队列触发后台“当前段有待审核结果”的保护。
+            if (latestSessionState && latestSessionState.status === "review") {
+                const currentRow = latestSessionState.segments?.[latestSessionState.cursor];
+                if (currentRow?.valid && typeof node._adH3Act === "function") {
+                    node._adH3Hint?.("当前段有待审核结果：先按「通过」处理，并继续生成下一段…", false);
+                    Promise.resolve(node._adH3Act("approve"))
+                        .then(result => {
+                            if (result && result.status !== "completed" && typeof node._adH3Run === "function") node._adH3Run();
+                        })
+                        .catch(error => {
+                            node._adH3Hint?.("通过当前段失败：" + (error?.message || String(error)), true);
+                        });
+                    return;
+                }
+                node._adH3Hint?.("当前段有待审核结果，请先在预览审批点「同意批准」或「本段抽卡」。", true);
+                return;
+            }
             const app = window.app || (window.comfyAPI && window.comfyAPI.app && window.comfyAPI.app.app);
             if (typeof node._adH3Run === "function") node._adH3Run();
             else try { void app?.queuePrompt?.(0, 1); } catch {}
@@ -1097,6 +1120,29 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         openLightbox(active || {url: imageView.src, origin: "media", file: ""});
     });
 
+    let videoWatchdog = 0, videoRetriedOnce = false;
+    const armVideoWatchdog = () => {
+        if (videoWatchdog) clearTimeout(videoWatchdog);
+        videoWatchdog = setTimeout(() => {
+            if (disposed || !active || active.kind !== "video") return;
+            if (video.readyState >= 1 || !video.getAttribute("src")) return;
+            if (!videoRetriedOnce) {
+                videoRetriedOnce = true;
+                try {
+                    const retryUrl = new URL(video.getAttribute("src"), location.href);
+                    retryUrl.searchParams.set("retry", String(Date.now()));
+                    video.src = retryUrl.href;
+                    video.load();
+                } catch (error) { /* 保持原地址 */ }
+                armVideoWatchdog();
+                return;
+            }
+            title.textContent = `${active.label || "预览"} · 视频加载失败（文件可能已清理或服务繁忙），请刷新页面后重试`;
+            node._adH3Hint?.("预览视频加载失败：文件可能已被清理或后端繁忙，请 Ctrl+F5 刷新后再试。", true);
+        }, 4000);
+    };
+    video.addEventListener("loadedmetadata", () => { videoRetriedOnce = false; if (videoWatchdog) { clearTimeout(videoWatchdog); videoWatchdog = 0; } });
+    video.addEventListener("error", () => { if (videoWatchdog) { clearTimeout(videoWatchdog); videoWatchdog = 0; } });
     function show(info, options = {}) {
         if (disposed || !info?.url) return false;
         const kind = info.kind === "image" ? "image" : info.kind === "audio" ? "audio" : "video";
@@ -1127,6 +1173,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             mute.textContent = video.muted ? "取消静音" : "静音";
             if (video.getAttribute("src") !== info.url) { video.src = info.url; video.load(); }
             else video.currentTime = 0;
+            armVideoWatchdog();
             const mediaRef = {origin: info.origin || "media", file: info.file || ""};
             fetchMediaFps(mediaRef).then(fps => { activeFps = fps > 0 ? fps : 24; updateTime(); });
         }

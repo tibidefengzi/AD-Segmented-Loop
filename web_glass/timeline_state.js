@@ -35,6 +35,12 @@ export function repairSourceInstances(state) {
 }
 
 const FPS = 24, HALF_FRAME = .5 / FPS;
+/** 当前保留素材的外边界；切断不丢内容，首尾裁掉的范围不能再拖回。 */
+export function retainedSourceBounds(state, sourceId) {
+    const clips=[...(state.video_tracks||[]),...(state.audio_tracks||[])].flat().filter(clip=>clip.source===sourceId);
+    if(!clips.length)return null;
+    return [Math.min(...clips.map(clip=>clip.src_in)),Math.max(...clips.map(clip=>clip.src_out))];
+}
 export function prependEmptyLane(lanes, limit = 3) {
     if (lanes.filter(lane => lane?.length).length >= limit) return false;
     const empty = lanes.findIndex(lane => !lane?.length);

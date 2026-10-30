@@ -44,8 +44,13 @@ SEGMENT_REF_NAMES = (
 )
 
 
-SEGMENT_EXTRA_NAMES = ()
-SEGMENT_EXTRA_TYPES = ()
+SEGMENT_EXTRA_NAMES = ("mask_frames",)
+SEGMENT_EXTRA_TYPES = ("IMAGE",)
+
+# 参考视频口输出统一等比缩放到“最长边 864”像素（用户 2026-10-29 确认）。
+# H3 内部还会按自己的 adapt_canvas（短边 768 / 面积上限 768×1344 / 32 对齐）再重采样；
+# 这里先缩是为了把解码内存与 frame-cache 从 1080p 级降到 864 级，避免整机被拉爆。
+REF_VIDEO_LONG_EDGE = 864
 
 class SegmentOutputTypes(tuple):
     """当前段：前 N 口固定类型，其后为动态参考素材口（视频参考口按 H3 要求输出 IMAGE 帧）。"""
@@ -191,6 +196,10 @@ def _round_video(source):
     return assets.load_video_object(source, start_time=start, duration=end-start)
 
 def _stack_image_sources(sources):
+    return assets.cached_media("aligned-image-batch", sources, [], lambda: _stack_image_sources_uncached(sources))
+
+
+def _stack_image_sources_uncached(sources):
     """把多张图片叠成一个 IMAGE 批次（尺寸不同时等比缩放后居中填充到第一张的尺寸，不拉伸、不裁切）。"""
     import torch
     tensors = []
@@ -234,6 +243,11 @@ def _round_image_legacy(state, index):
 
 
 def _audio_window_full(path, begin, want, sample_rate=48000):
+    return assets.cached_media("video-audio-full-window", path, [begin, want, sample_rate],
+                               lambda: _audio_window_full_uncached(path, begin, want, sample_rate))
+
+
+def _audio_window_full_uncached(path, begin, want, sample_rate=48000):
     """完整解码后按采样窗口截取（保底路径，行为与旧实现一致）。"""
     import av
     import numpy as np
@@ -253,6 +267,11 @@ def _audio_window_full(path, begin, want, sample_rate=48000):
 
 
 def _audio_window_seek(path, begin, want, sample_rate=48000):
+    return assets.cached_media("video-audio-seek-window", path, [begin, want, sample_rate],
+                               lambda: _audio_window_seek_uncached(path, begin, want, sample_rate))
+
+
+def _audio_window_seek_uncached(path, begin, want, sample_rate=48000):
     """只解码本段附近音频：seek 到起点前 0.5 秒，按 pts 对齐；定位失败返回 None。"""
     import av
     import numpy as np
@@ -358,11 +377,21 @@ def _frame_buffer(shape):
     return buffer
 
 
-def _video_frames(source, start=0, count=None, start_time=None, end_time=None):
-    """把视频素材解码成 IMAGE 帧张量（可选窗口）。
+def _video_frames(source, start=0, count=None, start_time=None, end_time=None, long_edge=None):
+    if not source:
+        return None
+    return assets.cached_media("reference-video-frames", source, [start, count, start_time, end_time, long_edge],
+                               lambda: _video_frames_uncached(source, start, count, start_time, end_time, long_edge),
+                               allow_large=True)
+
+
+def _video_frames_uncached(source, start=0, count=None, start_time=None, end_time=None, long_edge=None):
+    """把视频素材解码成 IMAGE 帧张量（可选窗口、可选统一最长边缩放）。
 
     内存友好：一次性预分配 float32 输出，逐帧就地写入并 /255，
     避免“先叠 uint8、再转 float、再除”造成的多份大缓冲（VHS 同思路）。
+    long_edge 给定时在解码阶段就用 PyAV 的 reformat 等比缩放（长边 = long_edge），
+    不会先分配原分辨率的整段缓冲。
     """
     if not source:
         return None
@@ -373,8 +402,21 @@ def _video_frames(source, start=0, count=None, start_time=None, end_time=None):
         path = assets.resolve_source(source)
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
+            if start_time is not None and start_time > 0 and not start:
+                try:
+                    container.seek(int(start_time / stream.time_base), stream=stream, backward=True)
+                except Exception:
+                    # Preserve the original sequential fallback for unseekable files.
+                    container.seek(0)
             total = (max(1, math.ceil((end_time - start_time) * float(stream.average_rate or FPS)))
                      if start_time is not None and end_time is not None else int(count or stream.frames or 0))
+            target = None
+            if long_edge:
+                long_edge = max(2, int(long_edge))
+                source_w, source_h = int(stream.width or 0), int(stream.height or 0)
+                if source_w > 0 and source_h > 0:
+                    scale = long_edge / float(max(source_w, source_h))
+                    target = (max(2, int(round(source_w * scale))), max(2, int(round(source_h * scale))))
             out = None
             index = 0
             written = 0
@@ -389,6 +431,8 @@ def _video_frames(source, start=0, count=None, start_time=None, end_time=None):
                 if index < start:
                     index += 1
                     continue
+                if target is not None:
+                    frame = frame.reformat(width=target[0], height=target[1], format="rgb24")
                 array = frame.to_ndarray(format="rgb24")
                 if out is None:
                     if total <= 0:
@@ -426,6 +470,75 @@ def _lane_clip_for_segment(lane, segment_index):
     return clips[segment_index % len(clips)], False
 
 
+def _fit_reference_frames(frames, height, width):
+    """把不同尺寸的参考视频帧统一到同一画布：等比缩放 + 居中补黑，便于多片段顺序拼接。"""
+    import torch
+    if int(frames.shape[1]) == int(height) and int(frames.shape[2]) == int(width):
+        return frames
+    batch, src_h, src_w, _ = frames.shape
+    data = frames[..., :3].movedim(-1, 1)
+    scale = min(width / float(src_w), height / float(src_h))
+    new_w = max(2, int(round(src_w * scale)))
+    new_h = max(2, int(round(src_h * scale)))
+    if (new_h, new_w) != (src_h, src_w):
+        data = torch.nn.functional.interpolate(data, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    canvas = torch.zeros((batch, 3, int(height), int(width)), dtype=data.dtype)
+    top, left = (int(height) - new_h) // 2, (int(width) - new_w) // 2
+    canvas[:, :, top:top + new_h, left:left + new_w] = data
+    return canvas.movedim(1, -1)
+
+
+def _canvas_mask_frames(source, window, width, height):
+    """遮罩专用输出：本段视频帧按生成画布缩放，并补齐/裁到本段帧数（尾部重复末帧）。"""
+    import torch
+    if source is None:
+        return None
+    video = _round_video(source)
+    if video is None:
+        return None
+    try:
+        images = video.get_components().images
+    except Exception:
+        return None
+    if images is None or not len(images):
+        return None
+    frames = _fit_reference_frames(images[..., :3].float(), int(height), int(width))
+    count = max(1, int(window.get("frame_count") or frames.shape[0]))
+    if frames.shape[0] > count:
+        frames = frames[:count]
+    elif frames.shape[0] < count:
+        frames = torch.cat([frames, frames[-1:].expand(count - frames.shape[0], -1, -1, -1)], dim=0)
+    return frames
+
+
+def _reference_video_window_frames(lane, source_map, start, end):
+    """参考视频按当前段窗口裁剪：只解码与本段 [start,end] 相交的片段范围，按时间顺序拼接。
+
+    - 帧数 = 本段在时间线上的实际帧数（与本段视频口一致），不再跟生成帧数（17k+5 上吸值）对齐；
+    - 单条铺满整条时间线的素材也会按段切开；
+    - 统一缩放到最长边 REF_VIDEO_LONG_EDGE；不足 5 帧用末帧补足（H3 参考视频下限）。
+    """
+    import torch
+    pieces = []
+    for clip in sorted(lane or [], key=lambda item: clip_span(item)[0]):
+        lo = max(float(start), float(clip_span(clip)[0]))
+        hi = min(float(end), float(clip_span(clip)[1]))
+        if hi - lo <= .5 / FPS:
+            continue
+        source = source_map[clip["source"]]
+        first = float(clip["src_in"]) + (lo - float(clip_span(clip)[0]))
+        last = first + (hi - lo)
+        frames = _video_frames(source, start_time=first, end_time=last, long_edge=REF_VIDEO_LONG_EDGE)
+        if frames is not None and len(frames):
+            if frames.shape[0] < 5:
+                frames = torch.cat([frames, frames[-1:].expand(5 - frames.shape[0], -1, -1, -1)], dim=0)
+            pieces.append(frames)
+    if not pieces:
+        return None
+    if len(pieces) == 1:
+        return pieces[0]
+    height, width = int(pieces[0].shape[1]), int(pieces[0].shape[2])
+    return torch.cat([_fit_reference_frames(item, height, width) for item in pieces], dim=0)
 def _full_lane_audio_pieces(lane, source_map):
     """整条音频复用：按时间线顺序拼接该轨道所有片段，不受当前段起止范围裁剪。"""
     pieces = []
@@ -530,23 +643,24 @@ def _timeline_material_values(queue, used=None, index=None, window=None):
         allowed = source is not None and image_scopes.get(source.get("id"), -1) in (-1, 0, segment_index + 1)
         values.append(assets.load_image_tensor(source) if needed(slot) and allowed else None)
     video_base = base + MAX_IMAGE_PORTS
+    # 参考视频帧数 = 本段在时间线上的实际帧数（与本段视频一致），不跟生成帧数对齐。
     for index in range(MAX_VIDEO_PORTS):
         slot = video_base + index
         frames = None
         if needed(slot) and index < len(video_lanes) and seconds > 0:
             number, lane = video_lanes[index]
-            clip, _whole = _lane_clip_for_segment(lane, segment_index)
-            if clip is not None:
-                source = source_map[clip["source"]]
-                frames = _video_frames(source, start_time=float(clip["src_in"]), end_time=float(clip["src_out"]))
+            # 参考视频按段窗口裁剪 + 统一缩放到最长边 REF_VIDEO_LONG_EDGE；
+            # 视频轨静音只影响声音，不隐藏画面。
+            if lane:
+                frames = _reference_video_window_frames(lane, source_map, start, end)
         values.append(frames)
     audio_video_base = base + MAX_IMAGE_PORTS + MAX_VIDEO_PORTS
     for index in range(MAX_VIDEO_PORTS):
         slot = audio_video_base + index
         if needed(slot) and index < len(video_lanes) and seconds > 0:
             number, lane = video_lanes[index]
-            clip, _whole = _lane_clip_for_segment(lane, segment_index)
-            values.append(_video_clip_audio(state, number, clip, source_map) if clip is not None else None)
+            # 参考视频音频同样按当前段窗口取该轨道的音轨（空隙补静音，轨道静音则全静音）。
+            values.append(_reference_video_audio(state, number, lane, source_map, start, end) if lane else None)
         else:
             values.append(None)
     audio_base = base + MAX_IMAGE_PORTS + 2 * MAX_VIDEO_PORTS
@@ -613,7 +727,9 @@ class AidenH3AudioQueue:
             main_cfg = editor_cfg
         elif editor_cfg.get("max_frames") is not None and main_cfg.get("max_frames") is None:
             main_cfg = dict(main_cfg, max_frames=editor_cfg["max_frames"])
-        plan = timeline_plan(_json.dumps(main_cfg, ensure_ascii=False))  # old queue formats auto-migrate to timeline
+        raw = _json.dumps(main_cfg, ensure_ascii=False)
+        assets.PREPARED_MEDIA.bind(str(unique_id or "material-queue"), timeline_identity(raw))
+        plan = timeline_plan(raw)  # old queue formats auto-migrate to timeline
         state = plan["timeline"]
         queue = {"entries": plan["entries"], "timeline": state, "references": reference_pack(state)}
         # ref image/av ports removed; media flows via current-segment outputs
@@ -720,8 +836,9 @@ def _decode_audio(source):
 
 
 def _original_audio(entry, state=None, index=0):
-    """源音频直读当前段关联的音频轨原文件；不截段、不混音、不从视频回退。"""
+    """源音频输出关联素材的裁后目标；整段复用，不按生成段截断或混入视频声。"""
     from .audio import load_audio
+    from .timeline import retained_source_range
     if state:
         priority = _priority_of_kind(state, "audio")
         if priority:
@@ -733,7 +850,9 @@ def _original_audio(entry, state=None, index=0):
             for clip in lane:
                 lo, hi = clip_span(clip)
                 if min(end, hi) - max(start, lo) > .5 / FPS:
-                    return load_audio(assets.resolve_source(_original_source(sources[clip["source"]])))
+                    from .audio import load_audio_range
+                    first, last = retained_source_range(state, clip["source"], clip)
+                    return load_audio_range(assets.resolve_source(_original_source(sources[clip["source"]])), first, last)
         return None
     pieces = []
     for track in (entry.get("timeline_audio") or {}).get("tracks", []):
@@ -742,6 +861,13 @@ def _original_audio(entry, state=None, index=0):
         from .audio import load_audio, resolve_entry
         return load_audio(resolve_entry(pieces[0]))
     return None
+
+
+def _source_video(source, state):
+    from .timeline import retained_source_range
+    retained = source.get("retained_range") or retained_source_range(state, source.get("id"))
+    first, duration = (retained[0], retained[1] - retained[0]) if retained else (0.0, 0.0)
+    return assets.load_video_object(_original_source(source), start_time=first, duration=duration, normalize=False)
 
 
 class AidenH3Segment:
@@ -757,7 +883,7 @@ class AidenH3Segment:
                 "optional": {"queue": ("H3_AUDIO_QUEUE",),
                              "aspect_ratio": (list(ASPECT_CHOICES), {"default": DEFAULT_ASPECT}),
                              "megapixels": ("FLOAT", {"default": 0.5, "min": 0.05, "max": 64.0, "step": 0.1, "tooltip": "百万像素，自由填写"}),
-                             "multiple": ("INT", {"default": 16, "min": 1, "max": 64, "tooltip": "倍数（宽高按此倍数对齐）"}),
+                             "multiple": ("INT", {"default": 32, "min": 1, "max": 64, "tooltip": "倍数（宽高按此倍数对齐）"}),
                              "正向提示词": ("STRING", {"multiline": True, "default": ""}),
                              "统一提示词前缀": ("STRING", {"multiline": True, "default": ""}),
                              "反向提示词": ("STRING", {"multiline": True, "default": ""}),
@@ -778,11 +904,11 @@ class AidenH3Segment:
 
     @classmethod
     def IS_CHANGED(cls, queue=None, aspect_ratio=DEFAULT_ASPECT, megapixels=DEFAULT_MEGAPIXELS,
-                   multiple=16, prompt=None, unique_id=None, **kwargs):
+                   multiple=32, prompt=None, unique_id=None, **kwargs):
         # 每轮都必须重新取“当前段”素材，避免轮次变化被缓存复用
         return float("nan")
 
-    def select(self, queue=None, aspect_ratio=DEFAULT_ASPECT, megapixels=DEFAULT_MEGAPIXELS, multiple=16,
+    def select(self, queue=None, aspect_ratio=DEFAULT_ASPECT, megapixels=DEFAULT_MEGAPIXELS, multiple=32,
                prompt_text="", prompt_prefix="", negative_prompt="", prompt=None, unique_id=None, extra_pnginfo=None, **kwargs):
         body_text = kwargs.get("正向提示词", prompt_text)
         negative_text = kwargs.get("反向提示词", negative_prompt)
@@ -831,7 +957,7 @@ class AidenH3Segment:
             total = 0
             for size, count in zip(sizes, wanted):
                 total += min(size, count) if isinstance(count, int) and count >= 0 else size
-            return fixed + tuple([None] * total)
+            return fixed + tuple([None] * total) + (None,)
         session_id = str(state.get("session_id") or (f"AD-H3-{unique_id}" if unique_id is not None else "AD-H3-session"))
         fps = float(FPS)
         validate_fps(fps)
@@ -885,6 +1011,16 @@ class AidenH3Segment:
             if slots:
                 used = slots
         need = lambda slot: used is None or slot in used
+        try:
+            import json as _json
+            counts = _json.loads(kwargs.get("ref_counts") or "{}")
+        except Exception:
+            counts = {}
+        sizes = [MAX_IMAGE_PORTS, MAX_VIDEO_PORTS, MAX_VIDEO_PORTS, MAX_AUDIO_PORTS]
+        wanted = [counts.get("image"), counts.get("video"), counts.get("video_audio"), counts.get("audio")]
+        active_sizes = [min(size, count) if isinstance(count, int) and count >= 0 else size
+                        for size, count in zip(sizes, wanted)]
+        extra_slot = len(SEGMENT_FIXED_TYPES) + sum(active_sizes)
         timeline_video = entry.get("video_source")
         if timeline_video is not None and not batch_source:
             mapped = {"start_frame": round(timeline_video["src_in"] * FPS),
@@ -893,6 +1029,9 @@ class AidenH3Segment:
         prompts = state.get("prompts") or []
         state_prompt = str(prompts[index % len(prompts)]) if prompts else ""
         context = {"session_id": session_id, "token": run_token, "index": index,
+                   "segment_key": session["active"].get("segment_key"),
+                   "entry_snapshot": session["active"].get("entry_snapshot"),
+                   "epoch": int(session.get("epoch", 0)),
                    "fps": fps, "width": width, "height": height,
                    "aspect_ratio": aspect_ratio,
                    "megapixels": float(megapixels),
@@ -902,7 +1041,7 @@ class AidenH3Segment:
                    "video_segment": None if timeline_video is None else timeline_video.get("name"),
                    "video_segment_file": None if timeline_video is None else timeline_video["file"],
                    "prompt_text": state_prompt, **window}
-        source_video = assets.load_video_object(_original_source(entry["source_video"]), normalize=False) if (need(12) and entry.get("source_video")) else None
+        source_video = _source_video(entry["source_video"], state) if (need(12) and entry.get("source_video")) else None
         original_audio = _original_audio(entry, state, index) if need(13) and not batch_source else None
         round_image = _round_image(state, index) if need(9) and not batch_source else None
         # 时间线音频必须按本段范围取样，不能每一轮重播整条原音频。
@@ -911,7 +1050,7 @@ class AidenH3Segment:
         round_audio = (_segment_audio(entry, window) if use_segment_audio else _round_audio(state, index)) if need(10) and not batch_source else None
         if round_audio is None and need(10) and not batch_source:
             round_audio = _segment_audio(entry, window)
-        segment_source = (entry.get("video_source") if batch_source else _segment_video_source(state, index, entry)) if need(2) or need(11) else None
+        segment_source = (entry.get("video_source") if batch_source else _segment_video_source(state, index, entry)) if need(2) or need(11) or need(extra_slot) else None
         first_frame = (assets.video_first_frame(segment_source, float(segment_source["src_in"]), float(segment_source["src_out"]))
                        if need(2) and segment_source is not None else None)
         round_video = (_round_video(segment_source) if not batch_source else
@@ -945,15 +1084,7 @@ class AidenH3Segment:
         fixed = (context, index, first_frame, window["frame_count"], fps,
                  width, height, positive, negative,
                  round_image, round_audio, round_video, source_video, original_audio)
-        try:
-            import json as _json
-            counts = _json.loads(kwargs.get("ref_counts") or "{}")
-        except Exception:
-            counts = {}
-        sizes = [MAX_IMAGE_PORTS, MAX_VIDEO_PORTS, MAX_VIDEO_PORTS, MAX_AUDIO_PORTS]
-        wanted = [counts.get("image"), counts.get("video"), counts.get("video_audio"), counts.get("audio")]
-        active_sizes = [min(size, count) if isinstance(count, int) and count >= 0 else size
-                        for size, count in zip(sizes, wanted)]
+        extra_slot = len(SEGMENT_FIXED_TYPES) + sum(active_sizes)
         schema_used = None
         if used is not None:
             schema_used = {slot for slot in used if slot < len(SEGMENT_FIXED_TYPES)}
@@ -972,7 +1103,10 @@ class AidenH3Segment:
                 out_refs.extend(refs[offset:offset + size])
             offset += size
         out_refs.extend(refs[offset:])
-        return fixed + tuple(out_refs)
+        extra_frames = None
+        if need(extra_slot) and segment_source is not None and not batch_source:
+            extra_frames = _canvas_mask_frames(segment_source, window, width, height)
+        return fixed + tuple(out_refs) + (extra_frames,)
 
 
 class AidenH3SegmentMedia:
@@ -1124,8 +1258,7 @@ class AidenH3Commit:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"video": ("VIDEO",), "context": ("H3_LOOP_CONTEXT",)},
-                "optional":{"detect_bad_frames":("BOOLEAN",{"default":True}),
-                            "strict_sync":("BOOLEAN",{"default":True,"tooltip":"默认开启：每段音频最多微调半帧，逐段贴合 24 FPS，消除累计偏差"}),
+                "optional":{"strict_sync":("BOOLEAN",{"default":True,"tooltip":"默认开启：每段音频最多微调半帧，逐段贴合 24 FPS，消除累计偏差"}),
                             "prompt_text":("STRING",{"default":"","forceInput":True})},
                 "hidden":{"prompt":"PROMPT"}}
 
@@ -1136,7 +1269,7 @@ class AidenH3Commit:
     CATEGORY = CATEGORY
     DESCRIPTION = "保存当前段的选用版本、保真素材与同步信息，并交给视频预览审核。"
 
-    def commit(self, video, context, detect_bad_frames=True, strict_sync=True, prompt_text="", prompt=None):
+    def commit(self, video, context, strict_sync=True, prompt_text="", prompt=None):
         session_id, token = context["session_id"], context["token"]
         directory = STORE.directory(session_id)
         directory.mkdir(parents=True, exist_ok=True)
@@ -1147,7 +1280,7 @@ class AidenH3Commit:
         try:
             from .media import normalize_video
             current=STORE.read(session_id)
-            normalized,details=normalize_video(video,context,current,directory,detect_bad_frames,strict_sync)
+            normalized,details=normalize_video(video,context,current,directory,strict_sync=strict_sync)
             details["prompt_text"]=prompt_text
             details["seeds"]={key:{k:v for k,v in node.get("inputs",{}).items() if k in {"seed","noise_seed"}}
                               for key,node in (prompt or {}).items() if any(k in node.get("inputs",{}) for k in ("seed","noise_seed"))}
@@ -1250,7 +1383,7 @@ class AidenH3VideoPreview:
                     details = {"frames": media.get_frame_count(), "fps": rate, "width": media.get_dimensions()[0],
                                "height": media.get_dimensions()[1], "seconds": media.get_frame_count() / rate}
                 else:
-                    normalized, details = normalize_video(media, loop_context, current, session_dir, True, True)
+                    normalized, details = normalize_video(media, loop_context, current, session_dir, strict_sync=True)
                 name = f"segment_{loop_context['index'] + 1:04d}_{uuid.uuid4().hex[:8]}.mp4"
                 normalized.save_to(str(session_dir / name))
                 details.update(media_kind="video", prompt_text=loop_context.get("prompt_text", ""))
@@ -1314,16 +1447,14 @@ class AidenH3VideoPreview:
             else:
                 source = directory / record["file"]
             if source.is_file():
-                import folder_paths
-                from . import layout, dedupe
-                from .save_target import save_with_template
+                from . import dedupe
+                from .save_target import save_with_template, configured_directory
                 try:
                     config = json.loads(save_config) if isinstance(save_config, str) and save_config.strip() else {}
                 except (ValueError, TypeError):
                     config = {}
-                category = {"image": "图片", "audio": "音频", "video": "视频"}[record["kind"]]
                 custom_dir = str(config.get("dir") or "").strip().strip('"').strip("'").strip()
-                target_dir = Path(custom_dir).expanduser() if custom_dir else Path(folder_paths.get_output_directory()) / layout.OUTPUT_LIBRARY / category
+                target_dir = configured_directory(config.get("dir"))
                 if not target_dir.is_absolute():
                     raise ValueError("保存路径请填写绝对文件夹路径")
                 target_dir.mkdir(parents=True, exist_ok=True)

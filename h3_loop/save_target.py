@@ -1,16 +1,34 @@
 import re
 import shutil
+import os
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_DIR_NAME = "AD-H3下载"
+DEFAULT_DIR_NAME = "AD-生成"
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+def _windows_desktop() -> Path | None:
+    """Resolve the actual desktop, including redirected/OneDrive desktops."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buffer) == 0 and buffer.value:
+            return Path(buffer.value)
+    except (OSError, AttributeError):
+        pass
+    return None
+
+
 def default_directory() -> Path:
-    home = Path.home()
-    desktop = home / "Desktop"
-    return (desktop if desktop.is_dir() else home) / DEFAULT_DIR_NAME
+    return (_windows_desktop() or Path.home() / "Desktop") / DEFAULT_DIR_NAME
+
+
+def configured_directory(value) -> Path:
+    raw = str(value or "").strip().strip('"').strip("'").strip()
+    return Path(raw).expanduser() if raw else default_directory()
 
 
 def resolve_template(template: str, index: int, source: Path, prompt_text: str = "") -> str:
@@ -33,10 +51,7 @@ def resolve_template(template: str, index: int, source: Path, prompt_text: str =
 
 
 def save_with_template(source: Path, config: dict, index: int, prompt_text: str = "") -> Path:
-    raw_dir = str(config.get("dir") or "").strip().strip('"').strip("'").strip()
-    directory = Path(raw_dir).expanduser()
-    if not raw_dir:
-        directory = default_directory()
+    directory = configured_directory(config.get("dir"))
     directory.mkdir(parents=True, exist_ok=True)
     name = resolve_template(str(config.get("template") or ""), index, source, prompt_text)
     target = directory / name
