@@ -1454,7 +1454,8 @@ class AidenH3VideoPreview:
                 except (ValueError, TypeError):
                     config = {}
                 custom_dir = str(config.get("dir") or "").strip().strip('"').strip("'").strip()
-                target_dir = configured_directory(config.get("dir"))
+                # 保存路径留空：按媒体类型归档到 ComfyUI/output/AD-Segmented-Loop-output/{图片,音频,视频}
+                target_dir = configured_directory(custom_dir, record["kind"])
                 if not target_dir.is_absolute():
                     raise ValueError("保存路径请填写绝对文件夹路径")
                 target_dir.mkdir(parents=True, exist_ok=True)

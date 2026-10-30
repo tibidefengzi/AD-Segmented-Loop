@@ -1,4 +1,4 @@
-import {segmentIntervals, clipEnd} from "./timeline_state.js?v=20261028-image-clips";
+import {segmentIntervals, clipEnd} from "./timeline_state.js?v=20261030-pure-image-count";
 const FPS = 24;
 const snap = value => Math.round(value * FPS) / FPS;
 

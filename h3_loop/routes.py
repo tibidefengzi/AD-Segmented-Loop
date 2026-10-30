@@ -645,7 +645,7 @@ async def sync_from_graph(data):
 @routes.post("/aiden_h3/save_to_desktop")
 @guarded
 async def save_to_desktop(request):
-    """把预览中的素材复制到当前用户桌面的 AD-生成 文件夹。"""
+    """兼容旧前端的“保存”入口：保存路径留空时按媒体类型归档到生成目录。"""
     import shutil
     from pathlib import Path
     data = await request.json()
@@ -664,8 +664,8 @@ async def save_to_desktop(request):
     source = next((path for path in candidates if path.is_file()), None)
     if source is None:
         raise ValueError(f"找不到素材文件：{name}")
-    from .save_target import default_directory
-    target_dir = default_directory()
+    from .save_target import default_directory, kind_for_path
+    target_dir = default_directory(kind_for_path(source))
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / source.name
     counter = 1
@@ -846,8 +846,11 @@ def _resolve_media_path(origin: str, name: str):
 @routes.post("/aiden_h3/save_media")
 @guarded
 async def save_media(request):
-    """按自定义目录 + 文件名模板保存预览素材；提供 target 时按系统另存为路径保存。"""
-    from .save_target import save_to_path, save_with_template
+    """按自定义目录 + 文件名模板保存预览素材；提供 target 时按系统另存为路径保存。
+
+    目录留空时按媒体类型归档到 ComfyUI/output/AD-Segmented-Loop-output/{图片,音频,视频}。
+    """
+    from .save_target import kind_for_path, save_to_path, save_with_template
     data = await request.json()
     source = _resolve_media_path(str(data.get("origin") or "media"), str(data.get("file") or ""))
     target = str(data.get("target") or "").strip()
@@ -855,7 +858,8 @@ async def save_media(request):
         target_path = await asyncio.to_thread(save_to_path, source, target)
         return web.json_response({"path": str(target_path)})
     config = {"dir": str(data.get("dir") or ""), "template": str(data.get("template") or "")}
-    target = await asyncio.to_thread(save_with_template, source, config, int(data.get("index") or 1))
+    target = await asyncio.to_thread(save_with_template, source, config, int(data.get("index") or 1), "",
+                                     kind_for_path(source))
     return web.json_response({"path": str(target)})
 
 
@@ -866,7 +870,7 @@ async def pick_save_path(request):
     from .dialogs import save_file as choose_save_file
     data = await request.json()
     from .save_target import configured_directory
-    initial_dir = configured_directory(data.get("initial_dir"))
+    initial_dir = configured_directory(data.get("initial_dir"), str(data.get("kind") or ""))
     initial_dir.mkdir(parents=True, exist_ok=True)
     path = await asyncio.to_thread(choose_save_file, str(data.get("default_name") or ""),
                                    str(initial_dir), "另存为",
@@ -881,7 +885,7 @@ async def pick_folder(request):
     from .dialogs import pick_folder as choose_folder_dialog
     data = await request.json()
     from .save_target import configured_directory
-    initial_dir = configured_directory(data.get("initial_dir"))
+    initial_dir = configured_directory(data.get("initial_dir"), str(data.get("kind") or ""))
     initial_dir.mkdir(parents=True, exist_ok=True)
     path = await asyncio.to_thread(choose_folder_dialog, str(initial_dir), "选择保存文件夹")
     return web.json_response({"path": path or ""})

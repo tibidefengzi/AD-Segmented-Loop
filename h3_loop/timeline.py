@@ -294,9 +294,9 @@ def validate_timeline(config):
                   and not any(source.get("priority") for source in sources.values()))
     forced_points = None
     if image_only:
-        # 纯图片：每张图片对应一个生成段，段长完全取时间线上的生成段
-        # （可自由拖拽、最后一段可向后延长），段数强制等于图片数量。
-        # 旧数据没有生成段时，按分段配方的每段帧数补等长默认段。
+        # 纯图片（v0.4.23 用户新规则）：生成段数量不再强制等于图片数量，由前端「分段数」决定。
+        # 有 generation_clips 时完全按给定数量和顺序使用（保留各段长度，允许与图片数量不同）；
+        # 很旧的存档没有 generation_clips 时，才按图片数量补等长默认段（兼容旧行为）。
         recipe_frames = 243
         recipe = config.get("segment_recipe")
         if isinstance(recipe, dict):
@@ -305,19 +305,15 @@ def validate_timeline(config):
             except (TypeError, ValueError):
                 recipe_frames = 243
         default_length = snap_seconds(recipe_frames / FPS)
-        normalized = []
-        for index, clip in enumerate(generation or []):
-            if index >= len(image_sources):
-                break
-            start, end = clip_span(clip)
-            if end - start > HALF_FRAME:
-                normalized.append(clip)
-        next_start = max((clip_span(clip)[1] for clip in normalized), default=0.0)
-        for index in range(len(normalized), len(image_sources)):
-            normalized.append({"id": f"image-clip-{index + 1}", "tl_start": snap_seconds(next_start),
-                               "src_in": 0.0, "src_out": default_length})
-            next_start = snap_seconds(next_start + default_length)
-        generation = normalized
+        if generation is None:
+            next_start = 0.0
+            generation = []
+            for index in range(len(image_sources)):
+                generation.append({"id": f"image-clip-{index + 1}", "tl_start": snap_seconds(next_start),
+                                   "src_in": 0.0, "src_out": default_length})
+                next_start = snap_seconds(next_start + default_length)
+        else:
+            generation = [clip for clip in generation if clip_span(clip)[1] - clip_span(clip)[0] > HALF_FRAME]
         forced_points = []
         injected_points = []
     else:

@@ -59,9 +59,11 @@ export function playbackRange(playhead, total) {
 export const clipEnd = clip => clip.tl_start + clip.src_out - clip.src_in;
 
 /**
- * 纯图片规则：只有图片素材、无音视频片段、无素材路径优先素材时，
- * 每张图片对应一个「生成段」，段长完全取时间线上的生成段（可自由拖拽/延长最后一段），
- * 段数强制等于图片数量。旧的生成段按顺序保留其时长；缺少的按每段目标帧数补默认段。
+ * 纯图片规则：只有图片素材、无音视频片段、无素材路径优先素材时适用。
+ * 生成段由时间线上的「生成段」承载（可自由拖拽/延长最后一段），段数不再强制等于图片数量：
+ * - 不传 count：段数 = 图片数量（首次载入或用户未手动设置时，仍自动跟随图片数量）；
+ * - 传 count：段数 = 用户「应用分段」填的分段数；保留已有各段长度，只在末尾追加或从末尾删除差值段，
+ *   新增段按每段目标帧数补默认长度。
  * 返回 null 表示不适用（混合素材/有音视频片段/素材路径模式）。
  */
 export function imageOnlyClips(state, frames, options = {}) {
@@ -74,36 +76,36 @@ export function imageOnlyClips(state, frames, options = {}) {
     const defaultFrames = Math.max(5, Math.round(raw));
     const defaultLength = Math.round((defaultFrames / FPS) * FPS) / FPS;
     const snap = value => Math.round(Number(value || 0) * FPS) / FPS;
-    const count = sources.length;
+    const requested = options.count == null ? sources.length : Math.round(Number(options.count));
+    const count = Number.isInteger(requested) && requested >= 1 && requested <= 1000 ? requested : sources.length;
     const existing = (Array.isArray(state.generation_clips) ? state.generation_clips : [])
-        .filter(clip => clip && Number(clip.src_out) > Number(clip.src_in || 0));
+        .filter(clip => clip && Number(clip.src_out) > Number(clip.src_in || 0))
+        .sort((left, right) => Number(left.tl_start || 0) - Number(right.tl_start || 0));
     const clips = [];
-    // applyFrames：按「每段长度」统一重排所有图片段（应用分段按钮）；默认保留已有每段时长，仅补缺段。
-    if (options.applyFrames) {
-        for (let index = 0; index < count; index++) {
-            clips.push({ id: existing[index]?.id || `image-clip-${index + 1}`,
-                tl_start: snap(index * defaultLength), src_in: 0, src_out: defaultLength });
-        }
-    } else {
-        for (let index = 0; index < count; index++) {
-            const previous = existing[index];
-            if (previous) {
-                clips.push({
-                    id: previous.id || `image-clip-${index + 1}`,
-                    tl_start: Math.max(0, snap(previous.tl_start)),
-                    src_in: 0,
-                    src_out: Math.max(1 / FPS, snap(previous.src_out) - snap(previous.src_in || 0)),
-                });
-            }
-        }
-        while (clips.length < count) {
-            const start = clips.reduce((max, clip) => Math.max(max, clip.tl_start + clip.src_out), 0);
-            clips.push({ id: `image-clip-${clips.length + 1}`, tl_start: snap(start), src_in: 0, src_out: defaultLength });
-        }
+    const usedIds = new Set();
+    for (let index = 0; index < Math.min(count, existing.length); index++) {
+        const previous = existing[index];
+        let id = previous.id || `image-clip-${index + 1}`;
+        while (usedIds.has(id)) id = `${id}-${index + 1}`;
+        usedIds.add(id);
+        clips.push({ id, tl_start: Math.max(0, snap(previous.tl_start)), src_in: 0,
+            src_out: Math.max(1 / FPS, snap(previous.src_out) - snap(previous.src_in || 0)) });
+    }
+    while (clips.length < count) {
+        const start = clips.reduce((max, clip) => Math.max(max, clip.tl_start + clip.src_out), 0);
+        let id = `image-clip-${clips.length + 1}`;
+        for (let suffix = clips.length + 2; usedIds.has(id); suffix++) id = `image-clip-${suffix}`;
+        usedIds.add(id);
+        clips.push({ id, tl_start: snap(start), src_in: 0, src_out: defaultLength });
     }
     clips.sort((left, right) => left.tl_start - right.tl_start);
     const duration = clips.reduce((max, clip) => Math.max(max, clip.tl_start + clip.src_out), 0);
-    return { count, clips, duration, defaultFrames };
+    return { count: clips.length, clips, duration, defaultFrames };
+}
+
+/** 纯图片模式是否仍跟随图片数量：用户点过「应用分段」或手动调过生成段后即停止跟随。 */
+export function followsImageCount(recipe) {
+    return !(recipe && (recipe.manual_count || recipe.custom));
 }
 
 /**

@@ -6,8 +6,8 @@ import { installGlassTheme } from "./glass_ui.js?v=20261029-frame-info";
 import { executeQueueOnce } from "./queue_runner.js?v=20261027-v039-share";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs } from "./timeline_editor.js?v=20261030-selected-run-v0417";
-import { mountNativePlayer } from "./native_player.js?v=20261030-save-default-v0419";
+import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs } from "./timeline_editor.js?v=20261030-pure-image-count";
+import { mountNativePlayer } from "./native_player.js?v=20261030-output-library-v0422";
 import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261027-v039-share";
 import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261030-v0417";
 
@@ -1021,6 +1021,14 @@ function mountResolutionBadge(node) {
     }
 }
 
+function syncLinkedPromptTimeline(segment) {
+    const graph = segment?.graph;
+    const input = segment?.inputs?.find(item => item.name === "queue");
+    const link = graph?.links?.get?.(input?.link) || graph?.links?.[input?.link];
+    const queue = link && graph?.getNodeById?.(link.origin_id);
+    queue?._adH3SyncPromptSegments?.({promptChanged: true});
+}
+
 function mountPromptEditor(node) {
     if (!node || node._adH3PromptMounted) return;
     node._adH3PromptMounted = true;
@@ -1043,7 +1051,11 @@ function mountPromptEditor(node) {
     let initial = String(native.value || "");
     if (initial.trim() === "# 第一段提示词\n# 第二段提示词") { initial = ""; native.value = ""; }
     area.value = initial;
-    area.addEventListener("input", () => { native.value = area.value; try { native.callback?.(area.value); } catch {} });
+    area.addEventListener("input", () => {
+        native.value = area.value;
+        try { native.callback?.(area.value); } catch {}
+        syncLinkedPromptTimeline(node);
+    });
     wrap.append(area);
     const fitAreaWidth = () => {
         const width = Math.max(160, (Number(node.size?.[0]) || 400) - 32);

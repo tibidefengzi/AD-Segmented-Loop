@@ -6,9 +6,9 @@ import "./ad_theme.js?v=20261026-ui219-final-layout";
 import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js?v=20261029-frame-info";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, clearImageSources, repairSourceInstances, retainedSourceBounds } from "./timeline_state.js?v=20261029-instant-crop";
+import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, followsImageCount, clearImageSources, repairSourceInstances, retainedSourceBounds } from "./timeline_state.js?v=20261030-pure-image-count";
 import { mountStoragePanel } from "./storage_panel.js?v=20261029-usage-refresh";
-import {generationClips, commitGeneration, changeGeneration, deleteGeneration} from "./generation_edit.js?v=20261027-independent-generation";
+import {generationClips, commitGeneration, changeGeneration, deleteGeneration} from "./generation_edit.js?v=20261030-pure-image-count";
 import { bindWidgetWidth, timelineOrigin, markWidthBreakpoint, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261026-ui219-final-layout";
 import { PreviewCache } from "./timeline_performance.js?v=20261027-perf1";
 import { setMaterialProgress } from "./run_progress.js?v=20261030-v0417";
@@ -476,6 +476,21 @@ export function updateSegmentMaterialOutputs(node, state) {
     }
 }
 
+export function linkedPromptSegment(queueNode) {
+    const graph = queueNode?.graph, links = graph?.links;
+    const values = typeof links?.values === "function" ? [...links.values()] : Object.values(links || {});
+    for (const link of values) {
+        if (String(link?.origin_id) !== String(queueNode?.id) || Number(link.origin_slot) !== 0) continue;
+        const target = graph?.getNodeById?.(link.target_id)
+            || (graph?._nodes || []).find(item => String(item.id) === String(link.target_id));
+        if ((target?.comfyClass || target?.type) !== "AidenH3Segment") continue;
+        const input = target.inputs?.find(item => item.name === "queue");
+        if (input?.link != null && link.id != null && String(input.link) !== String(link.id)) continue;
+        return target;
+    }
+    return null;
+}
+
 export function mountTimelineEditor(node) {
     if (node._h3TimelineMounted) return;
     node._h3TimelineMounted = true;
@@ -558,10 +573,10 @@ export function mountTimelineEditor(node) {
     <button data-merge title="只拼接同轨选中片段实际保留的内容，裁掉的内容不会恢复">合并</button>
   </span>
   <span class="h3-group h3-split-group" role="group" aria-label="分段参数">
-    <label title="无音视频时：与分段数相乘得到总时长；有音视频且分段数≥1时，应用后会回写成实际每段长度">每段长度 <button type="button" class="h3-step-btn" data-every-step="-1" title="减少 17 帧（一次点击生效）">−</button><input data-every aria-label="每段长度" type="number" min="1" step="1" value="124" style="width:76px"><button type="button" class="h3-step-btn" data-every-step="1" title="增加 17 帧（一次点击生效）">＋</button></label>
+    <label title="纯图片时只作末尾新增生成段的默认段长；无音视频时与分段数相乘得到总时长；有音视频且分段数≥1时，应用后会回写成实际每段长度">每段长度 <button type="button" class="h3-step-btn" data-every-step="-1" title="减少 17 帧（一次点击生效）">−</button><input data-every aria-label="每段长度" type="number" min="1" step="1" value="124" style="width:76px"><button type="button" class="h3-step-btn" data-every-step="1" title="增加 17 帧（一次点击生效）">＋</button></label>
     <span class="h3-unit"><button data-unit="s" aria-pressed="false">秒</button><button data-unit="f" class="on" aria-pressed="true">帧</button></span>
-    <label title="≥1：按段数均分；填 0：按「每段长度」切开（仅音视频）">分段数 <input data-count aria-label="分段数" type="number" min="0" max="1000" step="1" value="2" style="width:44px"></label>
-    <button data-apply-split class="primary" title="无音视频：总长=每段长度×分段数并均分；有音视频：分段数≥1均分，填0则按每段长度切开">应用分段</button>
+    <label title="≥1：按段数均分；填 0：按「每段长度」切开（仅音视频）；纯图片：直接决定生成段数，不再跟随图片数量">分段数 <input data-count aria-label="分段数" type="number" min="0" max="1000" step="1" value="2" style="width:44px"></label>
+    <button data-apply-split class="primary" title="纯图片：按分段数保留已有段长、在末尾增删生成段；无音视频：总长=每段长度×分段数并均分；有音视频：分段数≥1均分，填0则按每段长度切开">应用分段</button>
     <label class="h3-mini-field" title="单段生成帧数上限（须为 17k+5，非法值向下取整）；有连接时同步到 AD-当前段">单段上限 <input class="h3-max-frames-input" data-max-frames type="number" min="5" max="3600" step="17" value="362" style="width:76px" aria-label="单段生成帧数上限"></label>
   </span>
 </div>
@@ -600,7 +615,7 @@ export function mountTimelineEditor(node) {
   <div class="h3-selection-summary" data-selection-summary hidden></div>
   <div class="h3-frame-summary" data-frame-summary><span data-timeline-frames></span><span data-segment-frames></span><span data-segment-bounds></span></div>
 </div>
-  <div class="h3-hint" data-hint>无音视频：总长 = 每段长度 × 分段数。有音视频：分段数≥1 均分；分段数填 0 则按每段长度切开。</div>
+  <div class="h3-hint" data-hint>无音视频：总长 = 每段长度 × 分段数。纯图片：生成段数由「分段数」决定，已有段长保留、末尾增删，增删图片不再改变段数。有音视频：分段数≥1 均分；分段数填 0 则按每段长度切开。</div>
 
 <div class="h3-frame-plan collapsed" data-frame-plan>
   <button type="button" class="h3-frame-toggle" data-frame-toggle aria-expanded="false">帧数明细 ▸</button>
@@ -1264,6 +1279,16 @@ export function mountTimelineEditor(node) {
         const hasClips = [...T.state.video_tracks, ...T.state.audio_tracks].some(lane => lane.length);
         const selected = T.selected.size > 0;
         if (!(frames >= 1)) { el.textContent = ""; return; }
+        // 纯图片：段数由「分段数」控制，已有段长保留，只在末尾增删（v0.4.23 用户新规则）。
+        if (!hasClips && imageOnlyClips(T.state, frames)) {
+            const existing = (Array.isArray(T.state.generation_clips) ? T.state.generation_clips : [])
+                .filter(clip => clip && Number(clip.src_out) > Number(clip.src_in || 0)).length;
+            if (!byCount) { el.textContent = "纯图片请填分段数（≥1）"; return; }
+            const added = Math.max(0, count - existing), removed = Math.max(0, existing - count);
+            el.textContent = `纯图片：生成段 ${existing} → ${count} 段`
+                + (added ? `（末尾新增 ${added} 段 × ${frames} 帧）` : removed ? `（删除末尾 ${removed} 段）` : "（保留原段长）");
+            return;
+        }
         if (!hasClips) {
             if (!byCount) { el.textContent = "纯生成请填分段数（≥1）"; return; }
             const total = frames * count;
@@ -1443,9 +1468,10 @@ export function mountTimelineEditor(node) {
         if (!Number.isFinite(raw) || raw < 1) return 0;
         return Math.max(1, Math.round(T.unit === "s" ? raw * FPS : raw));
     }
-    // 纯图片：分段数强制等于图片数量；增删图片 / 改每段长度后立即重排。
-    // 纯图片：每张图片对应一个生成段；段长取时间线上的生成段（可自由拖拽、最后一段可向后延长）。
+    // 纯图片：用户未点过「应用分段」、也未手动调过生成段之前，生成段跟随图片数量（首次载入按图片数自动建段）；
+    // 一旦手动设置（manual_count/custom），增删图片不再改变段数，段数只由「分段数 + 应用分段」决定。
     function applyImageOnlySegments() {
+        if (!followsImageCount(T.state.segment_recipe)) return false;
         const plan = imageOnlyClips(T.state, currentSegmentFrames());
         if (!plan) return false;
         T.state.generation_clips = plan.clips;
@@ -1461,7 +1487,7 @@ export function mountTimelineEditor(node) {
     function promptOnlySegments() {
         if ((T.state.sources || []).length) return null;
         if ([...T.state.video_tracks, ...T.state.audio_tracks].some(lane => lane && lane.length)) return null;
-        const segmentNode = (node.graph?._nodes || []).find(item => item && (item.comfyClass === "AidenH3Segment" || item.type === "AidenH3Segment"));
+        const segmentNode = linkedPromptSegment(node);
         const text = String(segmentNode?.widgets?.find(item => item.name === "正向提示词")?.value ?? "");
         const parts = [];
         let current = [];
@@ -1477,11 +1503,13 @@ export function mountTimelineEditor(node) {
         if (count) return count;
         return text.trim() ? 1 : 0;
     }
-    function applyPromptOnlySegments() {
+    function applyPromptOnlySegments({promptChanged = false} = {}) {
         const count = promptOnlySegments();
         if (!count) return false;
         const frames = currentSegmentFrames() || Math.max(5, Math.round(Number(T.state.segment_recipe?.frames) || DEFAULT_SEG_FRAMES));
         const recipe = T.state.segment_recipe || {};
+        // A saved explicit delete-to-empty stays empty; editing the positive prompt is a new intent.
+        if (!promptChanged && recipe.custom && Array.isArray(T.state.generation_clips) && !T.state.generation_clips.length) return false;
         const existing = (Array.isArray(T.state.generation_clips) ? T.state.generation_clips : [])
             .filter(clip => clip && Number(clip.src_out) > Number(clip.src_in || 0));
         if (Number(recipe.count) === count && Number(recipe.frames) === frames && existing.length === count) return false;
@@ -1506,6 +1534,14 @@ export function mountTimelineEditor(node) {
         if (countInput) countInput.value = String(count);
         return true;
     }
+    node._adH3SyncPromptSegments = (options = {}) => {
+        if (node._adH3MaterialsReady === false) return false;
+        if (!applyPromptOnlySegments(options)) return false;
+        render();
+        try { updateMaterialOutputs(node, T.state); } catch {}
+        node.setDirtyCanvas?.(true, true);
+        return true;
+    };
     function afterEdit(outputs = true) {
         applyImageOnlySegments();
         applyPromptOnlySegments();
@@ -2876,19 +2912,25 @@ export function mountTimelineEditor(node) {
                 hint(`已拆开选中片段；清单共 ${Math.max(0, intervals().length)} 段。`);
                 return;
             }
-            // 纯图片：每张图片对应一个生成段；点「应用分段」时按上方「每段长度」统一重排每段，之后仍可拖左右边微调。
-            const imagePlan = imageOnlyClips(T.state, frames, {applyFrames: true});
+            // 纯图片：段数改由「分段数」决定；保留已有各段长度，只在末尾追加或从末尾删除差值段（v0.4.23 用户新规则）。
+            const imagePlan = imageOnlyClips(T.state, frames, byCount ? { count } : {});
             if (imagePlan) {
+                if (!byCount) { hint("纯图片模式请填写 1～1000 的分段数；生成段数不再跟随图片数量。", true); return; }
+                const before = (Array.isArray(T.state.generation_clips) ? T.state.generation_clips : [])
+                    .filter(clip => clip && Number(clip.src_out) > Number(clip.src_in || 0)).length;
                 pushUndo();
                 T.state.generation_clips = imagePlan.clips;
                 T.state.duration = imagePlan.duration;
                 T.state.split_points = [];
                 T.state.segmentation = "clips";
-                T.state.segment_recipe = { ...(T.state.segment_recipe || {}), frames: imagePlan.defaultFrames, count: imagePlan.count, unit: T.unit, custom: false };
+                T.state.segment_recipe = { ...(T.state.segment_recipe || {}), frames: imagePlan.defaultFrames, count: imagePlan.count, unit: T.unit, custom: false, manual_count: true };
                 const countInput = $("[data-count]");
                 if (countInput) countInput.value = String(imagePlan.count);
                 afterEdit();
-                hint(`纯图片：已按 ${imagePlan.count} 张图片同步 ${imagePlan.count} 个生成段，每段 ${imagePlan.defaultFrames} 帧；可继续拖左右边微调（最后一段可向后延长）。`);
+                const added = Math.max(0, imagePlan.count - before), removed = Math.max(0, before - imagePlan.count);
+                hint(`纯图片：生成段 ${before} → ${imagePlan.count} 段`
+                    + (added ? `，末尾新增 ${added} 段 × ${imagePlan.defaultFrames} 帧` : removed ? `，已删除末尾 ${removed} 段` : "，原有段长保留")
+                    + "；之后增删图片不再改变段数。");
                 return;
             }
             // 无音视频：两字段配合 → 总长 = 每段长度 × 分段数，均分
@@ -3431,7 +3473,12 @@ export function mountTimelineEditor(node) {
     const widget = node.addDOMWidget("queue_state", "div", root, {
         hideOnZoom: false,
         getHeight: () => currentWidgetH() + 8,
-        getValue: () => JSON.stringify(T.state),
+        getValue: () => {
+            if (node._adH3MaterialsReady !== false && applyPromptOnlySegments()) {
+                queueMicrotask(() => { if (node.graph) { render(); node.setDirtyCanvas?.(true, true); } });
+            }
+            return JSON.stringify(T.state);
+        },
         setValue: restoreEditor,
         afterResize() {
             fillTimelineWidth();
@@ -3521,11 +3568,7 @@ export function mountTimelineEditor(node) {
     // 素材准备没有任何素材时，正向提示词的 # 段数变化后自动同步分段数（不用再手点「应用分段」）。
     const promptRuleTimer = setInterval(() => {
         if (interactionLock || document.hidden || !node.graph) return;
-        if (applyPromptOnlySegments()) {
-            render();
-            try { updateMaterialOutputs(node, T.state); } catch {}
-            node.setDirtyCanvas?.(true, true);
-        }
+        node._adH3SyncPromptSegments();
     }, 800);
     // 首次挂载：用 emptyTimeline 的 recipe 填输入并画出生成段（configure 有存档时再由 restoreEditor 覆盖）
     {
@@ -3543,6 +3586,7 @@ export function mountTimelineEditor(node) {
     const prevConn = node.onConnectionsChange;
     node.onConnectionsChange = function () {
         const result = prevConn?.apply(this, arguments);
+        node._adH3SyncPromptSegments?.();
         try { updateMaterialOutputs(node, T.state); } catch {}
         return result;
     };

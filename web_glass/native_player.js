@@ -45,7 +45,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     const saveRow = document.createElement("div");
     saveRow.className = "ad-h3-save-row";
     saveRow.innerHTML = '<span class="ad-h3-save-label">保存路径</span>'
-        + '<input type="text" data-save-dir placeholder="留空：用户桌面/AD-生成">'
+        + '<input type="text" data-save-dir placeholder="留空：ComfyUI/output/AD-Segmented-Loop-output/（按类型归档）" title="留空时按图片/音频/视频分别保存到 ComfyUI/output/AD-Segmented-Loop-output 对应子目录">'
         + '<button type="button" data-save-pick>选择目录</button>'
         + '<span class="ad-h3-save-label">文件名</span>'
         + '<input type="text" data-save-name placeholder="默认：AD-{index}-{date}">'
@@ -74,10 +74,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         event.stopPropagation();
         await chooseSaveFolder();
     });
-    // 下载前弹出系统文件夹选择框；选中后同步到保存路径输入框。
+    // 下载前弹出系统文件夹选择框；选中后同步到保存路径输入框。留空时按类型从生成目录起始。
     async function chooseSaveFolder() {
         try {
-            const response = await fetch("/aiden_h3/pick_folder", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({initial_dir: saveState.dir})});
+            const response = await fetch("/aiden_h3/pick_folder", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({initial_dir: saveState.dir, kind: active?.kind || ""})});
             const result = await response.json();
             const path = String(result.path || "").trim();
             if (path) { dirInput.value = path; syncSaveConfig(); }
@@ -98,7 +98,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         try {
             const response = await fetch("/aiden_h3/pick_save_path", {
                 method: "POST", headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({default_name: defaultName, initial_dir: saveState.dir, title: "选择保存位置"}),
+                body: JSON.stringify({default_name: defaultName, initial_dir: saveState.dir, kind: info?.kind || active?.kind || "", title: "选择保存位置"}),
             });
             if (response.ok) {
                 const picked = await response.json();
