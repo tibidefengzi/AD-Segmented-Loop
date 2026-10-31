@@ -236,29 +236,36 @@ def resolve_resume_anchor(state, preview, fallback):
         return int(fallback)
     sid = state["id"]
     named = preview.get("session_id")
-    if named and named != sid:
-        raise ValueError("所选预览不属于当前这一轮，请选择本轮分段预览")
     name = str(preview.get("file") or "").replace("\\", "/")
+    scope = ""
     if preview.get("origin") == "session":
-        if not name.startswith(sid + "/"):
-            raise ValueError("所选预览不属于当前这一轮，请选择本轮分段预览")
-        name = name[len(sid) + 1:]
+        scope, separator, name = name.partition("/")
+        if not separator:
+            raise ValueError("所选预览缺少本轮文件身份，请重新选择分段预览")
+    normal = scope in {"", sid} and named in {None, "", sid}
+    child = scope if scope.startswith("trial_") else (named if str(named or "").startswith("trial_") else "")
     matches = []
     for index, row in enumerate(state.get("segments") or []):
         for version in row.get("versions") or []:
             file = str(version.get("file") or "").replace("\\", "/")
-            if file and (file == name or file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1])):
+            matching = bool(file) and (file == name or file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1]))
+            trial_match = (child and version.get("preview_only") and version.get("trial_request")
+                           and (not version.get("trial_session") or version["trial_session"] == child)
+                           and file == "trial_" + str(version["trial_request"]) + "_" + name)
+            if (normal and matching) or trial_match:
                 matches.append(index + 1)
                 break
     if len(matches) == 1:
         return matches[0]
     key = preview.get("segment_key")
-    if named == sid and key:
+    if normal and named == sid and key:
         matches = [i + 1 for i, row in enumerate(state.get("segments") or []) if row.get("segment_key") == key]
         if len(matches) == 1:
             return matches[0]
-    if named == sid and preview.get("segment_index"):
+    if normal and named == sid and preview.get("segment_index"):
         return int(preview["segment_index"])
+    if not normal:
+        raise ValueError("所选预览不属于当前这一轮，请选择本轮分段预览")
     raise ValueError("无法在本轮进度中找到所选预览，请选择本轮已有结果")
 
 
@@ -439,6 +446,7 @@ def finish_trial(child_id, success=True):
             version = next((v for v in trial_row["versions"] if v["id"] == trial_row["selected"]), None)
             if version:
                 version = copy.deepcopy(version)
+                trial_file = version.get("file")
                 # 备选文件留在独立会话，用限定相对路径供历史/合并统一读取。
                 # 原会话另建唯一硬链接（跨盘则独占创建），不覆盖任何历史文件。
                 for key in ("file", "tail_file", "overlap_file", "audio_file", "continuum_file"):
@@ -461,7 +469,8 @@ def finish_trial(child_id, success=True):
                         if not metadata.exists():
                             with src.with_suffix(".json").open("rb") as incoming, metadata.open("xb") as output:
                                 shutil.copyfileobj(incoming, output)
-                version.update(preview_only=True, trial_request=source["request_id"])
+                version.update(preview_only=True, trial_request=source["request_id"],
+                               trial_session=child_id, trial_file=trial_file)
                 versions = row["versions"] if row is not None else parent.setdefault("draft_candidates", [])
                 version["draft_index"] = source["index"]
                 if not any(v.get("trial_request") == source["request_id"] for v in versions):

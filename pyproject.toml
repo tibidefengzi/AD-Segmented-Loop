@@ -1,6 +1,6 @@
 [project]
 name = "ad-segmented-loop"
-version = "0.4.37"
+version = "0.4.38"
 description = "分段循环：素材时间线、逐段生成与预览、持久化进度"
 requires-python = ">=3.10"
 license = {text = "GPL-3.0-only"}
