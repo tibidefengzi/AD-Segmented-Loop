@@ -46,7 +46,7 @@ def _selected_version(row, index):
     selected = row.get("selected")
     version = next((v for v in (row.get("versions") or []) if selected and v.get("id") == selected), None)
     if version is None:
-        raise ValueError(f"第 {index+1} 段没有可用的选中版本，请先生成并批准该段")
+        raise ValueError(f"第 {index+1} 段没有可用的选中版本，请先生成该段")
     return version
 
 

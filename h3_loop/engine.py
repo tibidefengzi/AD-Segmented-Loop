@@ -224,8 +224,13 @@ async def enqueue(session_id):
     try:
         active = STORE.reserve(session_id)
         prompt = copy.deepcopy(template["prompt"])
+        if state.get("execution_round"):
+            from .rounds import read_snapshot, validate_assets, execution_prompt
+            snapshot = read_snapshot(state)
+            validate_assets(snapshot)
+            prompt = execution_prompt(state, snapshot)
         prompt[template["segment_node"]]["inputs"]["run_token"] = active["token"]
-        if active.get("reroll"):
+        if active.get("reroll") and not state.get("execution_round"):
             for node in prompt.values():
                 for name in ("seed","noise_seed"):
                     value=node.get("inputs",{}).get(name)
@@ -268,7 +273,7 @@ async def watch_prompt(session_id, token, prompt_id):
         current = state.get("active")
         if current and current["token"] != token:
             return
-        if not current and not any(row["selected"] == token for row in state["segments"]):
+        if not current and not state.get("preview_parent") and not any(row["selected"] == token for row in state["segments"]):
             return
         if prompt_id not in history:
             running, pending = server.prompt_queue.get_current_queue()
@@ -283,6 +288,9 @@ async def watch_prompt(session_id, token, prompt_id):
                 STORE.fail(session_id, "任务已取消或队列被清空，可恢复当前段")
             else:
                 STORE.fail(session_id, "任务结束后没有收到执行记录，请检查队列后恢复或合并")
+            if state.get("preview_parent"):
+                from .rounds import finish_trial
+                finish_trial(session_id, success=False)
             return
         entry = history[prompt_id]
         if entry.get("status", {}).get("status_str") != "success":
@@ -290,11 +298,32 @@ async def watch_prompt(session_id, token, prompt_id):
             text = next((data.get("exception_message", "生成中断") for event, data in reversed(messages)
                          if event in {"execution_error", "execution_interrupted"}), "生成任务未完成")
             STORE.fail(session_id, text)
+            if state.get("preview_parent"):
+                from .rounds import finish_trial
+                finish_trial(session_id, success=False)
             return
+        # 已确认任务成功；只释放插件缓存，不卸载模型、不重置执行器。
+        try:
+            running, pending = server.prompt_queue.get_current_queue()
+            if not running and not pending:
+                from .assets import PREPARED_MEDIA
+                PREPARED_MEDIA.trim()
+                from . import cleanup
+                await asyncio.to_thread(cleanup.clean_frame_cache, 60)
+                await asyncio.to_thread(cleanup.clean_trial_progress, 60)
+        except Exception:
+            pass
         if current:
             # 纯预览没有 Commit/登记结果；成功历史确认后必须回收预约。
             # 令牌、任务号及段号在锁内复核，避免晚到的完成事件结束新任务。
             STORE.finish_preview(session_id, token, prompt_id)
+            if state.get("preview_parent"):
+                from .rounds import finish_trial
+                finish_trial(session_id, success=False)
+            return
+        if state.get("preview_parent"):
+            from .rounds import finish_trial
+            finish_trial(session_id)
             return
         if state["auto"] and not state["pause_after"]:
             try:

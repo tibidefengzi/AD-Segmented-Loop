@@ -1,5 +1,5 @@
 // 存储信息不进入工作流状态或生成缓存身份。
-let pendingUsage = null;
+let pendingUsage = {};
 export function storageBytes(value) {
     const bytes = Math.max(0, Number(value) || 0);
     return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GB` : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
@@ -17,29 +17,32 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
     const message = panel.querySelector("[data-storage-message]");
     let disposed = false, current = null, cleaning = false;
     const showMessage = text => { message.textContent = text; message.hidden = !text; scheduleLayout?.(40); };
-    const fetchUsage = () => {
-        if (!pendingUsage) pendingUsage = (async () => {
-            const response = await api.fetchApi("/aiden_h3/storage", {cache:"no-store"});
+    const fetchUsage = (withCache = true) => {
+        const key = withCache ? "full" : "fast";
+        if (!pendingUsage[key]) pendingUsage[key] = (async () => {
+            const response = await api.fetchApi(`/aiden_h3/storage${withCache ? "" : "?cache=0"}`, {cache:"no-store"});
             const data = await response.json();
             if (!response.ok || data.error) throw new Error(data.error || "占用统计接口尚未就绪，请安全重启后使用");
             return data;
-        })().finally(() => { pendingUsage = null; });
-        return pendingUsage;
+        })().finally(() => { pendingUsage[key] = null; });
+        return pendingUsage[key];
     };
-    async function refresh() {
+    async function refresh({cache: withCache = true} = {}) {
         try {
-            const data = await fetchUsage();
+            const data = await fetchUsage(withCache);
             if (disposed) return data;
+            // 周期轮询不算可清理缓存明细（cache=0）；保留上一次已算出的条目，避免把「可清理」误显示为 0。
+            if (!withCache) data.cache_bytes = current ? current.cache_bytes : null;
             current = data;
             used.textContent = `素材占用 ${storageBytes(data.used_bytes)} / ${storageBytes(data.limit_bytes)}`;
-            cache.textContent = `可清理 ${storageBytes(data.cache_bytes)}`;
+            cache.textContent = data.cache_bytes == null ? "可清理 —（点击刷新）" : `可清理 ${storageBytes(data.cache_bytes)}`;
             auto.textContent = `启动自动清理：${["off", "0", "false", "none"].includes(String(data.auto_clean).toLowerCase()) ? "已关闭" : "已开启"}`;
             const warning = !!data.over_limit;
             root.classList.toggle("h3-storage-over-limit", warning);
             panel.classList.toggle("is-warning", warning);
             for (const entry of root.querySelectorAll('[data-load],[data-batch]')) entry.disabled = warning && data.enforce;
             panel.title = warning ? "已达到容量上限；新导入受限，已有素材与生成可继续使用" : "统计本插件导入素材、会话、衍生文件及帧缓存";
-            button.disabled = cleaning || data.busy || !data.cache_bytes;
+            button.disabled = cleaning || data.busy || data.cache_bytes === 0;
             button.title = data.busy ? "任务完成后可清理" : "只清理可重建缓存，保留原素材、结果与进度";
             if (clearSources) clearSources.disabled = !!data.busy;
             scheduleLayout?.(40);
@@ -50,7 +53,7 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
         }
     }
     async function canImport(bytes = 0) {
-        const data = await refresh();
+        const data = await refresh({cache:false});
         if (data.enforce && (data.over_limit || data.used_bytes + data.pending_bytes + bytes > data.limit_bytes)) {
             showMessage("导入将超过容量上限，请先清理缓存或整理素材。");
             return false;
@@ -60,7 +63,7 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
     if (clearSources) clearSources.onclick = () => {
         if (cleaning) return;
         if (typeof onClearAll === "function") onClearAll();
-        void refresh().catch(() => {});
+        void refresh({cache:false}).catch(() => {});
     };
     button.onclick = async () => {
         if (cleaning) return;
@@ -79,13 +82,13 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
         } catch (error) { showMessage(error.message); }
         finally { cleaning = false; if (!disposed) void refresh().catch(() => {}); }
     };
-    const onFocus=()=>{if(!disposed&&!document.hidden&&root.isConnected)void refresh().catch(()=>{});};
+    const onFocus=(cache=false)=>{if(!disposed&&!document.hidden&&root.isConnected)void refresh({cache}).catch(()=>{});};
     const summary=panel.querySelector(".h3-storage-summary");
     summary.title="点击刷新磁盘占用统计";summary.style.cursor="pointer";
-    summary.addEventListener("click",event=>{event.stopPropagation();onFocus();});
-    window.addEventListener("focus",onFocus);
-    document.addEventListener("visibilitychange",onFocus);
-    const timer = setInterval(onFocus, 15000);
+    summary.addEventListener("click",event=>{event.stopPropagation();onFocus(true);});
+    window.addEventListener("focus", () => onFocus(false));
+    document.addEventListener("visibilitychange", () => onFocus(false));
+    const timer = setInterval(onFocus, 60000);
     void refresh().catch(() => {});
     return {refresh, canImport, dispose() { disposed = true; clearInterval(timer);window.removeEventListener("focus",onFocus);document.removeEventListener("visibilitychange",onFocus); }};
 }

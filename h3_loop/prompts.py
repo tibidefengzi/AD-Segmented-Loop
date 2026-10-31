@@ -8,7 +8,9 @@ def select_prompt(text, index, prefix="", suffix=""):
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise ValueError("生成段号必须是从 0 开始的整数")
     # 只把行首（允许缩进）的 # 当作分隔符；句中的 # 保留。
-    paragraphs = [part.strip() for part in re.split(r"(?m)^[ \t]*#[ \t]*", text) if part.strip()]
+    parts = re.split(r"(?m)^[ \t]*#[ \t]*", text)
+    # 有 # 时首个分隔符前的说明不计段，与素材准备的正向计段一致。
+    paragraphs = [part.strip() for part in (parts[1:] if len(parts) > 1 else parts) if part.strip()]
     if not paragraphs:
         raise ValueError("分段提示词为空，请至少填写一段内容")
     return "\n".join(part for part in (prefix, paragraphs[index % len(paragraphs)], suffix) if part)

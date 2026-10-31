@@ -6,11 +6,14 @@
 - 导入额度校验每批并发 ImportReservation 共享基线与已提交用量，上传分块不再反复全盘扫描。
 """
 from __future__ import annotations
-import json, math, os, re, shutil, threading, time
+import json, math, os, re, shutil, stat, threading, time
 from pathlib import Path
 from .storage import ROOT, data_roots
 
 CACHE_MIN_AGE = 600
+_TRIAL_MIN_AGE = 60
+_USAGE_CACHE = {}
+_USAGE_CACHE_TTL = 2.0
 _LOCK = threading.RLock()
 _RESERVED = 0
 _IMPORT_BASELINE = None
@@ -55,13 +58,14 @@ def _files(root):
             with os.scandir(directory) as entries:
                 for entry in entries:
                     try:
-                        info = entry.stat(follow_symlinks=False)
-                        if entry.is_symlink() or getattr(info, 'st_file_attributes', 0) & 0x400: continue
-                        if entry.is_dir(follow_symlinks=False): pending.append(Path(entry.path))
-                        elif entry.is_file(follow_symlinks=False):
-                            # Windows 的 DirEntry.stat 不返回真实 inode（为 0），
-                            # 占用统计要按硬链接去重，必须用 Path.stat() 再取一次。
-                            yield Path(entry.path), Path(entry.path).stat()
+                        if entry.is_symlink(): continue
+                        # 一次 os.stat 同时拿到大小和 inode：Windows 的 DirEntry.stat 没有真实 inode，
+                        # 原先“entry.stat + Path.stat”两次系统调用可以合并成一次。
+                        info = os.stat(entry.path, follow_symlinks=False)
+                        if getattr(info, 'st_file_attributes', 0) & 0x400: continue
+                        if stat.S_ISDIR(info.st_mode): pending.append(Path(entry.path))
+                        elif stat.S_ISREG(info.st_mode):
+                            yield Path(entry.path), info
                     except OSError: continue
         except OSError: continue
 
@@ -180,8 +184,13 @@ def _allowed_relative(relative: str) -> bool:
     if parent == 'import-staging': return bool(re.fullmatch(r'[0-9a-f]{32}\.part', name))
     parts = relative.split('/')
     if len(parts) == 3 and parts[0] == 'sessions':
+        # 抽卡试运行会话的进度/快照在完成后可回收；媒体文件保留供黄色预览卡继续播放。
+        if parts[1].startswith('trial_') and parts[2] == 'progress.json':
+            return bool(re.fullmatch(r'trial_[0-9a-f]+', parts[1]))
         return bool(re.fullmatch(r'(picture_|soundtrack_)[A-Za-z0-9_.-]+\.(mp4|m4a|wav|log)', name)
                     or re.fullmatch(r'progress\.json\.[0-9a-f]+\.tmp', name))
+    if len(parts) == 4 and parts[0] == 'sessions' and parts[2] == 'rounds':
+        return bool(re.fullmatch(r'[0-9a-f]{32}\.json', parts[3]))
     return False
 
 def _is_allowed_cache_file(path):
@@ -195,9 +204,32 @@ def _is_allowed_cache_file(path):
         return _allowed_relative(relative)
     return False
 
+def _invalidate_usage():
+    with _LOCK:
+        _USAGE_CACHE.clear()
+
+
+def _active_trial_ids():
+    """所有父会话 draft_trial 指向的试运行会话：清理时必须保留。"""
+    active = set()
+    for root in _roots():
+        sessions = root / 'sessions'
+        if not sessions.is_dir(): continue
+        for parent in sessions.iterdir():
+            if not parent.is_dir(): continue
+            progress = parent / 'progress.json'
+            if not progress.is_file(): continue
+            try: state = json.loads(progress.read_text(encoding='utf-8'))
+            except (OSError, ValueError): continue
+            pending = state.get('draft_trial') or {}
+            if pending.get('session_id'): active.add(str(pending['session_id']))
+    return active
+
+
 def plan_cache(min_age=CACHE_MIN_AGE):
     refs = _protected_refs()
     if refs is None: return {'entries':[],'bytes':0,'files':0,'blocked':True}
+    active_trials = _active_trial_ids()
     entries = []; now = time.time()
     for root in _roots():
         for folder in [root/'media'/'derived', root/'frame-cache', root/'sessions', root/'import-staging']:
@@ -206,11 +238,82 @@ def plan_cache(min_age=CACHE_MIN_AGE):
                 try: relative = path.relative_to(root).as_posix()
                 except ValueError: continue
                 if not _allowed_relative(relative): continue
+                parts = relative.split('/')
+                if len(parts) >= 3 and parts[0] == 'sessions' and parts[1] in active_trials: continue
                 if _is_protected(path, root, refs): continue
                 entries.append({'path':str(path),'bytes':info.st_size,'mtime_ns':info.st_mtime_ns})
     return {'entries':entries,'bytes':sum(item['bytes'] for item in entries),'files':len(entries),'blocked':False}
 
-def usage(include_cache=True):
+
+def clean_frame_cache(min_age=_TRIAL_MIN_AGE):
+    """任务边界回收超过 min_age 的参考帧临时文件；被内存映射占用时保留到下次。"""
+    removed = freed = 0
+    now = time.time()
+    for root in _roots():
+        folder = root / 'frame-cache'
+        if not folder.is_dir(): continue
+        for path, info in list(_files(folder)):
+            if now - info.st_mtime < min_age: continue
+            try: relative = path.relative_to(root).as_posix()
+            except ValueError: continue
+            if not _allowed_relative(relative): continue
+            try:
+                path.unlink()
+                removed += 1; freed += info.st_size
+            except OSError:
+                continue
+    if removed: _invalidate_usage()
+    return {'removed_files': removed, 'freed_bytes': freed}
+
+
+def clean_trial_progress(min_age=_TRIAL_MIN_AGE):
+    """回收已完成抽卡试运行会话的进度与轮次快照；媒体文件保留，黄色预览卡仍可播放。"""
+    removed = freed = 0
+    now = time.time()
+    for root in _roots():
+        sessions = root / 'sessions'
+        if not sessions.is_dir(): continue
+        protected = _active_trial_ids()
+        for trial in sessions.iterdir():
+            if not trial.is_dir() or not re.fullmatch(r'trial_[0-9a-f]+', trial.name): continue
+            if trial.name in protected: continue
+            progress = trial / 'progress.json'
+            if not progress.is_file(): continue
+            try: state = json.loads(progress.read_text(encoding='utf-8'))
+            except (OSError, ValueError): state = {}
+            if state.get('status') in {'queued', 'running', 'merging'}: continue
+            targets = [progress]
+            rounds = trial / 'rounds'
+            if rounds.is_dir(): targets.extend(rounds.glob('*.json'))
+            for path in targets:
+                if not path.is_file(): continue
+                try: info = path.stat()
+                except OSError: continue
+                if now - info.st_mtime < min_age: continue
+                try: relative = path.relative_to(root).as_posix()
+                except ValueError: continue
+                if not _allowed_relative(relative): continue
+                try:
+                    path.unlink()
+                    removed += 1; freed += info.st_size
+                except OSError:
+                    continue
+    if removed: _invalidate_usage()
+    return {'removed_files': removed, 'freed_bytes': freed}
+
+
+def usage(include_cache=True, use_cache=True):
+    limit = int(default_limit_gb()*1024**3)
+    roots = tuple(str(root) for root in _roots())
+    cache_key = (bool(include_cache), limit, roots)
+    now = time.time()
+    if use_cache:
+        with _LOCK:
+            cached = _USAGE_CACHE.get(cache_key)
+            if cached is not None and now - cached[0] < _USAGE_CACHE_TTL:
+                result = dict(cached[1])
+                result['pending_bytes'] = _RESERVED
+                return result
     media_bytes=sessions_bytes=frame_bytes=staging_bytes=media_files=sessions_files=0
     seen = set()
     for root in _roots():
@@ -226,12 +329,15 @@ def usage(include_cache=True):
     imported=import_root()
     import_bytes,import_files=_dir_usage(imported, seen) if imported else (0,0)
     used=media_bytes+sessions_bytes+frame_bytes+staging_bytes+import_bytes
-    limit=int(default_limit_gb()*1024**3)
-    return {'used_bytes':used,'limit_bytes':limit,'percent':round(used/limit,4),
+    result = {'used_bytes':used,'limit_bytes':limit,'percent':round(used/limit,4),
         'over_limit':used>=limit,'enforce':enforce_limit(),'import_bytes':import_bytes,'import_files':import_files,
         'media_bytes':media_bytes,'media_files':media_files,'sessions_bytes':sessions_bytes,'sessions_files':sessions_files,
         'frame_cache_bytes':frame_bytes,'cache_bytes':plan_cache()['bytes'] if include_cache else 0,
         'pending_bytes':_RESERVED,'auto_clean':os.environ.get('AIDEN_H3_AUTO_CLEAN','safe')}
+    if use_cache:
+        with _LOCK:
+            _USAGE_CACHE[cache_key] = (now, {key: value for key, value in result.items() if key != 'pending_bytes'})
+    return result
 
 class ImportReservation:
     """并发批次共享基线；已提交字节仍计入额度，分块上传不重复扫描。"""
@@ -246,7 +352,7 @@ class ImportReservation:
         with _LOCK:
             if self.closed:
                 raise ValueError('导入额度已释放')
-            current = _IMPORT_BASELINE if _IMPORT_ACTIVE else usage(False)
+            current = _IMPORT_BASELINE if _IMPORT_ACTIVE else usage(False, use_cache=False)
             if current['enforce'] and (current['over_limit'] or
                     current['used_bytes'] + _IMPORT_COMMITTED + _RESERVED + count > current['limit_bytes']):
                 raise StorageLimitError(f'素材占用将超过 {default_limit_gb():g} GB 上限，请先清理缓存或整理素材后再导入')
@@ -304,6 +410,8 @@ def clean_cache(confirmed=False,min_age=CACHE_MIN_AGE):
                     if info.st_mtime_ns!=entry['mtime_ns'] or not _is_allowed_cache_file(path): continue
                     path.unlink(); removed+=1; freed+=entry['bytes']
                 except OSError: continue
+            if removed:
+                _invalidate_usage()
         return {'dry_run':not confirmed,'files':plan['files'],'bytes':plan['bytes'],
             'removed_files':removed,'freed_bytes':freed,'blocked':plan['blocked']}
 

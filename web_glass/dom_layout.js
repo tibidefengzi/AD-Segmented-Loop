@@ -54,6 +54,7 @@ export function fitPreviewContent(node, root) {
         frame = requestAnimationFrame(() => {
             frame = 0;
             if (!node.graph || !root.isConnected || !root.offsetWidth) return;
+            if (document.fullscreenElement && root.contains(document.fullscreenElement)) return;
             markWidthBreakpoint(root);
             clampNodeWidth(node);
             const size = node.computeSize?.();

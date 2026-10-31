@@ -2,15 +2,17 @@
 // cachebust 20261025-0440 segment-dedupe-materials
 // CACHEBUST 2026-10-25-restore-v027-approved-043100
 import "./ad_theme.js?v=20261027-v039-share";
-import { installGlassTheme } from "./glass_ui.js?v=20261029-frame-info";
-import { executeQueueOnce } from "./queue_runner.js?v=20261027-v039-share";
+import { installGlassTheme } from "./glass_ui.js?v=20261031-fullscreen-center-v27";
+import { executeQueueOnce, interruptOwnedPrompt } from "./queue_runner.js?v=20261031-integrity-v36";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs } from "./timeline_editor.js?v=20261030-pure-image-count";
-import { mountNativePlayer } from "./native_player.js?v=20261030-output-library-v0422";
-import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261027-v039-share";
-import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261030-v0417";
+import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js?v=20261031-p0-v30";
+import { mountNativePlayer } from "./native_player.js?v=20261031-resume-v37";
+import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261031-fullscreen-v27";
+import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261031-round-v29";
 
+import { installRoundQueue } from "./round_queue.js?v=20261031-round-v29";
+installRoundQueue(api, app);
 installProgressEvents(api);
 
 const styles = document.createElement("style");
@@ -41,7 +43,7 @@ styles.textContent = `
 .ad-h3-preview-layout{display:flex;flex-direction:column;gap:10px;width:100%;min-width:0}
 .ad-h3-strips{display:flex;flex-direction:column;gap:6px;min-width:0;padding:2px 4px}
 .ad-h3-strip-row{display:flex;gap:8px;align-items:flex-start;min-width:0;width:100%;border:1px solid #3d5a80;border-radius:8px;background:#141b26;padding:4px 8px;min-height:104px;box-sizing:border-box}.ad-h3-strip-row>span{flex:0 0 64px;white-space:nowrap}
-.ad-h3-segments,.ad-h3-merges{display:flex;gap:6px;overflow:auto;min-width:0;flex:1;min-height:96px;align-items:flex-start;padding:2px 0}
+.ad-h3-segments,.ad-h3-segments-b,.ad-h3-merges{display:flex;gap:6px;overflow:auto;min-width:0;flex:1;min-height:96px;align-items:flex-start;padding:2px 0}
 .aiden-h3 .ad-h3-preview-thumb{width:112px;min-width:112px;padding:4px;font-size:12px;overflow-wrap:anywhere;position:relative}
 .ad-h3-preview-remove{position:absolute;top:3px;right:3px;width:18px;height:18px;border-radius:50%;background:rgba(0,0,0,.62);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;line-height:1;cursor:pointer;z-index:2}
 .ad-h3-preview-thumb .ad-h3-preview-remove{display:flex}
@@ -50,15 +52,31 @@ styles.textContent = `
 .ad-h3-video.aiden-h3 .ad-h3-loop-actions button.ad-h3-playlist-toggle[aria-pressed="false"]{background:#282f3c!important;border-color:#505865!important;color:#b8c0cc!important;box-shadow:none!important}
 .ad-h3-video.aiden-h3 .ad-h3-loop-actions button.ad-h3-playlist-toggle.active{background:#3f91ef!important;border-color:#c4e2ff!important;color:#fff!important;box-shadow:0 0 0 2px #69b5ff66,inset 0 0 8px #cceaff33}
 .aiden-h3 .ad-h3-preview-thumb.selected{border-color:#7aafff;background:#254d81}
-.aiden-h3 .ad-h3-preview-thumb.merge-selected{outline:3px solid #4cd964;outline-offset:-3px;box-shadow:0 0 0 2px rgba(76,217,100,.35)}
+.aiden-h3 .ad-h3-preview-thumb.merge-selected{outline:3px solid #4cd964;outline-offset:-3px;box-shadow:0 0 0 2px rgba(76,217,100,.35)} .ad-h3-merge-wrap{position:relative;display:inline-flex}.ad-h3-merge-menu{position:absolute;left:0;top:calc(100% + 4px);z-index:12;display:flex;flex-direction:column;gap:4px;padding:5px;border:1px solid #4A80BF;border-radius:9px;background:#1b2b40;box-shadow:0 8px 22px rgba(0,0,0,.5)}.ad-h3-merge-menu[hidden]{display:none}.ad-h3-merge-menu button{white-space:nowrap;padding:6px 14px;border-radius:7px;background:#3B7DC4;color:#fff;border:1px solid #4A80BF;font:600 13px "Microsoft YaHei",system-ui;cursor:pointer}.ad-h3-merge-menu button:hover{background:#326BA8}
 .aiden-h3 .ad-h3-preview-thumb.redraw span:last-child{background:#F2C94C!important;border-top-color:#F2C94C!important;color:#1b1b1b!important;font-weight:700}
-.ad-h3-screen{min-width:0;background:var(--ad-surface);aspect-ratio:16/9;overflow:hidden;position:relative}.ad-h3-screen:fullscreen{display:flex;flex-direction:column;justify-content:center;padding:20px}
+.ad-h3-screen{min-width:0;background:var(--ad-surface);aspect-ratio:16/9;overflow:hidden;position:relative}.ad-h3-video.aiden-h3 .ad-h3-screen:fullscreen,
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen{
+ position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;
+ min-width:0!important;min-height:0!important;max-width:none!important;max-height:none!important;
+ aspect-ratio:auto!important;display:block!important;margin:0!important;padding:0!important;
+ border:0!important;border-radius:0!important;box-shadow:none!important;background:#000!important;box-sizing:border-box!important}
+.ad-h3-screen:fullscreen::backdrop,.ad-h3-ab-overlay:fullscreen::backdrop{background:#000}
+.ad-h3-screen:fullscreen>.ad-h3-preview-title{display:none!important}
+.ad-h3-video.aiden-h3 .ad-h3-screen:fullscreen>.ad-h3-player-controls,
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen>.ad-h3-ab-controls{background:rgba(0,0,0,.7)!important;border:0!important}
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen>.ad-h3-ab-controls{padding-right:260px!important}
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-videos{gap:0!important;background:#000!important}
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-vcell,
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-acell{border:0!important;border-radius:0!important;background:#000!important}
+.ad-h3-lightbox:fullscreen{background:#000!important;border:0!important;border-radius:0!important;padding:0!important}
+.ad-h3-lightbox:fullscreen>.ad-h3-lightbox-video,.ad-h3-lightbox:fullscreen>.ad-h3-lightbox-img{width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;object-fit:contain;object-position:center}
+
 /* 空闲态：没有结果时预览窗口保持同样大小（16:9 黑屏），不再收成小占位 */
 .ad-h3-idle-hint{display:none;color:rgba(200,214,235,.58);font-size:13px;text-align:center;padding:0 16px;line-height:1.9;letter-spacing:1px}
 .ad-h3-idle-hint span{display:block}
 .ad-h3-preview-layout.is-idle .ad-h3-screen{background:#000!important;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px}
 .ad-h3-preview-layout.is-idle .ad-h3-screen video,.ad-h3-preview-layout.is-idle .ad-h3-player-controls{display:none!important}
-.ad-h3-screen>video{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:100%!important;height:100%!important;object-fit:contain;background:#000;display:block}
+.ad-h3-screen>video{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain;object-position:center center!important;background:#000;display:block}
 .ad-h3-video-actions{display:none;gap:8px;flex-wrap:wrap;align-items:center}
 .ad-h3-loop-hint{width:100%;font-size:12px;color:var(--ad-text-dim);white-space:pre-wrap}
 .ad-h3-loop-hint.error{color:#f87171}
@@ -116,12 +134,12 @@ styles.textContent = `
 `;
 document.head.appendChild(styles);
 
-const label = {ready:"待生成",queued:"已排队",running:"生成中",review:"等待审核",paused:"已暂停",completed:"全部通过",merging:"正在合并",error:"运行中断"};
+const label = {ready:"待生成",queued:"已排队",running:"生成中",review:"已生成",paused:"已暂停",completed:"全部完成",merging:"正在合并",error:"运行中断"};
 const natural = new Intl.Collator(undefined, {numeric:true, sensitivity:"base"});
 const esc = value => String(value).replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 const mediaUrl = (origin, file) => api.apiURL(`/aiden_h3/media/${origin}/${file.split("/").map(encodeURIComponent).join("/")}`);
 const chineseLabels={index:"段号",multiple:"对齐倍数",media:"媒体",positive_prompt:"正向提示词",negative_prompt:"反向提示词",round_image:"本段图像",round_audio:"本段音频",round_video:"本段视频",source_latent:"源视频编码",latent:"音视频潜变量",queue:"分段清单",queue_state:"素材清单",video_queue:"(已弃用)视频分段清单",video_queue_state:"视频分段清单（JSON）",audio_oasis_ui:"音频预览",session_id:"进度名称",fps:"帧率",run_token:"执行标识",overlap_frames:"重叠帧数",guard_frames:"保护帧数",aspect_ratio:"宽高比",megapixels:"百万像素",reanchor_every:"重锚定间隔（段）",max_frames:"单段生成帧数上限",context:"当前段上下文",audio:"本段音频",guide_audio:"含重叠前导音频",prompt_index:"索引号",multiline:"多行模式",seconds_float:"时长（小数秒）",seconds_int:"时长（整数秒）",generation_frames:"本段帧数",start_frame:"起始帧（源）",target_frames:"目标帧数",filename:"素材文件名",video_frames:"视频画面",mask:"遮罩",segment:"覆盖段号（0为全局）",mode:"参考模式",previous:"上一级参考",references:"参考设置",frames:"历史画面帧数",previous_tail:"前段保真尾帧",best_handoff:"最佳交接参考帧",has_history:"存在前段历史",video:"视频",strict_sync:"严格音画同步",prompt_text:"实际提示词",video_oasis_ui:"视频预览",strings:"分段提示词",select:"生成段号",global_prefix:"统一提示词前缀",global_suffix:"统一提示词后缀",prompt:"提示词",width:"画面宽度",height:"画面高度"};
-const chineseTitles={AidenH3EditMask:"角色替换遮罩适配",AidenH3AudioQueue:"素材准备",AidenH3VideoQueue:"视频分段清单",AidenH3Segment:"分段生成",AidenH3SegmentMedia:"视频与遮罩取段",AidenH3References:"全局与本段参考",AidenH3PickReferences:"当前段参考",AidenH3PreviousFrames:"前段末尾画面",AidenH3Commit:"记录分段结果",AidenH3VideoPreview:"预览审批",AidenH3Prompt:"分段提示词",AidenH3Resolution:"分辨率",AidenH3MergedVideo:"读取合并结果",AidenH3ContinuumStatus:"续段检测",AidenH3ContinuumPrepare:"续段准备",AidenH3ContinuumCapture:"续段存档",AidenH3ContinuumRecall:"续段调取",};
+const chineseTitles={AidenH3EditMask:"角色替换遮罩适配",AidenH3AudioQueue:"素材准备",AidenH3VideoQueue:"视频分段清单",AidenH3Segment:"分段生成",AidenH3SegmentMedia:"视频与遮罩取段",AidenH3References:"全局与本段参考",AidenH3PickReferences:"当前段参考",AidenH3PreviousFrames:"前段末尾画面",AidenH3Commit:"记录分段结果",AidenH3VideoPreview:"分段预览",AidenH3Prompt:"分段提示词",AidenH3Resolution:"分辨率",AidenH3MergedVideo:"读取合并结果",AidenH3ContinuumStatus:"续段检测",AidenH3ContinuumPrepare:"续段准备",AidenH3ContinuumCapture:"续段存档",AidenH3ContinuumRecall:"续段调取",};
 
 function adEnsureWidgetOptions(widget){
     if(!widget) return null;
@@ -255,6 +273,9 @@ function hideWidget(node, name) {
 
 function upstreamSegment(viewer) {
     // 新布局：直接连「当前段上下文」；旧布局兼容 视频→记录分段结果→context
+    const bound=viewer.properties?.ad_execution_round;
+    const saved=bound?.id && app.graph.getNodeById(Number(bound.segment_node));
+    if(saved?.comfyClass==="AidenH3Segment")return saved;
     const direct=app.graph.links[viewer.inputs?.find(input=>input.name==="context")?.link];
     const directNode=direct && app.graph.getNodeById(direct.origin_id);
     if(directNode?.comfyClass==="AidenH3Segment") return directNode;
@@ -275,7 +296,7 @@ function runSelectedSegments(segment, options = {}) {
 
 function followRunningSegment(viewer, state) {
     if (!["queued", "running"].includes(state.status)) { viewer._adH3FollowedSegment = ""; return; }
-    const index = Number(state.cursor), row = state.segments?.[index];
+    const index = Number(state.execution?.index ?? state.cursor), row = state.segments?.[index];
     const identity = `${state.id}:${row?.segment_key || index}`;
     if (!row || viewer._adH3FollowedSegment === identity) return;
     const segment = upstreamSegment(viewer), graph = segment?.graph;
@@ -296,11 +317,13 @@ function mountReview(node) {
     root.innerHTML=`<div class="h3-status"></div><div class="h3-message"></div><div class="h3-list"></div>`;
     const status=root.querySelector(".h3-status"),message=root.querySelector(".h3-message"),list=root.querySelector(".h3-list");
     const compare=document.createElement("div");compare.className="h3-compare";compare.hidden=true;
-    let disposed=false,busy=false,lastState=null,lastSession="",lastRendered="",connectionFailed=false;
+    let disposed=false,busy=false,lastState=null,lastSession="",lastRendered="",connectionFailed=false,lastETag="";
     let refreshing=false,lastPolled=0,lastPayload="";
     node._adH3FollowCurrent = () => lastState && followRunningSegment(node, {...lastState, status: "queued"});
     const say=(text,error=false)=>{message.textContent=text;message.classList.toggle("error",error);try{node._adH3Hint?.(text,error);}catch{}};
     function sessionId(segment){
+        const frozen = segment?.properties?.ad_execution_round;
+        if (frozen?.session_id && frozen.id) return frozen.session_id;
         const direct=segment?.widgets?.find(widget=>widget.name==="session_id")?.value;
         if(direct) return direct;
         // 新布局：当前段不再带 session_id 控件，从上游素材清单库的状态里取
@@ -316,6 +339,9 @@ function mountReview(node) {
     }
     function draw(state) {
         lastState=state;
+        node.properties ||= {};
+        if(state.execution_round) node.properties.ad_execution_round={...state.execution_round,session_id:state.id};
+        else delete node.properties.ad_execution_round;
         followRunningSegment(node, state);
         const segment = upstreamSegment(node), graph = segment?.graph;
         const input = segment?.inputs?.find(item => item.name === "queue");
@@ -327,7 +353,7 @@ function mountReview(node) {
         const running=["queued","running","merging"].includes(state.status);
         const row=state.segments[state.cursor];
         const canMerge=state.segments.every(item=>item.valid&&item.accepted);
-        const enabled={start:!running&&!row.valid,approve:!running&&row.valid&&!row.accepted,
+        const enabled={start:!running&&!row.valid,
             redo:!running,auto:!running,merge:!running&&canMerge,clear:!running,
             run_segment:!running,run_pending:!running};
         for(const button of root.querySelectorAll("[data-command]"))button.disabled=busy||!enabled[button.dataset.command];
@@ -337,7 +363,7 @@ function mountReview(node) {
         let cumulative=0;
         list.innerHTML=state.segments.map((row,i)=>{
             const version=row.versions.find(version=>version.id===row.selected);
-            const text=row.valid?(row.accepted?"已通过":"待审核"):(row.versions.length?"待更新":"未生成");
+            const text=row.valid?(row.accepted?"已生成":"生成中"):(row.versions.length?"待更新":"未生成");
             const source=version?`<a href="${esc(mediaUrl("session",`${state.id}/${version.file}`))}" target="_blank" rel="noopener">播放</a>`:"";
             const options=row.versions.map((version,j)=>`<option value="${esc(version.id)}" ${version.id===row.selected?"selected":""}>版本 ${j+1}</option>`).join("");
             cumulative+=version?.sync_error_ms||0;
@@ -369,8 +395,11 @@ function mountReview(node) {
     node._adH3BatchStop = false;
     let actionRevision=0;
     async function act(command,extra={}) {
-        if(command==="stop") {node._adH3BatchStop=true;node._adH3StopEpoch=(Number(node._adH3StopEpoch)||0)+1;}
-        if(node._adH3AffectedRunning && command!=="stop") {say("正在运行所选段，请等待完成或先点停止。",true);return false;}
+        if(command==="stop") {
+            node._adH3BatchStop=true;node._adH3StopEpoch=(Number(node._adH3StopEpoch)||0)+1;
+            try { await interruptOwnedPrompt(api,node); } catch(error) { say(error.message,true); }
+        }
+        if(node._adH3AffectedRunning && command!=="stop" && !(command==="redo_preview" && extra.draft_target)) {say("正在运行所选段，请等待完成或先点停止。",true);return false;}
         if(busy && command !== "stop") {node._adH3LastActionError="上一项操作尚未结束，请稍后重试。";say(node._adH3LastActionError,true);return false;}
         const segment=upstreamSegment(node);
         if(!segment){say("请先连接当前段上下文。",true);return false;}
@@ -393,8 +422,12 @@ function mountReview(node) {
             let result=null;
             try{
                 result=await request("/aiden_h3/action",{command,session_id:sessionId(segment),segment_node:String(segment.id),
-                    prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,confirmed:command==="clear",...extra});
+                    prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,confirmed:command==="clear",auto_accept:true,...extra});
                 if(operation!==actionRevision)return false;
+                if (command === "clear") {
+                    if(segment.properties) delete segment.properties.ad_execution_round;
+                    if(node.properties) delete node.properties.ad_execution_round;
+                }
                 previewId=result?.preview_hold?.request_id||"";
                 draw(result);
             }catch(error){
@@ -403,17 +436,27 @@ function mountReview(node) {
                 if(queueLinked || !["redo","redo_preview","start"].includes(command)) throw error;
             }
             const messages={stop:"已停止：当前生成已中断，分段循环待命；可点任意预览后「本段抽卡」，抽完点「开始」续接分段循环。",
-                clear:"已清空本轮进度，已有文件保留。",redo:"已重置当前段，正在重新抽卡…",redo_preview:"正在本段抽卡（仅预览备选，不改变分段循环进度）…",
-                start:"已开始生成当前段…",approve:"已通过并准备下一段。",auto:"已开始分段循环。",merge:"合并操作已完成。",
+                clear:"已清空本轮进度，已有文件保留。",redo:"已重置当前段，正在重新抽卡…",redo_preview:"正在本段抽卡（新结果将直接作为该段当前选用）…",
+                start:"已开始生成当前段…",approve:"已自动通过当前段。",auto:"已开始分段循环。",merge:"合并操作已完成。",
                 run_segment:"已切换到指定段：点「开始」只生成这一段，通过后自动回到原进度位置。",
                 run_pending:"已定位到待生成/待更新段：点「开始」只生成这一段，通过后自动回到原进度位置。"};
             say(command==="redo_preview" && result?.preview_hold?.select_on_success
-                ? "正在重抽停止段；成功后作为待批准版本，不自动跳段…" : (messages[command] || "操作已完成。"));
+                ? "正在重抽停止段；成功后直接作为该段当前选用，不自动跳段…" : (messages[command] || "操作已完成。"));
             if(command==="redo_preview"){
                 const stopEpoch=Number(node._adH3StopEpoch)||0;
-                const queued=await executeQueueOnce(app,api,segment.id,{isStopped:()=>(Number(node._adH3StopEpoch)||0)!==stopEpoch});
+                const queued=await executeQueueOnce(app,api,segment.id,{isStopped:()=>(Number(node._adH3StopEpoch)||0)!==stopEpoch,owner:node});
                 if(operation!==actionRevision)return false;
                 if(queued.stopped){node._adH3ActionCancelled=true;say("本段抽卡已停止，原循环位置已恢复。");return false;}
+                for (let attempt=0;attempt<40;attempt++) {
+                    const response=await api.fetchApi("/aiden_h3/session/"+encodeURIComponent(sessionId(segment))+"?t="+Date.now(),{cache:"no-store"});
+                    const state=await response.json();
+                    if (!response.ok) throw new Error(state.error || "读取试跑结果失败");
+                    draw(state);
+                    if (!state.draft_trial) {result=state;break;}
+                    await new Promise(resolve=>setTimeout(resolve,100));
+                }
+                if(result?.draft_trial) throw new Error("试跑已结束，等待结果登记，请稍后再继续");
+                say("本段抽卡完成：新结果已作为该段当前选用；点「开始」继续原循环。");
             }else if(command==="redo"||command==="start"){
                 if(typeof node._adH3Run==="function") {
                     if(await node._adH3Run()===false)throw new Error("工作流未成功加入队列，请检查节点连线和输入参数");
@@ -424,13 +467,13 @@ function mountReview(node) {
                 const cursor=Number(result.cursor)||0;
                 const total=(result.segments||[]).length;
                 const approved=approvedIndex;
-                if(result.status==="review")say(`已批准第 ${approved} 段；第 ${cursor+1} 段已有待审核结果。`);
+                if(result.status==="review")say(`已自动通过第 ${approved} 段；第 ${cursor+1} 段已有生成结果。`);
                 else if(result.status!=="completed" && cursor<total){
-                    say(`已批准第 ${approved} 段，正在生成第 ${cursor + 1} 段…`);
+                    say(`已自动通过第 ${approved} 段，正在生成第 ${cursor + 1} 段…`);
                     if(typeof node._adH3Run==="function") node._adH3Run();
                     else try{ if(app.queuePrompt) await app.queuePrompt(0,1); }catch{}
                 }else{
-                    say("已批准，全部轮次已完成。");
+                    say("已全部自动通过，全部轮次已完成。");
                 }
             }
         return result || true;
@@ -448,42 +491,82 @@ function mountReview(node) {
     }
     root.querySelectorAll("[data-command]").forEach(button=>button.onclick=()=>button.dataset.command==="auto"?void node._adH3Batch({merge:false}):void act(button.dataset.command));
     node._adH3Act = act;
+    node._adH3QueueOwned = async () => {
+        const segment = upstreamSegment(node);
+        if (!segment) return false;
+        const epoch = Number(node._adH3StopEpoch) || 0;
+        await executeQueueOnce(app, api, segment.id, {owner:node, waitForCompletion:false,
+            isStopped:()=>(Number(node._adH3StopEpoch)||0)!==epoch});
+        return true;
+    };
 
-    async function batchRun() {
+    async function batchRun({resumeSelection=true}={}) {
         const segment=upstreamSegment(node);
         if(!segment) throw new Error("请先连接当前段上下文");
         node._adH3BatchStop=false;
         const stopped=()=>!!node._adH3BatchStop;
-        const queueLinked=!!segment.inputs?.find(item=>item.name==="queue")?.link;
+        // 后台继续运行：循环只依赖启动时序列化的队列副本和已捕获的节点，不依赖当前激活画布。
+        // 切到其它工作流标签后旧图 DOM/连线可能不可用，界面刷新失败不能中断生成。
+        const safeDraw = state => { try { draw(state); } catch {} };
+        const queueLinked=!!segment.inputs?.find(item=>item.name==="queue")?.link || !!segment.properties?.ad_execution_round?.id;
         if(!queueLinked) {
             const widget=segment.widgets?.find(item=>item.name==="正向提示词");
             const text=String(widget?.value||"");
             if(!text.trim())throw new Error("请先填写正向提示词再开始分段循环");
-            const count=Math.max(1,text.split(/^[ \t]*#[ \t]*/m).filter(part=>part.trim()).length);
+            const parts=text.split(/^[ \t]*#[ \t]*/m);
+            const count=Math.max(1,(parts.length>1?parts.slice(1):parts).filter(part=>part.trim()).length);
             const index=segment.widgets?.find(item=>item.name==="段索引");
+            const serialized=await app.graphToPrompt();
             for(let i=0;i<count;i++) {
                 if(stopped()) return;
                 if(index) index.value=i;
                 say("正在生成第 "+(i+1)+"/"+count+" 段…");
-                const result=await executeQueueOnce(app,api,segment.id,{isStopped:stopped});
+                let submission=serialized;
+                if(app.graph===node.graph && segment.graph===node.graph) submission=await app.graphToPrompt();
+                // 切页仍更新自己的提交副本，不触碰另一张画布。
+                submission=structuredClone(submission);
+                if(submission.output?.[String(segment.id)]) submission.output[String(segment.id)].inputs["段索引"]=i;
+                const result=await executeQueueOnce(app,api,segment.id,{isStopped:stopped,serialized:submission,owner:node});
                 if(result.stopped) return;
             }
             say("独立模式分段循环完成，共 "+count+" 段。");return;
         }
         const serialized=await app.graphToPrompt();
-        let state=await request("/aiden_h3/sync",{segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId});
+        // 本轮提交副本固定：后续段即使切到别的标签也用它，而不是当前激活工作流。
+        const roundSubmission=serialized;
+        // 分段循环续跑：报错后按最新编辑重冻结并从报错段继续；清空重置后从选中预览卡之后继续。
+        let currentState=null;
+        try {
+            const response=await api.fetchApi("/aiden_h3/session/"+encodeURIComponent(sessionId(segment))+"?t="+Date.now(),{cache:"no-store"});
+            if(response.ok) currentState=await response.json();
+        } catch {}
+        const selectedPreview=resumeSelection ? node._adH3Preview?.resumeTarget?.() : null;
+        const selectedSegment=resumeSelection ? Number(selectedPreview?.segment_index || (typeof node._adH3Preview?.resumeTarget !== "function" ? node._adH3Preview?.selectedSegment?.() : 0) || 0) : 0;
+        let state;
+        if(currentState && selectedSegment > 0){
+            state=await request("/aiden_h3/action",{command:"resume_after",session_id:currentState.id,index:selectedSegment,preview:selectedPreview,segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,frontend_queue:true,auto_accept:true});
+            node._adH3Preview?.consumeResumeTarget?.();
+            safeDraw(state);
+            say(state.status==="completed" ? "所选为本轮最后一段，本轮已完成，没有后续段。" : "已从选中的第 "+state.cursor+" 段之后继续；本轮素材与前段结果保留。");
+        } else if(currentState?.status==="error"){
+            state=await request("/aiden_h3/action",{command:"resume_round",session_id:currentState.id,segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,frontend_queue:true,auto_accept:true});
+            safeDraw(state);
+            say("已按当前编辑重新生成，从报错段继续…");
+        } else {
+            state=await request("/aiden_h3/sync",{segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,round_session:sessionId(segment),freeze_round:true,auto_accept:true});
+        }
         const finish=async()=>{
             if (state.segments.some(row=>row.entry?.batch_source)) {
                 try {
                     state=await request("/aiden_h3/action",{command:"clear",session_id:state.id,confirmed:true});
-                    draw(state);
+                    safeDraw(state);
                     say("原文件批处理完成，结果已分别保存；本轮已自动清空，点开始继续新一轮。");
                 } catch (error) {
                     say("原文件批处理完成，结果已分别保存；自动清空失败："+error.message,true);
                 }
                 return;
             }
-            say("全部轮次已通过，分段循环完成。");
+            say("全部轮次已完成，分段循环完成。");
         };
         const waitIdle=async()=>{
             for(let attempt=0;attempt<3600;attempt++){
@@ -493,40 +576,53 @@ function mountReview(node) {
                 const response=await api.fetchApi("/aiden_h3/session/"+encodeURIComponent(state.id),{cache:"no-store"});
                 state=await response.json();
                 if(!response.ok) throw new Error(state.error||"读取进度失败");
-                draw(state);
+                safeDraw(state);
             }
             throw new Error("等待当前任务完成超时，请先点停止检查");
         };
         if(!(await waitIdle())) return;
         if(state.status==="error") throw new Error(state.error||"当前任务失败，请检查后重试");
         if(state.status==="completed"){await finish();return;}
-        for(let i=0;i<state.segments.length;i++) {
+        for(let guard=0;guard<state.segments.length+2;guard++) {
             if(stopped()) return;
-            const row=state.segments[state.cursor];
+            if(state.status==="completed"){await finish();return;}
+            if(state.status==="error") throw new Error(state.error||"当前任务失败，请检查后重试");
+            const beforeCursor=Number(state.cursor);
+            const row=state.segments[beforeCursor];
+            if(!row) break;
             if(!row.valid) {
-                followRunningSegment(node, {...state, status: "queued"});
+                try { followRunningSegment(node, {...state, status: "queued"}); } catch {}
                 say("正在生成第 "+(state.cursor+1)+"/"+state.segments.length+" 段…");
-                const result=await executeQueueOnce(app,api,segment.id,{isStopped:stopped});
+                // A 方案：同一画布内每段重新读取当前连线/参数，改线从下一段立即生效；切到别的工作流时仍用启动副本。
+                let submission=roundSubmission;
+                try { if(app.graph===node.graph && segment.graph===node.graph && app.graph.getNodeById?.(segment.id)) submission=await app.graphToPrompt(); } catch {}
+                const result=await executeQueueOnce(app,api,segment.id,{isStopped:stopped,serialized:submission,owner:node});
                 if(result.stopped) return;
-                // 执行完成与后台会话落盘有短暂竞态：等当前段真正变为有效再批准。
-                for(let attempt=0;attempt<120;attempt++){
+                // 生成即通过：等待后台自动登记有效/通过并把游标前移，无需再点同意批准。
+                let advanced=false;
+                for(let attempt=0;attempt<160;attempt++){
                     const response=await api.fetchApi("/aiden_h3/session/"+encodeURIComponent(state.id),{cache:"no-store"});
                     state=await response.json();
                     if(!response.ok) throw new Error(state.error||"读取进度失败");
                     if(state.status==="error") throw new Error(state.error||"本次任务失败");
-                    if(state.segments?.[state.cursor]?.valid) break;
+                    if(state.status==="completed" || Number(state.cursor)!==beforeCursor
+                        || (state.segments?.[beforeCursor]?.valid && state.segments?.[beforeCursor]?.accepted)) {advanced=true;break;}
                     if(stopped()) return;
                     await new Promise(resolve=>setTimeout(resolve,250));
                 }
-                if(!state.segments?.[state.cursor]?.valid)
-                    throw new Error(state.error||"本次任务没有有效结果，当前段未批准");
+                if(!advanced) throw new Error(state.error||"本次任务没有有效结果，未能继续下一段");
+                if(state.status==="completed"){await finish();return;}
+                continue;
             }
-            if(stopped()) return;
-            const beforeCursor=Number(state.cursor);
-            state=await request("/aiden_h3/action",{command:"approve",session_id:state.id});draw(state);
-            if(state.status==="completed"){await finish();return;}
-            if(Number(state.cursor)===beforeCursor)
-                throw new Error(`审批后进度没有前进（仍停在第 ${beforeCursor+1} 段），请检查后台进度或点停止后重试`);
+            if(!row.accepted){
+                // 旧会话兼容：仅对待审核的有效结果自动通过一次；新会话生成即通过，不会走到这里。
+                state=await request("/aiden_h3/action",{command:"approve",session_id:state.id});safeDraw(state);
+                if(state.status==="completed"){await finish();return;}
+                if(Number(state.cursor)===beforeCursor)
+                    throw new Error(`自动通过后进度没有前进（仍停在第 ${beforeCursor+1} 段），请检查后台进度或点停止后重试`);
+                continue;
+            }
+            break;
         }
     }
     node._adH3Batch=async options=>{
@@ -583,6 +679,17 @@ function mountReview(node) {
                 workflow: serialized.workflow, client_id: api.clientId});
             if (stopped()) return false;
             draw(state);
+            if (state.execution_round) {
+                const indices = options.indices?.length ? [...new Set(options.indices)] : [state.cursor];
+                for (const index of indices) {
+                    if (stopped()) return false;
+                    const result = await act("redo_preview", {index, draft_target:true});
+                    if (result === false) return false;
+                }
+                succeeded = true;
+                say("所选片段已生成；原循环进度保持不变。");
+                return true;
+            }
             state = await request("/aiden_h3/action", {command: "run_affected", session_id: state.id,
                 ...(options.indices ? {indices: options.indices} : {})});
             if (stopped()) {
@@ -591,7 +698,7 @@ function mountReview(node) {
             }
             draw(state);
             const total = Number(state.affected_run?.remaining?.length || 0);
-            if (total) say(`检测到 ${total} 个需要重跑的段：自动逐个生成并批准，完成后回到原运行位置…`);
+            if (total) say(`检测到 ${total} 个需要重跑的段：自动逐个生成并完成，完成后回到原运行位置…`);
             const limit = total + 1;
             for (let guard = 0; guard < limit; guard++) {
                 if (stopped()) return;
@@ -613,7 +720,7 @@ function mountReview(node) {
                 if (Number.isFinite(start)) follow(start);
                 if (!row.valid) {
                     say(`正在重跑第 ${index + 1} 段（自动处理受影响段）…`);
-                    const queued = await executeQueueOnce(app, api, segment.id, {isStopped: stopped});
+                    const queued = await executeQueueOnce(app, api, segment.id, {isStopped: stopped,owner:node});
                     if (queued.stopped) return;
                     for (let attempt = 0; attempt < 120; attempt++) {
                         const response = await api.fetchApi("/aiden_h3/session/" + encodeURIComponent(state.id), {cache: "no-store"});
@@ -624,7 +731,7 @@ function mountReview(node) {
                         if (stopped()) return;
                         await new Promise(resolve => setTimeout(resolve, 250));
                     }
-                    if (!state.segments?.[state.cursor]?.valid) throw new Error("本次任务没有有效结果，当前段未能批准");
+                    if (!state.segments?.[state.cursor]?.valid) throw new Error("本次任务没有有效结果，当前段未能完成");
                 }
                 if (stopped()) return false;
                 state = await request("/aiden_h3/action", {command: "approve", session_id: state.id, frontend_queue: true});
@@ -645,6 +752,15 @@ function mountReview(node) {
         }
     };
     node._adH3ReviewStatus = say;
+    node._adH3RefreshState = async () => {
+        const segment=upstreamSegment(node);
+        if(!segment) throw new Error("找不到本轮的分段生成节点");
+        const response=await api.fetchApi("/aiden_h3/session/"+encodeURIComponent(sessionId(segment))+"?t="+Date.now(),{cache:"no-store"});
+        const state=await response.json();
+        if(!response.ok) throw new Error(state.error || "读取本轮进度失败");
+        draw(state);
+        return state;
+    };
     async function refresh(force=true){
         if(disposed || refreshing || (!force && document.hidden))return;
         const interval=lastState && ["queued","running","merging"].includes(lastState.status)?2000:10000;
@@ -652,16 +768,21 @@ function mountReview(node) {
         const segment=upstreamSegment(node);const current=sessionId(segment);
         if(!segment){ status.textContent="连接「当前段上下文」后启用循环控制。"; for(const button of root.querySelectorAll("[data-command]")) button.disabled=true; return; }
         if(!current)return;
-        if(current!==lastSession){lastSession=current;lastState=null;lastRendered="";list.textContent="";compare.querySelectorAll("video").forEach(video=>video.pause());compare.replaceChildren();compare.hidden=true;}
+        if(current!==lastSession){lastETag="";lastSession=current;lastState=null;lastRendered="";list.textContent="";compare.querySelectorAll("video").forEach(video=>video.pause());compare.replaceChildren();compare.hidden=true;}
         refreshing=true;lastPolled=Date.now();
         const pollRevision=actionRevision;
         try{
-            const response=await api.fetchApi(`/aiden_h3/session/${encodeURIComponent(current)}`);
+            const response=await api.fetchApi(`/aiden_h3/session/${encodeURIComponent(current)}`, {cache:"no-store",headers:lastETag ? {"If-None-Match":lastETag} : {}});
             if(disposed || pollRevision!==actionRevision){lastPolled=0;return;}
-            if(response.status===404){
+            if(response.status===304){
+                const payload=`${current}|${lastETag}|${busy}`;
+                if(lastState && payload!==lastPayload){lastPayload=payload;draw(lastState);}
+                return;
+            }
+            if(response.status===404){lastETag="";
                 if(connectionFailed){say("");connectionFailed=false;}
                 const standaloneReady=!!node._adH3StandaloneReady;
-                status.textContent=standaloneReady?"独立模式 · 本次结果可批准":"已连接 · 可以开始第一段";
+                status.textContent=standaloneReady?"独立模式 · 本次结果可用":"已连接 · 可以开始第一段";
                 root.querySelectorAll("[data-command]").forEach(button=>{
                     const allowed=["start","auto"].includes(button.dataset.command)||(button.dataset.command==="approve"&&standaloneReady);
                     button.disabled=busy||!allowed;
@@ -672,7 +793,8 @@ function mountReview(node) {
             if(disposed || current!==lastSession || pollRevision!==actionRevision)return;
             if(Number(state.updated_at||0)<Number(lastState?.updated_at||0))return;
             if(connectionFailed){say("");connectionFailed=false;}
-            const payload=JSON.stringify([current,state,busy]);
+            lastETag=response.headers?.get?.("ETag") || "";
+            const payload=lastETag ? `${current}|${lastETag}|${busy}` : JSON.stringify([current,state,busy]);
             if(payload!==lastPayload){lastPayload=payload;draw(state);}
         }catch(error){if(!disposed && pollRevision===actionRevision){connectionFailed=true;say(error.message,true);}}
         finally{refreshing=false;}
@@ -1264,10 +1386,11 @@ function startSegmentRepairTimer() {
             try { repairSegmentLinkTypes(node); } catch {}
             node._adH3RepairSignature = segmentRepairSignature(node);
         }
-    }, 1500);
+    }, 4000);
 }
 
 const savedSegmentSchemas = new Map();
+const schemasBySavedInfo = new WeakMap();
 function setupNode(node) {
     if (["AidenH3AudioQueue", "AidenH3Segment", "AidenH3VideoPreview"].includes(node.comfyClass)) mountNodeProgress(node);
     installGlassTheme();
@@ -1276,7 +1399,7 @@ function setupNode(node) {
       normalizeAspectWidget(node);
       const prevConfigure=node.onConfigure;
       const syncSegmentOutputs=()=>{normalizeSegmentOutputs(node);try{node._adH3ApplyDynamicOutputs?.();}catch(_error){}};
-      node.onConfigure=function(){this._adH3Configured=true;this._adH3GraphReady=false;const info=arguments[0];const savedOutputs=savedSegmentSchemas.get(String(this.id))||(info&&Array.isArray(info.outputs)?info.outputs.map(output=>({...output,links:[...(output.links||[])]})):null);const restoreNames=()=>{if(savedOutputs)node.outputs=savedOutputs.map((saved,index)=>{const output=node.outputs?.[index]||{links:[]};output.name=saved.name;output.type=saved.type;output.h3_key=undefined;output.slot_index=index;return output;});};restoreNames();const out=prevConfigure?.apply(this,arguments);restoreNames();normalizeAspectWidget(node);syncSegmentOutputs();const repairLinks=()=>{try{migrateSegmentLinksBySavedOutputs(node,savedOutputs);}catch(_error){}try{migrateLegacySegmentLinks(node);}catch(_error){}};repairLinks();setTimeout(syncSegmentOutputs,0);setTimeout(syncSegmentOutputs,400);setTimeout(repairLinks,0);setTimeout(repairLinks,120);return out;};
+      node.onConfigure=function(){this._adH3Configured=true;this._adH3GraphReady=false;const info=arguments[0];const savedOutputs=(info&&schemasBySavedInfo.get(info))||savedSegmentSchemas.get(String(this.id))||(info&&Array.isArray(info.outputs)?info.outputs.map(output=>({...output,links:[...(output.links||[])]})):null);this._adH3SavedSchema=savedOutputs;const restoreNames=()=>{if(savedOutputs)node.outputs=savedOutputs.map((saved,index)=>{const output=node.outputs?.[index]||{links:[]};output.name=saved.name;output.type=saved.type;output.h3_key=undefined;output.slot_index=index;return output;});};restoreNames();const out=prevConfigure?.apply(this,arguments);restoreNames();normalizeAspectWidget(node);syncSegmentOutputs();const repairLinks=()=>{try{migrateSegmentLinksBySavedOutputs(node,savedOutputs);}catch(_error){}try{migrateLegacySegmentLinks(node);}catch(_error){}};repairLinks();setTimeout(syncSegmentOutputs,0);setTimeout(syncSegmentOutputs,400);setTimeout(repairLinks,0);setTimeout(repairLinks,120);return out;};
       mountResolutionBadge(node);mountPromptEditor(node);mountNegativeEditor(node);mountPromptPrefix(node);
       startSegmentRepairTimer(); repairSegmentNode(node);
       const relabel={"正向提示词":"正向提示词","统一提示词前缀":"统一提示词前缀","反向提示词":"反向提示词",multiple:"倍数"};
@@ -1286,12 +1409,14 @@ function setupNode(node) {
       for(const widget of node.widgets||[]){ if(relabel[widget.name]){ widget.label=relabel[widget.name]; widget.localized_name=relabel[widget.name]; } }
       // 动态参考端口：素材库实际有多少参考素材就显示多少口
       node._adH3ApplyDynamicOutputs = () => {
+        const graph = node.graph;
+        if (!graph) return;  // 已切走/移除节点的迟到回调不能操作另一个工作流。
         const queueInput = (node.inputs || []).find(input => input.name === "queue");
-        const link = queueInput?.link != null ? (app.graph.links?.[queueInput.link] || app.graph.links?.get?.(queueInput.link)) : null;
-        const queue = link && app.graph.getNodeById(link.origin_id);
+        const link = queueInput?.link != null ? (graph.links?.get?.(queueInput.link) || graph.links?.[queueInput.link]) : null;
+        const queue = link && graph.getNodeById?.(link.origin_id);
         const widget = queue?.widgets?.find(item => item.name === "queue_state");
         if (queueInput?.link == null) {
-            if (savedSegmentSchemas.has(String(node.id)) && !node._adH3GraphReady) return;
+            if (node._adH3SavedSchema && !node._adH3GraphReady) return;
             updateSegmentMaterialOutputs(node, {sources:[], images:[], video_tracks:[], audio_tracks:[]});
             applySegmentOutputLabels(node);
             return;
@@ -1439,16 +1564,20 @@ app.registerExtension({
     },
     beforeConfigureGraph(graphData){
         savedSegmentSchemas.clear();
-        // 在 LiteGraph 校验连线之前统一紧凑布局，避免缺口修补后仍按旧槽位载入连线。
         const infos = new Map((graphData?.nodes || []).map(info => [String(info.id), info]));
-        const links = graphData?.links || [];
+        const rawLinks = graphData?.links || [];
+        const links = Array.isArray(rawLinks) ? rawLinks : Object.values(rawLinks);
+        // 旧工作流使用元组，新前端在扩展钩子前转换为对象；两种格式都按名称恢复。
+        const field = (link, key, index) => Array.isArray(link) ? link[index] : link?.[key];
+        const setField = (link, key, index, value) => { if (Array.isArray(link)) link[index] = value; else link[key] = value; };
         for (const info of graphData?.nodes || []) {
             if (info.type !== "AidenH3Segment") continue;
             const queueInput = info.inputs?.find(input => input.name === "queue");
-            const queueLink = links.find(link => Array.isArray(link) && link[0] === queueInput?.link);
-            const queue = queueLink && infos.get(String(queueLink[1]));
+            if (queueInput?.link == null) continue;
+            const queueLink = links.find(link => String(field(link,"id",0)) === String(queueInput.link));
+            const queue = queueLink && infos.get(String(field(queueLink,"origin_id",1)));
             let state;
-            try { const value = queue?.widgets_values?.[0]; state = typeof value === "string" ? JSON.parse(value) : value; } catch {}
+            try { const value = savedTimelineValue(queue); state = typeof value === "string" ? JSON.parse(value) : value; } catch {}
             if (!Array.isArray(state?.sources)) continue;
             const counts = segmentRefCounts(state);
             const desired = [...AD_SEG_FIXED];
@@ -1458,23 +1587,33 @@ app.registerExtension({
             const previous = info.outputs || [];
             const byName = new Map(previous.map(output => [output.name, output]));
             for (const link of links) {
-                if (!Array.isArray(link) || String(link[1]) !== String(info.id)) continue;
-                const name = previous[link[2]]?.name;
+                if (String(field(link,"origin_id",1)) !== String(info.id)) continue;
+                const name = previous[field(link,"origin_slot",2)]?.name;
                 const index = desired.indexOf(name);
-                if (index >= 0) { link[2] = index; link[5] = AD_SEG_TYPES[AD_SEG_OUTPUTS.indexOf(name)]; }
+                if (index >= 0) {
+                    setField(link,"origin_slot",2,index);
+                    setField(link,"type",5,AD_SEG_TYPES[AD_SEG_OUTPUTS.indexOf(name)]);
+                }
             }
             info.outputs = desired.map((name, index) => ({
                 ...(byName.get(name) || {}), name, type: AD_SEG_TYPES[AD_SEG_OUTPUTS.indexOf(name)],
                 slot_index: index, links: [...(byName.get(name)?.links || [])],
             }));
-            savedSegmentSchemas.set(String(info.id), info.outputs.map(output => ({...output,links:[...(output.links||[])],
-                targets:(output.links||[]).map(id=>{const link=links.find(item=>Array.isArray(item)&&item[0]===id);return link?{id:link[3],slot:link[4],name:infos.get(String(link[3]))?.inputs?.[link[4]]?.name}:null;}).filter(Boolean),
-            })));
+            const schema = info.outputs.map(output => ({...output,links:[...(output.links||[])],
+                targets:(output.links||[]).map(id=>{
+                    const link=links.find(item=>String(field(item,"id",0))===String(id));
+                    if(!link)return null;
+                    const target=field(link,"target_id",3),slot=field(link,"target_slot",4);
+                    return {id:target,slot,name:infos.get(String(target))?.inputs?.[slot]?.name};
+                }).filter(Boolean),
+            }));
+            savedSegmentSchemas.set(String(info.id), schema);
+            schemasBySavedInfo.set(info, schema);
         }
     },
     loadedGraphNode(node){
         if ((node.comfyClass || node.type) !== "AidenH3Segment") return;
-        const saved = savedSegmentSchemas.get(String(node.id));
+        const saved = node._adH3SavedSchema;
         if (!saved) return;
         const previous = node.outputs || [];
         node.outputs = saved.map((slot,index)=>{
@@ -1493,19 +1632,20 @@ app.registerExtension({
             setTimeout(() => { if (node.graph) node._adH3ApplyDynamicOutputs?.(); }, 0);
         }
         // 核心版本可能按固定返回类型先移除紧凑参考口的连线；按保存的两端名称恢复。
-        for (const [id,saved] of savedSegmentSchemas) {
-            const node=app.graph?.getNodeById?.(id)||app.graph?.getNodeById?.(Number(id));
-            if (!node) continue;
+        for (const node of app.graph?._nodes || []) {
+            const saved = node._adH3SavedSchema;
+            if (!saved || !node.graph) continue;
+            const graph = node.graph;
             for(const output of saved){
                 const slot=node.outputs?.findIndex(item=>item.name===output.name);
                 if(slot==null||slot<0)continue;
                 for(const spec of output.targets||[]){
-                    const target=app.graph.getNodeById(spec.id);
+                    const target=graph.getNodeById(spec.id);
                     const named=target?.inputs?.findIndex(input=>input.name===spec.name);
                     const index=named>=0?named:spec.slot;
                     const input=target?.inputs?.[index];
                     if(!input)continue;
-                    const link=app.graph.links?.get?.(input.link)||app.graph.links?.[input.link];
+                    const link=graph.links?.get?.(input.link)||graph.links?.[input.link];
                     if(link&&String(link.origin_id)!==String(node.id))continue;
                     if(link&&link.origin_slot===slot)continue;
                     try{node.connect(slot,target,index);}catch{}
@@ -1646,6 +1786,7 @@ if(!chineseTitles[nodeData.name])return;
         if(!node._adWheelWidgetHook){node._adWheelWidgetHook=true;node.addDOMWidget=function(name,type,element,...args){const widget=add.call(this,name,type,element,...args);attach(element);return widget;};}
     },
 });
+
 
 
 

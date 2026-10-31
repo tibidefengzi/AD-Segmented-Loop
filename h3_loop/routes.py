@@ -34,7 +34,9 @@ def _storage_busy():
 
 @routes.get("/aiden_h3/storage")
 async def storage_usage(request):
-    result = await asyncio.to_thread(cleanup.usage)
+    cache_flag = str(request.rel_url.query.get("cache", "1")).lower()
+    include_cache = cache_flag not in {"0", "false", "off", "no"}
+    result = await asyncio.to_thread(cleanup.usage, include_cache)
     result["busy"] = _storage_busy()
     return web.json_response(result, headers={"Cache-Control":"no-store, max-age=0"})
 
@@ -586,17 +588,48 @@ def public_state(state):
     result = {key: value for key, value in state.items() if key not in {"template", "active", "retired_segments", "run_origins"}}
     active = state.get("active") or {}
     result["execution"] = {"index": active.get("index"), "prompt_id": active.get("prompt_id")}
+    pending = state.get("draft_trial")
+    if pending:
+        try:
+            child = STORE.read(pending["session_id"])
+            active = child.get("active") or {}
+            result["status"] = "running" if active else "queued"
+            result["preview_hold"] = {"request_id": pending["request_id"], "select_on_success": False}
+            result["execution"] = {"index": pending["target"], "prompt_id": active.get("prompt_id")}
+        except FileNotFoundError:
+            pass
     return result
 
 
 @routes.get("/aiden_h3/session/{session_id}")
 @guarded
 async def session(request):
-    state = STORE.read(request.match_info["session_id"])
-    return web.json_response(public_state(state))
+    state, etag = await asyncio.to_thread(STORE.read_if_changed, request.match_info["session_id"], request.headers.get("If-None-Match"))
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if state is None:
+        return web.Response(status=304, headers=headers)
+    if state.get("draft_trial"):
+        headers.pop("ETag", None)
+    return web.json_response(public_state(state), headers=headers)
 
 
 async def sync_from_graph(data):
+    return await asyncio.to_thread(sync_graph_now, data)
+
+
+def _enable_auto_accept(session_id):
+    """新界面“生成即通过”：给会话打上自动通过标记，旧会话首次同步/操作时升级。"""
+    with STORE.lock(session_id):
+        state = STORE._load(session_id)
+        if not state.get("auto_accept"):
+            state["auto_accept"] = True
+            return STORE._save(state)
+        return state
+
+
+def sync_graph_now(data):
+    # A 方案：不再因已有 execution_round 直接返回旧快照；每次都用当前画布重新同步，
+    # 连线/参数变化从下一次生成起生效。进度由 STORE.sync 按源范围保留。
     prompt = data["prompt"]
     node_id = str(data["segment_node"])
     node = prompt[node_id]
@@ -613,14 +646,20 @@ async def sync_from_graph(data):
         except Exception:
             session_raw = None
     session_id = identifier(session_raw or f"AD-H3-{node_id}")
+    try:
+        existing = STORE.read(session_id)
+        if existing.get("execution_round"):
+            return existing
+    except FileNotFoundError:
+        pass
     if not link:
-        raise ValueError("独立模式请用「分段循环」逐段执行；连分段清单后才能用开始/批准。")
+        raise ValueError("独立模式请用「分段循环」逐段执行；连分段清单后才能用开始/分段循环。")
     queue_node = prompt[link[0]]
     if queue_node["class_type"] != "AidenH3AudioQueue" or link[1] != 0:
         raise ValueError("当前段的 queue 需要连接 H3 多段音频队列")
     raw_state = queue_node["inputs"]["queue_state"]
     from .timeline import timeline_plan
-    plan = await asyncio.to_thread(timeline_plan, raw_state)
+    plan = timeline_plan(raw_state)
     entries = plan["entries"]
     if not entries:raise ValueError("请设置每段长度和分段数，或在时间线上切分视频/音频后再生成。")
     from .spec import FPS
@@ -639,7 +678,10 @@ async def sync_from_graph(data):
     signature, template = template_for(prompt, node_id, {"workflow": data.get("workflow", {})})
     template["client_id"] = data.get("client_id")
     signatures = segment_signatures(prompt, node_id, entries, fps)
-    return STORE.sync(session_id, entries, signatures, template)
+    state = STORE.sync(session_id, entries, signatures, template)
+    if data.get("auto_accept"):
+        state = _enable_auto_accept(session_id)
+    return state
 
 
 @routes.post("/aiden_h3/save_to_desktop")
@@ -744,8 +786,32 @@ def _reuse_duplicate(kind: str, size: int, content_hash: str, original_name: str
 @routes.post("/aiden_h3/sync")
 @guarded
 async def sync_graph(request):
-    state = await sync_from_graph(await request.json())
+    data = await request.json()
+    state = await sync_from_graph(data)
+    if data.get("freeze_round"):
+        from .rounds import freeze
+        state = await asyncio.to_thread(freeze, state, data["prompt"], str(data["segment_node"]), data.get("workflow"), True)
     return web.json_response(public_state(state))
+
+
+def _interrupt_owned_prompt(prompt_id):
+    """原子定向中断/撤销本次任务，绝不退回全局中断。"""
+    if not prompt_id:
+        return
+    queue = PromptServer.instance.prompt_queue
+    queue.interrupt_if_running(prompt_id)
+    delete = getattr(queue, "delete_queue_item", None)
+    if callable(delete):
+        delete(lambda item: item[1] == prompt_id)
+
+
+@routes.post("/aiden_h3/interrupt_prompt")
+@guarded
+async def interrupt_prompt(request):
+    data = await request.json()
+    prompt_id = identifier(data.get("prompt_id"))
+    _interrupt_owned_prompt(prompt_id)
+    return web.json_response({"stopped": True})
 
 
 @routes.post("/aiden_h3/action")
@@ -754,6 +820,85 @@ async def action(request):
     data = await request.json()
     command = data["command"]
     session_id = identifier(data["session_id"])
+    from . import rounds
+    try:
+        existing = STORE.read(session_id)
+    except FileNotFoundError:
+        existing = {}
+    if data.get("auto_accept") and existing and not existing.get("auto_accept"):
+        existing = _enable_auto_accept(session_id)
+    if command == "redo_preview" and not data.get("prompt") and existing.get("execution_round"):
+        raise ValueError("本段抽卡需要当前编辑内容，请从分段预览按钮操作")
+    if command == "redo_preview" and data.get("prompt"):
+        if not existing:
+            existing = await sync_from_graph(data)
+        state = await asyncio.to_thread(rounds.start_trial, data)
+        return web.json_response(public_state(state))
+    if existing.get("draft_trial"):
+        if command not in {"stop", "cancel_preview"}:
+            raise ValueError("本段抽卡尚未结束，请完成后再继续原循环")
+        pending = existing["draft_trial"]
+        child = STORE.read(pending["session_id"])
+        active_child = child.get("active") or {}
+        if command == "stop" and active_child.get("prompt_id"):
+            _interrupt_owned_prompt(active_child["prompt_id"])
+        state = rounds.cancel_trial(session_id, data.get("preview_id"))
+        return web.json_response(public_state(state))
+    if command in {"resume_round", "resume_after"}:
+        # 分段循环续跑：用当前最新编辑重新冻结本轮，保留前面结果，从指定段继续。
+        if not data.get("prompt") or data.get("segment_node") is None:
+            raise ValueError("缺少当前编辑内容，无法继续本轮；请从分段预览的分段循环重试")
+        if not existing:
+            raise ValueError("尚未开始本轮，无法续跑")
+        if existing.get("status") in {"queued", "running", "merging"}:
+            raise ValueError("当前有任务运行，请先停止再续跑")
+        anchor = 0
+        if command == "resume_round":
+            if existing.get("status") != "error":
+                raise ValueError("当前不是报错状态，无需从报错段继续")
+        else:
+            try:
+                anchor = int(data.get("index") or 0)
+            except (TypeError, ValueError):
+                anchor = 0
+            if anchor <= 0:
+                raise ValueError("请先在「分段生成」里选中要从其后续跑的预览卡")
+        if command == "resume_after":
+            # 保留进度与清空重置都能选卡续跑，恢复本轮素材，不把下一轮草稿带进来。
+            with STORE.lock(session_id):
+                original = STORE._load(session_id)
+                candidate = copy.deepcopy(original)
+                anchor = rounds.resolve_resume_anchor(candidate, data.get("preview"), anchor)
+                rounds.accept_through(candidate, anchor)
+                reference = original.get("execution_round") or original.get("resume_round")
+                snapshot = rounds.read_snapshot({**original, "execution_round": reference}) if reference else None
+                source = (snapshot or {}).get("prompt") or (original.get("template") or {}).get("prompt") or data["prompt"]
+                materials = (snapshot or {}).get("materials") or rounds.capture_materials(source, str(data["segment_node"]))
+                rounds.validate_assets({"assets": materials.get("assets", [])})
+                prepared = rounds.apply_materials(data["prompt"], str(data["segment_node"]), materials, source)
+                candidate.update(auto_accept=True, auto=False, pause_after=False, active=None, error="")
+                if reference:
+                    candidate["execution_round"] = copy.deepcopy(reference)
+                STORE._save(candidate)
+                try:
+                    state = rounds.freeze(candidate, prepared, str(data["segment_node"]), data.get("workflow"), True, materials=materials)
+                except Exception:
+                    STORE._save(original)
+                    raise
+            return web.json_response(public_state(state))
+        # 先解除旧轮快照与错误状态，再用最新编辑同步分段并重新冻结。
+        with STORE.lock(session_id):
+            current = STORE._load(session_id)
+            current.pop("execution_round", None)
+            current.pop("draft_trial", None)
+            current.update(status="ready", auto=False, pause_after=False, active=None, error="")
+            STORE._save(current)
+        state = await sync_from_graph(data)
+        if state["id"] != session_id:
+            raise ValueError("进度名称与工作流不一致")
+        state = await asyncio.to_thread(rounds.freeze, state, data["prompt"],
+                                        str(data["segment_node"]), data.get("workflow"), True)
+        return web.json_response(public_state(state))
     if command not in {"pause", "stop", "clear", "select", "merge", "settings"} and data.get("prompt"):
         state = await sync_from_graph(data)
         if state["id"] != session_id:
@@ -770,19 +915,7 @@ async def action(request):
             state = STORE.action(session_id, "stop")
         except FileNotFoundError:
             state = {"id": session_id, "status": "paused", "cursor": 0, "segments": []}
-        # 立即中断 ComfyUI 当前执行（不只是暂停循环）
-        try:
-            from nodes import interrupt_processing
-            interrupt_processing()
-        except Exception:
-            pass
-        try:
-            from server import PromptServer
-            prompt_id = active.get("prompt_id")
-            if prompt_id:
-                PromptServer.instance.prompt_queue.interrupt_if_running(prompt_id)
-        except Exception:
-            pass
+        _interrupt_owned_prompt(active.get("prompt_id"))
     else:
         state = STORE.action(session_id, command, **{k: data[k] for k in ("confirmed", "index", "indices", "version", "merge_options", "reason", "preview_id") if k in data})
         if command in {"start", "redo", "approve", "auto"} and data.get("frontend_queue") is not True:
@@ -927,27 +1060,55 @@ async def media_info(request):
     return web.json_response(info)
 
 
+_THUMB_TASKS = {}
+_THUMB_SEMAPHORE = asyncio.Semaphore(2)
+
+def _write_thumbnail(path, target):
+    import io, os, subprocess, tempfile
+    from PIL import Image
+    from .assets import VIDEO_EXTS, ffmpeg_executable
+    if path.suffix.lower() in VIDEO_EXTS:
+        result = subprocess.run([ffmpeg_executable(), "-v", "error", "-nostdin", "-i", str(path),
+            "-frames:v", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            capture_output=True, check=True, timeout=30)
+        handle = io.BytesIO(result.stdout)
+    else:
+        handle = path
+    with Image.open(handle) as source:
+        image = source.convert("RGB")
+        image.thumbnail((320, 320))
+    with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".webp", delete=False) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        image.save(temporary_path, format="WEBP", quality=75, method=4)
+        os.replace(temporary_path, target)
+    finally:
+        image.close()
+        temporary_path.unlink(missing_ok=True)
+
 @routes.get("/aiden_h3/thumbnail/{origin}/{file:.*}")
 @guarded
 async def thumb(request):
-    """按需生成 320px 缩略图（磁盘缓存），避免浏览器批量解码大图。"""
-    import hashlib
-    from .assets import IMAGE_EXTS, resolve_source
-    origin = request.match_info["origin"]
-    source = {"origin": origin, "file": request.match_info["file"]}
-    path = resolve_source(source)
-    if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
-        raise ValueError("缩略图仅支持图片素材")
+    """按需静态缩略图；视频仅后台解码首帧，浏览器不为每张卡片创建视频。"""
+    from .assets import IMAGE_EXTS, VIDEO_EXTS, resolve_source
+    path = resolve_source({"origin": request.match_info["origin"], "file": request.match_info["file"]})
+    if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS | VIDEO_EXTS:
+        raise ValueError("缩略图仅支持图片或视频素材")
     cache_dir = Path(ROOT) / "thumbs"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha1(f"{path.resolve()}|{path.stat().st_mtime_ns}".encode("utf-8")).hexdigest()
+    stamp = path.stat()
+    key = digest([str(path.resolve()), stamp.st_mtime_ns, stamp.st_size])
     target = cache_dir / f"{key}.webp"
     if not target.is_file():
-        from PIL import Image
-        image = await asyncio.to_thread(Image.open, path)
-        image = image.convert("RGB")
-        image.thumbnail((320, 320))
-        await asyncio.to_thread(image.save, target, format="WEBP", quality=75, method=4)
+        if key not in _THUMB_TASKS:
+            async def generate():
+                async with _THUMB_SEMAPHORE:
+                    if not target.is_file():
+                        await asyncio.to_thread(_write_thumbnail, path, target)
+            task = asyncio.create_task(generate())
+            _THUMB_TASKS[key] = task
+            task.add_done_callback(lambda done: _THUMB_TASKS.pop(key, None) if _THUMB_TASKS.get(key) is done else None)
+        await asyncio.shield(_THUMB_TASKS[key])
     response = web.FileResponse(target)
     response.headers["Content-Type"] = "image/webp"
     response.headers["Cache-Control"] = "public, max-age=86400"
@@ -1055,3 +1216,16 @@ if STORE.root.is_dir():
         except (OSError, ValueError, KeyError):
             pass
 
+
+
+@routes.post("/aiden_h3/round/prepare")
+@guarded
+async def prepare_round(request):
+    from .rounds import prepare
+    data = await request.json()
+    return web.json_response(await asyncio.to_thread(prepare, data))
+
+
+from .rounds import prompt_handler as _round_prompt_handler
+if hasattr(PromptServer.instance, "add_on_prompt_handler"):
+    PromptServer.instance.add_on_prompt_handler(_round_prompt_handler)

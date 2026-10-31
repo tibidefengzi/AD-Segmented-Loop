@@ -3,11 +3,11 @@
 // CACHEBUST 2026-10-25-cursor-timeline
 // AD-H3 素材清单库：剪映式时间线编辑器（图片 / 视频 / 音频统一管理，片段切分驱动循环）。
 import "./ad_theme.js?v=20261026-ui219-final-layout";
-import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js?v=20261029-frame-info";
+import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js?v=20261031-fullscreen-center-v27";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, followsImageCount, clearImageSources, repairSourceInstances, retainedSourceBounds } from "./timeline_state.js?v=20261030-pure-image-count";
-import { mountStoragePanel } from "./storage_panel.js?v=20261029-usage-refresh";
+import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, followsImageCount, clearImageSources, repairSourceInstances, retainedSourceBounds, trackDisabled, activeClips, selectionPlaybackRange } from "./timeline_state.js?v=20261031-selection-play-v28";
+import { mountStoragePanel } from "./storage_panel.js?v=20261031-p1-v31";
 import {generationClips, commitGeneration, changeGeneration, deleteGeneration} from "./generation_edit.js?v=20261030-pure-image-count";
 import { bindWidgetWidth, timelineOrigin, markWidthBreakpoint, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261026-ui219-final-layout";
 import { PreviewCache } from "./timeline_performance.js?v=20261027-perf1";
@@ -142,7 +142,10 @@ style.textContent = `
 .h3-tl[data-w="lg"] .h3-shot img{height:124px}
 .h3-tl[data-w="lg"] .h3-player .screen{height:320px;max-height:320px}
 .h3-tl .h3-lane[data-kind] .h3-head{padding:0 2px;gap:2px;font-size:13px;white-space:nowrap}
-.h3-tl .h3-head [data-track-mute]{flex:0 0 16px!important;width:16px!important;min-width:16px!important;height:22px!important;min-height:22px!important;padding:0!important;border:0!important;background:transparent!important;font-size:12px!important;line-height:22px!important}
+.h3-tl .h3-head [data-track-mute],.h3-tl .h3-head [data-track-visibility]{flex:0 0 16px!important;width:16px!important;min-width:16px!important;height:22px!important;min-height:22px!important;padding:0!important;border:0!important;background:transparent!important;font-size:12px!important;line-height:22px!important}
+.h3-tl .h3-lane[data-kind] .h3-head{flex-basis:96px!important;box-sizing:border-box;flex-shrink:0}
+.h3-tl .h3-track-disabled .h3-clip{opacity:.32;filter:grayscale(.85);pointer-events:none}
+.h3-tl .h3-head [data-track-visibility][aria-pressed="true"]{color:#8b98ab!important}
 .h3-tl .h3-head [data-track-mute][aria-pressed="true"]{background:#38506b!important;border-radius:4px}
 /* 操作框高度只由素材轨数决定（见 syncViewHeight），节点拖拽不再拉伸它 */
 `;
@@ -270,6 +273,7 @@ function loadStateValue(raw) {
     else state = emptyTimeline();
     state = stripToneSources(state);
     state.muted_tracks ||= {};
+    state.disabled_tracks ||= {};
     const sourceMap = new Map((state.sources || []).map(source => [source.id, source]));
     for (const key of ["video_tracks", "audio_tracks"])
         state.muted_tracks[key] = (state[key] || []).map((lane, index) =>
@@ -325,8 +329,9 @@ const SEGMENT_FIXED_KEYS = ["context", "index", "start_frame", "generation_frame
 // 图片按底部横条顺序；音视频按有片段的轨道数，未上轨素材不占参考口。
 export function segmentRefCounts(state) {
     const sources = state?.sources || [];
-    const banned = new Set((state?.images || []).filter(image => image && image.segment === -2).map(image => image.source));
-    const images = sources.filter(source => source && source.kind === "image" && !banned.has(source.id)).length;
+    // 参考图按加载位置固定编号：禁止输出也占原槽位，仅该口输出空。
+    // 不能减掉禁止图数量，否则后台按原位置取材时，末尾图片会被ref_counts截断。
+    const images = sources.filter(source => source && source.kind === "image").length;
     const videos = (state?.video_tracks || []).reduce((max, lane, index) => lane?.length ? Math.max(max, index + 1) : max, 0);
     // 参考音频口按轨道位置固定：音频1→参考音频1…；中间空轨保留空位，不把后面的音频往前顶。
     const audios = (state?.audio_tracks || []).reduce((max, lane, index) => lane?.length ? Math.max(max, index + 1) : max, 0);
@@ -476,6 +481,17 @@ export function updateSegmentMaterialOutputs(node, state) {
     }
 }
 
+/** 旧隐藏控件可能携带初次状态；恢复端口和编辑器必须一致读取末尾的当前存档。 */
+export function savedTimelineValue(info) {
+    for (const value of [...(info?.widgets_values || [])].reverse()) {
+        try {
+            const state = typeof value === "string" ? JSON.parse(value) : value;
+            if (state && (Array.isArray(state.sources) || Array.isArray(state.tracks) || Array.isArray(state.entries))) return value;
+        } catch {}
+    }
+    return null;
+}
+
 export function linkedPromptSegment(queueNode) {
     const graph = queueNode?.graph, links = graph?.links;
     const values = typeof links?.values === "function" ? [...links.values()] : Object.values(links || {});
@@ -569,14 +585,14 @@ export function mountTimelineEditor(node) {
   <span class="h3-group" role="group" aria-label="片段操作">
     <button data-separate title="分离选中视频的音轨">音视频分离</button>
     <button data-delete title="删除选中的片段（Delete 键）">删除</button>
-    <button data-remove-source title="删除选中片段所属的整个素材（含其全部片段与参考口）">删除素材</button>
+    <button data-remove-source title="仅移除所选可见片段的素材使用；其它片段及磁盘文件保留">删除素材</button>
     <button data-merge title="只拼接同轨选中片段实际保留的内容，裁掉的内容不会恢复">合并</button>
   </span>
   <span class="h3-group h3-split-group" role="group" aria-label="分段参数">
     <label title="纯图片时只作末尾新增生成段的默认段长；无音视频时与分段数相乘得到总时长；有音视频且分段数≥1时，应用后会回写成实际每段长度">每段长度 <button type="button" class="h3-step-btn" data-every-step="-1" title="减少 17 帧（一次点击生效）">−</button><input data-every aria-label="每段长度" type="number" min="1" step="1" value="124" style="width:76px"><button type="button" class="h3-step-btn" data-every-step="1" title="增加 17 帧（一次点击生效）">＋</button></label>
     <span class="h3-unit"><button data-unit="s" aria-pressed="false">秒</button><button data-unit="f" class="on" aria-pressed="true">帧</button></span>
     <label title="≥1：按段数均分；填 0：按「每段长度」切开（仅音视频）；纯图片：直接决定生成段数，不再跟随图片数量">分段数 <input data-count aria-label="分段数" type="number" min="0" max="1000" step="1" value="2" style="width:44px"></label>
-    <button data-apply-split class="primary" title="纯图片：按分段数保留已有段长、在末尾增删生成段；无音视频：总长=每段长度×分段数并均分；有音视频：分段数≥1均分，填0则按每段长度切开">应用分段</button>
+    <button data-apply-split class="primary" title="音视频仅处理所选可见片段：分段数≥1均分，填0按每段长度切开；纯图片按段数在末尾增删生成段">应用分段</button>
     <label class="h3-mini-field" title="单段生成帧数上限（须为 17k+5，非法值向下取整）；有连接时同步到 AD-当前段">单段上限 <input class="h3-max-frames-input" data-max-frames type="number" min="5" max="3600" step="17" value="362" style="width:76px" aria-label="单段生成帧数上限"></label>
   </span>
 </div>
@@ -596,7 +612,7 @@ export function mountTimelineEditor(node) {
   <button data-smart-apply class="primary">应用切分</button>
   <button data-smart-clear>清空候选</button>
   <button data-smart-add class="primary" title="在白色游标位置添加黄色候选切分线；应用切分后生效">添加切分线</button>
-  <button type="button" data-smart-cut class="primary" title="在白色游标位置立即切分视频（音视频一起切断，可撤销）">切分视频</button>
+  <button type="button" data-smart-cut class="primary" title="在白色游标位置切分选中的音视频片段（Ctrl 多选，可撤销）">切分视频</button>
   <button type="button" data-run-affected class="primary" title="选中分段后仅运行所选段；未选择时重跑受影响段，完成后回原进度">运行此段</button>
 </div>
 <div class="h3-view" data-view>
@@ -613,7 +629,7 @@ export function mountTimelineEditor(node) {
     <button type="button" data-mute title="切换预览声音">取消静音</button>
   </div>
   <div class="h3-selection-summary" data-selection-summary hidden></div>
-  <div class="h3-frame-summary" data-frame-summary><span data-timeline-frames></span><span data-segment-frames></span><span data-segment-bounds></span></div>
+  <div class="h3-frame-summary" data-frame-summary><span data-timeline-frames></span><span data-segment-frames></span></div>
 </div>
   <div class="h3-hint" data-hint>无音视频：总长 = 每段长度 × 分段数。纯图片：生成段数由「分段数」决定，已有段长保留、末尾增删，增删图片不再改变段数。有音视频：分段数≥1 均分；分段数填 0 则按每段长度切开。</div>
 
@@ -744,6 +760,7 @@ export function mountTimelineEditor(node) {
         return segmentAt((clip.tl_start + clipEnd(clip)) / 2);
     };
     const syncSegmentFromSelection = ({ announce = true } = {}) => {
+        playedSelectionKey = "";  // 再次点选同一片段也表示重新从该片段开始试听。
         // 选中素材框 → 对应第几段；多选取时间上最早的一条（视频优先）
         const selected = [...T.state.video_tracks, ...T.state.audio_tracks].flat()
             .filter(clip => T.selected.has(clip.id));
@@ -764,11 +781,10 @@ export function mountTimelineEditor(node) {
         const probe=cur===total&&total>0?cur-1:cur;
         const index=cached.selectedIndex>=0?cached.selectedIndex:spans.findIndex(span=>probe>=span.start&&probe<span.end);
         const span=spans[index];
-        const timeline=$("[data-timeline-frames]"), segment=$("[data-segment-frames]"), range=$("[data-segment-bounds]");
+        const timeline=$("[data-timeline-frames]"), segment=$("[data-segment-frames]");
         const values=[`时间线：${cur} / ${total} 帧`,
-            span?`本段：${Math.max(0,Math.min(span.count,cur-span.start))} / ${span.count} 帧`:"本段：未选择或游标位于空隙",
-            span?`本段范围：${span.start}–${span.end}帧（不含末端）`:""];
-        [timeline,segment,range].forEach((element,i)=>{if(element&&element.textContent!==values[i])element.textContent=values[i];});
+            span?`本段：${Math.max(0,Math.min(span.count,cur-span.start))} / ${span.count} 帧`:"本段：未选择或游标位于空隙"];
+        [timeline,segment].forEach((element,i)=>{if(element&&element.textContent!==values[i])element.textContent=values[i];});
     }
 
     function renderSelectionSummary() {
@@ -777,18 +793,29 @@ export function mountTimelineEditor(node) {
         const sources = sourcesOf();
         for (const [key,name] of [["video_tracks","视频"],["audio_tracks","音频"]])
             T.state[key].forEach((lane,i) => lane.forEach(clip => {
-                if (T.selected.has(clip.id)) selected.push({clip,track:`${name}${i+1}`,name:sources[clip.source]?.name || "未命名素材"});
+                if (T.selected.has(clip.id) && !trackDisabled(T.state,key,i)) selected.push({clip,track:`${name}${i+1}`,name:sources[clip.source]?.name || "未命名素材"});
             }));
         let text = "";
         if (selected.length === 1) {
             const {clip,track,name} = selected[0];
-            text = `已选：${track} ｜ 源范围 ${fmtClock(clip.src_in)}–${fmtClock(clip.src_out)}`;
+            const index = segmentIndexForClip(clip);
+            text = `已选：${track}${index >= 0 ? ` ｜ 第${index+1}段` : ""}`;
             element.title = `${name} ｜ 时间线 ${fmtClock(clip.tl_start)}–${fmtClock(clipEnd(clip))} ｜ 时长 ${(clip.src_out-clip.src_in).toFixed(2)} 秒`;
         } else if (selected.length > 1) {
-            text = `已选中 ${selected.length} 个片段：${[...new Set(selected.map(item=>`${item.track} · ${item.name}`))].join("、")} ｜ 时间线 ${fmtClock(Math.min(...selected.map(item=>item.clip.tl_start)))}–${fmtClock(Math.max(...selected.map(item=>clipEnd(item.clip))))}`;
-        } else if (!hasAvClips() && T.segment >= 0 && intervals()[T.segment]) {
-            const [a,b] = intervals()[T.segment];
-            text = `已选中第 ${T.segment+1} 段 ｜ 时间线 ${fmtClock(a)}–${fmtClock(b)} ｜ 时长 ${(b-a).toFixed(2)} 秒`;
+            const numbers = [...new Set(selected.map(item=>segmentIndexForClip(item.clip)).filter(index=>index>=0))].sort((a,b)=>a-b);
+            const segments = numbers.length ? ` ｜ 第${numbers.map(index=>index+1).join("、")}段` : "";
+            text = `已选中 ${selected.length} 个片段${segments}：${[...new Set(selected.map(item=>`${item.track} · ${item.name}`))].join("、")} ｜ 时间线 ${fmtClock(Math.min(...selected.map(item=>item.clip.tl_start)))}–${fmtClock(Math.max(...selected.map(item=>clipEnd(item.clip))))}`;
+        } else if (!hasAvClips()) {
+            const generated = generationClips(T.state).filter(clip=>T.selected.has(clip.id));
+            const numbers = [...new Set(generated.map(segmentIndexForClip).filter(index=>index>=0))].sort((a,b)=>a-b);
+            if (numbers.length > 1) text = `已选中 ${generated.length} 个生成片段 ｜ 第${numbers.map(index=>index+1).join("、")}段`;
+            else {
+                const index = numbers[0] ?? T.segment;
+                if (spans[index]) {
+                    const [a,b] = spans[index];
+                    text = `已选中第${index+1}段 ｜ 时长 ${(b-a).toFixed(2)} 秒`;
+                }
+            }
         }
         const layoutChanged=element.textContent!==text;
         element.hidden = !text;if(layoutChanged)element.textContent = text;
@@ -955,6 +982,7 @@ export function mountTimelineEditor(node) {
                     if (event.ctrlKey || event.metaKey) {
                         if (T.selected.has(selectedId)) T.selected.delete(selectedId); else T.selected.add(selectedId);
                     } else if (!T.selected.has(selectedId)) T.selected = new Set([selectedId]);
+                    playedSelectionKey = "";
                     selectSegmentAt((segStart + segEnd) / 2);
                     // 单击/拖边只选中分段，不移动白色游标（游标保持原位）
                     renderClock();
@@ -1005,6 +1033,7 @@ export function mountTimelineEditor(node) {
         renderFramePlan();
         syncViewHeight();  // 每次重绘后重算高度（缩放/无素材都不留底空白）
         syncTrackMuteButtons();
+        syncTrackVisibilityButtons();
     }
     function ensureRulerCoverage() {
         const viewEl = root.querySelector("[data-view]");
@@ -1037,7 +1066,9 @@ export function mountTimelineEditor(node) {
             tick.style.left = `${offset + timeToX(Number(tick.dataset.time))}px`;
         // 不再画灰蓝段罩：跑哪一段由选中的素材框决定
         for (const stale of canvas.querySelectorAll(":scope > .h3-segshade, :scope > .h3-segline, .h3-smartcut")) stale.remove();
+        const candidateIds = new Set(activeClips(T.state,null,T.selected).map(clip=>clip.id));
         for (const frame of T.smartCuts || []) {
+            if (!T.smartOwners?.[frame]?.some(id=>candidateIds.has(id))) continue;
             const marker = document.createElement("div");
             marker.className = "h3-smartcut";
             const t = frame / FPS;
@@ -1054,7 +1085,7 @@ export function mountTimelineEditor(node) {
             });
             marker.addEventListener("dblclick", event => {
                 event.stopPropagation();
-                T.smartCuts = T.smartCuts.filter(item => item !== frame);
+                moveCandidateFrame(frame,null);
                 root._adH3SmartCuts = [...T.smartCuts];
                 renderOverlays(); paintSmartInfo();
             });
@@ -1073,7 +1104,7 @@ export function mountTimelineEditor(node) {
                     const snapped = Math.round(next * FPS) / FPS;
                     const nextFrame = Math.round(snapped * FPS);
                     if(nextFrame===currentFrame)return;
-                    T.smartCuts = [...new Set(T.smartCuts.map(item => item === currentFrame ? nextFrame : item))].sort((a,b)=>a-b);
+                    moveCandidateFrame(currentFrame,nextFrame);
                     currentFrame = nextFrame; root._adH3SmartCuts = [...T.smartCuts];
                     T.playhead = snapped;
                     renderOverlays();
@@ -1086,7 +1117,7 @@ export function mountTimelineEditor(node) {
                     endInteraction();
                     renderClock({seekPreview:true});
                     paintSmartInfo();
-                    if (resume) void play();
+                    if (resume) void play({resume:true});
                 };
                 window.addEventListener("pointermove", onMove);
                 window.addEventListener("pointerup", onUp);
@@ -1094,8 +1125,8 @@ export function mountTimelineEditor(node) {
             });
             marker.tabIndex=0;marker.setAttribute("role","slider");marker.setAttribute("aria-label","候选切点 "+frame+" 帧");marker.setAttribute("aria-valuenow",String(frame));
             marker.addEventListener("keydown",event=>{
-                if(["Delete","Backspace"].includes(event.key)){event.preventDefault();T.smartCuts=T.smartCuts.filter(item=>item!==frame);}
-                else if(["ArrowLeft","ArrowRight"].includes(event.key)){event.preventDefault();const next=Math.max(1,Math.min(Math.round(duration()*FPS)-1,frame+(event.key==="ArrowLeft"?-1:1)));T.smartCuts=[...new Set(T.smartCuts.map(item=>item===frame?next:item))].sort((a,b)=>a-b);}
+                if(["Delete","Backspace"].includes(event.key)){event.preventDefault();moveCandidateFrame(frame,null);}
+                else if(["ArrowLeft","ArrowRight"].includes(event.key)){event.preventDefault();const next=Math.max(1,Math.min(Math.round(duration()*FPS)-1,frame+(event.key==="ArrowLeft"?-1:1)));moveCandidateFrame(frame,next);}
                 else if(event.key==="Enter"){event.preventDefault();T.playhead=t;clearSourcePreview(root);void updatePreviewAt(t);}
                 else return;
                 root._adH3SmartCuts=[...T.smartCuts];renderOverlays();paintSmartInfo();
@@ -1277,7 +1308,7 @@ export function mountTimelineEditor(node) {
         if (!el) return;
         const { frames, count, byCount } = readRecipeInputs();
         const hasClips = [...T.state.video_tracks, ...T.state.audio_tracks].some(lane => lane.length);
-        const selected = T.selected.size > 0;
+        const selected = selectedEditableClips().length > 0;
         if (!(frames >= 1)) { el.textContent = ""; return; }
         // 纯图片：段数由「分段数」控制，已有段长保留，只在末尾增删（v0.4.23 用户新规则）。
         if (!hasClips && imageOnlyClips(T.state, frames)) {
@@ -1300,13 +1331,13 @@ export function mountTimelineEditor(node) {
             const each = Math.max(1, Math.round(totalF / count));
             el.textContent = selected
                 ? `将把选中片段均分成 ${count} 段`
-                : `将把时间线均分成 ${count} 段（约 ${each}帧/段，总长不变）`;
+                : "请先选中可见片段，再应用分段";
             return;
         }
         if (count === 0) {
             el.textContent = selected
                 ? `将按每 ${frames} 帧切开选中片段`
-                : `将按每 ${frames} 帧切开整条时间线（总长不变）`;
+                : "请先选中可见片段，再应用分段";
             return;
         }
         el.textContent = "";
@@ -1317,10 +1348,11 @@ export function mountTimelineEditor(node) {
             control.disabled = pathBatch;
         const canDeleteGen = typeof hasAvClips === "function" && !hasAvClips()
             && T.selected.size > 0;
-        $("[data-separate]").disabled = !hasAvClips() || !T.selected.size;
-        $("[data-delete]").disabled = !(T.selected.size || canDeleteGen);
-        $("[data-remove-source]").disabled = !hasAvClips() || !T.selected.size;
-        $("[data-merge]").disabled = T.selected.size<2;
+        const editableCount = selectedEditableClips().length;
+        $("[data-separate]").disabled = !activeClips(T.state,"video_tracks",T.selected).length;
+        $("[data-delete]").disabled = !(editableCount || canDeleteGen);
+        $("[data-remove-source]").disabled = !editableCount;
+        $("[data-merge]").disabled = (hasAvClips()?editableCount:T.selected.size)<2;
         const batchSegs = T.state.path_source ? Math.max(0, Number(T.batchCount) || 0) : 0;
         const actualSegs = Math.max(0, pathBatch ? batchSegs : intervals().length);
         const { count: want, byCount } = readRecipeInputs();
@@ -1452,7 +1484,7 @@ export function mountTimelineEditor(node) {
         // 压紧有片段的轨并去掉中间空壳；再补齐到 MAX_LANES 条空轨，避免后端校验「轨道数不足」
         for (const key of ["video_tracks", "audio_tracks"]) {
             const flags = (T.state.muted_tracks || {})[key] || [];
-            const active = (T.state[key] || []).map((lane, index) => ({lane, muted: !!flags[index]}))
+            const active = (T.state[key] || []).map((lane, index) => ({lane, muted: !!flags[index], disabled: trackDisabled(T.state, key, index)}))
                 .filter(item => item.lane?.length).slice(0, MAX_LANES);
             const packed = (Array.isArray(T.state[key]) ? T.state[key] : [])
                 .filter(lane => Array.isArray(lane) && lane.length)
@@ -1461,6 +1493,8 @@ export function mountTimelineEditor(node) {
             T.state[key] = packed;
             T.state.muted_tracks ||= {};
             T.state.muted_tracks[key] = Array.from({length:MAX_LANES}, (_, index) => active[index]?.muted || false);
+            T.state.disabled_tracks ||= {};
+            T.state.disabled_tracks[key] = Array.from({length:MAX_LANES}, (_, index) => active[index]?.disabled || false);
         }
     }
     function currentSegmentFrames() {
@@ -1549,8 +1583,8 @@ export function mountTimelineEditor(node) {
         bumpSnapCache();
         pruneSources();
         compactTracks();
-        T.selected = new Set([...T.selected].filter(id =>
-            [...T.state.video_tracks, ...T.state.audio_tracks, T.state.generation_clips || []].flat().some(clip => clip.id === id)));
+        const available = new Set([...activeClips(T.state), ...(hasAvClips() ? [] : T.state.generation_clips || [])].map(clip=>clip.id));
+        T.selected = new Set([...T.selected].filter(id => available.has(id)));
         if (outputs) try { updateMaterialOutputs(node, T.state); } catch (error) { hint(error.message, true); throw error; }
         render();
         scheduleLayout(40);
@@ -1788,6 +1822,7 @@ export function mountTimelineEditor(node) {
         T.state.duration = null;
         delete T.state.generation_clips;
         T.state.muted_tracks = {};
+        T.state.disabled_tracks = {};
         T.selected.clear();
         T.segment = -1;
         T.playhead = 0;
@@ -2098,25 +2133,32 @@ export function mountTimelineEditor(node) {
     }
 
     async function separateSelected() {
-        const clips = [...T.state.video_tracks].flat().filter(clip => T.selected.has(clip.id));
-        if (!clips.length) { hint("请先选中一个视频片段，再进行音视频分离。", true); return; }
-        const sources = sourcesOf();
-        const source = sources[clips[0].source];
-        try {
-            const response = await api.fetchApi("/aiden_h3/separate", { method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ origin: source.origin, file: source.file, name: source.name }) });
-            const data = await response.json();
-            if (data.error) { hint(data.error, true); return; }
-            addSource(data.source);
-            source.muted = true;  // 剪映语义：分离后原视频静音，声音只走分离出的音频片段
-            T.state.muted_tracks ||= {};
-            T.state.muted_tracks.video_tracks ||= [];
-            T.state.video_tracks.forEach((lane, index) => {
-                if (lane.some(clip => clip.source === source.id)) T.state.muted_tracks.video_tracks[index] = true;
+        const clips = activeClips(T.state,"video_tracks",T.selected);
+        if (!clips.length) { requireSelectedClips();return; }
+        if (T.separating) return;
+        const snapshot=JSON.stringify(T.state),planned=(T.state.audio_tracks||[]).map(lane=>[...lane]),placements=[];
+        for(const clip of clips){
+            const index=planned.findIndex((lane,i)=>!trackDisabled(T.state,"audio_tracks",i)&&lane.every(item=>clipEnd(item)<=clip.tl_start+.5/FPS||item.tl_start>=clipEnd(clip)-.5/FPS));
+            if(index<0){hint("可见音频轨没有足够空位，请先腾出音频轨道。",true);return;}
+            planned[index].push(clip);placements.push(index);
+        }
+        T.separating=true;
+        try{
+            const extracted=new Map();
+            for(const clip of clips)if(!extracted.has(clip.source)){
+                const source=sourcesOf()[clip.source];
+                const response=await api.fetchApi("/aiden_h3/separate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({origin:source.origin,file:source.file,name:source.name})});
+                const data=await response.json();if(!response.ok||data.error)throw Error(data.error||"分离失败");extracted.set(clip.source,{...data.source,id:uid("s")});
+            }
+            if(snapshot!==JSON.stringify(T.state)||clips.some(clip=>!selectedEditableClips().some(item=>item.id===clip.id))){hint("所选片段已变化，分离结果未添加到时间线。",true);return;}
+            pushUndo();T.state.sources.push(...extracted.values());
+            clips.forEach((clip,i)=>{
+                T.state.audio_tracks[placements[i]].push({id:uid("c"),source:extracted.get(clip.source).id,tl_start:clip.tl_start,src_in:clip.src_in,src_out:clip.src_out});
+                clip.audio_muted=true;
             });
-            afterEdit();
-            hint(`已分离出 ${data.source.name}；原视频已静音，播放时声音由分离音频提供。`);
-        } catch (error) { hint(`分离失败：${error.message}`, true); }
+            for(const lane of T.state.audio_tracks)lane.sort((a,b)=>a.tl_start-b.tl_start);
+            afterEdit();hint("已分离所选片段的声音并对齐原时间位置；只静音这些视频片段。");
+        }catch(error){hint(`分离失败：${error.message}`,true);}finally{T.separating=false;}
     }
 
     // ---------- 常驻视频预览 ----------
@@ -2157,6 +2199,12 @@ export function mountTimelineEditor(node) {
     }
 
     // ---------- 无音视频素材时：生成段编辑（与音视频裁切/切断/删除对齐） ----------
+    const selectedEditableClips = () => activeClips(T.state, null, T.selected);
+    const requireSelectedClips = () => {
+        const clips = selectedEditableClips();
+        if (!clips.length) hint("请先选中可见轨道上的音视频片段（Ctrl 可多选）；隐藏片段不参与操作。", true);
+        return clips;
+    };
     const hasAvClips = () => [...T.state.video_tracks, ...T.state.audio_tracks].some(lane => lane.length);
     const activeGenIndex = () => {
         const iv = intervals();
@@ -2243,9 +2291,9 @@ export function mountTimelineEditor(node) {
     }
 
     // ---------- 播放试听 ----------
-    let playbackRevision = 0;
+    let playbackRevision = 0, playedSelectionKey = "";
     const laneMuted = (key, index) => !!T.state.muted_tracks?.[key]?.[index];
-    const videoMuted = clip => !!root._adMuted || T.state.video_tracks.some((lane, index) =>
+    const videoMuted = clip => !!root._adMuted || !!clip.audio_muted || T.state.video_tracks.some((lane, index) =>
         lane.includes(clip) && (T.state.muted_tracks?.video_tracks?.[index] ?? !!sourcesOf()[clip.source]?.muted));
     function syncTrackMuteButtons() {
         for (const lane of canvas.querySelectorAll(".h3-lane[data-kind]")) {
@@ -2267,12 +2315,40 @@ export function mountTimelineEditor(node) {
                 T.state.muted_tracks[key] ||= [];
                 T.state.muted_tracks[key][index] = !muted;
                 afterEdit();
-                if (resume) void play();
+                if (resume) void play({resume:true});
             };
             head.append(button);
         }
     }
     // 点击预览画面：播放 / 停止（与播放按钮同一套逻辑）
+    function syncTrackVisibilityButtons() {
+        for (const lane of canvas.querySelectorAll(".h3-lane[data-kind]")) {
+            const key = lane.dataset.kind, index = Number(lane.dataset.index), head = lane.querySelector(".h3-head");
+            const disabled = trackDisabled(T.state, key, index);
+            lane.classList.toggle("h3-track-disabled", disabled);
+            if (!head || head.querySelector("[data-track-visibility]")) continue;
+            const button = document.createElement("button");
+            button.type = "button"; button.dataset.trackVisibility = "";
+            button.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>${disabled ? '<path d="m3 3 18 18"/>' : ''}</svg>`;
+            button.title = disabled ? "启用本轨道（恢复预览与分段输出）" : "禁用本轨道（隐藏预览且不参与分段输出）";
+            button.setAttribute("aria-label", head.textContent + button.title);
+            button.setAttribute("aria-pressed", String(disabled));
+            button.onpointerdown = event => { event.stopPropagation(); };
+            button.onclick = event => {
+                event.stopPropagation(); pushUndo();
+                const resume = T.playing;
+                if (resume) stopPlayback();
+                clearSourcePreview(root);
+                T.state.disabled_tracks ||= {};
+                T.state.disabled_tracks[key] ||= [];
+                T.state.disabled_tracks[key][index] = !disabled;
+                afterEdit();
+                hint(disabled ? "已启用本轨道。" : "已禁用本轨道：不参与预览与后续分段输出；正在执行的任务保持启动时状态。");
+                if (resume) void play({resume:true});
+            };
+            head.append(button);
+        }
+    }
     const applyMute = (muted) => {
         root._adMuted = muted;
         root.querySelectorAll("video,audio").forEach(element => { try { element.muted = muted; } catch (error) {} });
@@ -2310,10 +2386,15 @@ export function mountTimelineEditor(node) {
         renderOverlays();
         void updatePreviewAt(T.playhead);
     }
-    async function play() {
+    async function play({ resume = false } = {}) {
         if (T.playing) { stopPlayback(); return; }
         if (!duration()) { hint("时间线还没有时长：请放置素材或填写总时长。", true); return; }
-        const [from,to] = playbackRange(T.playhead,duration());
+        const selected = hasAvClips() ? selectedEditableClips()
+            : generationClips(T.state).filter(clip=>T.selected.has(clip.id));
+        const playback = resume ? {range:playbackRange(T.playhead,duration()),selectionKey:playedSelectionKey,fromSelection:false}
+            : selectionPlaybackRange(T.playhead,duration(),selected,playedSelectionKey);
+        const [from,to] = playback.range;
+        if (!resume) playedSelectionKey = playback.selectionKey;
         if (!(to > from)) { hint("已在终点，请向前移动白线游标后播放。", true); return; }
         const ticket = ++playbackRevision;
         T.playing = true;
@@ -2325,7 +2406,7 @@ export function mountTimelineEditor(node) {
         try { audioCtx ||= new (window.AudioContext || window.webkitAudioContext)(); await audioCtx.resume(); } catch {}
         if (ticket !== playbackRevision) return;
         for (const [laneIndex, lane] of T.state.audio_tracks.entries()) for (const clip of lane) {
-            if (laneMuted("audio_tracks", laneIndex)) continue;
+            if (laneMuted("audio_tracks", laneIndex) || trackDisabled(T.state, "audio_tracks", laneIndex)) continue;
             const start = Math.max(from, clip.tl_start), end = Math.min(to, clipEnd(clip));
             if (end - start <= 0.5 * FRAME) continue;
             try {
@@ -2341,7 +2422,7 @@ export function mountTimelineEditor(node) {
                 T.nodes.push(node);
             } catch {}
         }
-        const stepVideo = t => {
+        const stepVideo = (t, forceSeek = false) => {
             const clip = topVideoAt(T.state, t);
             if (!clip) {
                 if (!playerVideo.paused) playerVideo.pause();
@@ -2358,12 +2439,12 @@ export function mountTimelineEditor(node) {
                 playerVideo.currentTime = clip.src_in + (t - clip.tl_start);
             } else {
                 const expect = clip.src_in + (t - clip.tl_start);
-                if (Math.abs(playerVideo.currentTime - expect) > 0.35)
+                if (forceSeek || Math.abs(playerVideo.currentTime - expect) > 0.35)
                     playerVideo.currentTime = Math.max(0, Math.min(expect, playerVideo.duration || expect));
             }
             if (playerVideo.paused) void playerVideo.play().catch(() => {});
         };
-        stepVideo(from);
+        stepVideo(from,true);
         const startedAt = performance.now() / 1000, base = from;
         const step = () => {
             if (!T.playing || ticket !== playbackRevision) return;
@@ -2381,7 +2462,7 @@ export function mountTimelineEditor(node) {
             requestAnimationFrame(step);
         };
         requestAnimationFrame(step);
-        hint(`从白线 ${fmtClock(from)} 播放，到时间线结尾停止。`);
+        hint(`从${playback.fromSelection ? "所选片段起点" : "白线"} ${fmtClock(from)} 播放，到时间线结尾停止。`);
     }
 
     // ---------- 指针交互 ----------
@@ -2423,7 +2504,7 @@ export function mountTimelineEditor(node) {
             endInteraction();
             renderClock({ seekPreview: true });
             syncButtons();
-            if (resume) void play();
+            if (resume) void play({resume:true});
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
@@ -2431,7 +2512,7 @@ export function mountTimelineEditor(node) {
         apply(event);
     }
     canvas.addEventListener("pointerdown", event => {
-        if (event.target.closest("[data-track-mute]")) return;
+        if (event.target.closest("[data-track-mute],[data-track-visibility]")) return;
         const clipElement = event.target.closest(".h3-clip");
         if (event.target.closest(".h3-playhead") || event.target.closest(".h3-ruler")) { dragPlayhead(event); return; }
         if (clipElement) { dragClip(event, clipElement); return; }
@@ -2505,7 +2586,7 @@ export function mountTimelineEditor(node) {
                 renderOverlays();
                 renderClock({ seekPreview: true });
                 syncButtons();
-                if (resume) void play();
+                if (resume) void play({resume:true});
                 return;
             }
             syncSegmentFromSelection();
@@ -2570,7 +2651,7 @@ export function mountTimelineEditor(node) {
             endInteraction();
             paintSelection();
             syncButtons();
-            if (resume) void play();
+            if (resume) void play({resume:true});
             return;
         }
         const edge = event.target.classList.contains("edge") ? (event.target.classList.contains("l") ? "l" : "r") : null;
@@ -2631,6 +2712,10 @@ export function mountTimelineEditor(node) {
                             const flags = Array.from({length:MAX_LANES}, (_, i) => !!T.state.muted_tracks[kindKey]?.[i]);
                             flags.splice(emptyIndex, 1); flags.unshift(false);
                             T.state.muted_tracks[kindKey] = flags;
+                            const disabled = Array.from({length:MAX_LANES}, (_, i) => trackDisabled(T.state, kindKey, i));
+                            disabled.splice(emptyIndex, 1); disabled.unshift(false);
+                            T.state.disabled_tracks ||= {};
+                            T.state.disabled_tracks[kindKey] = disabled;
                             for (const element of [...kindLanes]) {
                                 const oldIndex = Number(element.dataset.index);
                                 if (oldIndex === emptyIndex) {
@@ -2732,21 +2817,21 @@ export function mountTimelineEditor(node) {
             else {
                 // 单击片段只选中素材：白线游标保持原位，不跟随点击位置移动（改走标尺/白线才定位）。
                 paintSelection(); renderOverlays(); renderClock(); syncButtons();
-                if (resume) void play();
+                if (resume) void play({resume:true});
             }
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
     }
     function splitSelectedClips(clips, points) {
-        const cuts = [...new Set(points.map(snapFrame))].sort((a, b) => a - b);
+        const cutsFor = clip => [...new Set((points instanceof Map ? points.get(clip.id) || [] : points).map(snapFrame))].sort((a,b)=>a-b);
         const ids = new Set(clips.map(clip => clip.id));
         const nextSelected = new Set();
         for (const key of ["video_tracks", "audio_tracks"]) {
             T.state[key] = T.state[key].map(lane => lane.flatMap(clip => {
                 if (!ids.has(clip.id)) return [clip];
                 const ends = [clip.tl_start,
-                    ...cuts.filter(t => t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME),
+                    ...cutsFor(clip).filter(t => t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME),
                     clipEnd(clip)];
                 return ends.slice(1).map((end, index) => {
                     const piece = {
@@ -2780,10 +2865,11 @@ export function mountTimelineEditor(node) {
         hint("已在播放头处切断片段。");
     }
     function removeSelected() {
-        if (!T.selected.size) { hint("请先点击选中要删除的片段（Ctrl 可多选）。", true); return; }
+        const ids = new Set(requireSelectedClips().map(clip=>clip.id));
+        if (!ids.size) return;
         pushUndo();
         for (const key of ["video_tracks", "audio_tracks"])
-            T.state[key] = T.state[key].map(lane => lane.filter(clip => !T.selected.has(clip.id)));
+            T.state[key] = T.state[key].map(lane => lane.filter(clip => !ids.has(clip.id)));
         T.selected.clear();
         afterEdit();
         hint("已删除选中片段；素材文件保留。");
@@ -2803,8 +2889,9 @@ export function mountTimelineEditor(node) {
         const found = [];
         for (const key of ["video_tracks", "audio_tracks"])
             T.state[key].forEach((lane, li) => lane.forEach((clip, index) => {
-                if (T.selected.has(clip.id)) found.push({key, li, clip, index});
+                if (T.selected.has(clip.id) && !trackDisabled(T.state,key,li)) found.push({key, li, clip, index});
             }));
+        if (found.length < 2) { hint("请选择同一可见轨道的至少两个片段。",true); return; }
         const {key, li} = found[0];
         if (found.some(item => item.key !== key || item.li !== li)) { hint("请选择同一条轨道上的片段。", true); return; }
         const ordered = found.sort((a, b) => a.clip.tl_start - b.clip.tl_start);
@@ -2862,10 +2949,8 @@ export function mountTimelineEditor(node) {
             removeSelected(); return;
         }
         if (button.hasAttribute("data-remove-source")) {
-            const ids = new Set([...T.state.video_tracks, ...T.state.audio_tracks].flat()
-                .filter(clip => T.selected.has(clip.id)).map(clip => clip.source));
-            if (!ids.size) { hint("请先选中要删除的素材的一个片段。", true); return; }
-            for (const id of ids) { try { removeSource(id); } catch {} }
+            // 只移除所选使用实例；其它轨道/隐藏片段仍引用的同一素材不得连带删除。
+            removeSelected();
             return;
         }
         if (button.hasAttribute("data-separate")) { void separateSelected(); return; }
@@ -2881,13 +2966,15 @@ export function mountTimelineEditor(node) {
                 $("[data-count]").value = segCount;
                 T.state.segment_recipe = { frames: segFrames, count: segCount, unit: T.unit, custom: false };
             };
-            const selectedClips = [...T.state.video_tracks, ...T.state.audio_tracks].flat()
-                .filter(clip => T.selected.has(clip.id));
+            const selectedClips = selectedEditableClips();
+            if (hasClips && !selectedClips.length) { requireSelectedClips(); return; }
             // 有选中音视频：只拆选中片段
             if (selectedClips.length) {
                 if (!byCount && count !== 0) { hint("分段数应为 1～1000，或填 0 按每段长度拆。", true); return; }
-                const cuts = [];
+                const cutsByClip = new Map();
                 for (const clip of selectedClips) {
+                    const cuts = [];
+                    cutsByClip.set(clip.id,cuts);
                     const from = clip.tl_start, to = clipEnd(clip), len = to - from;
                     const clipFrames = Math.floor(len * FPS + 1e-7);
                     if (!(len > FRAME) || clipFrames < 2) { hint("选中片段太短，无法继续分段。", true); return; }
@@ -2899,9 +2986,9 @@ export function mountTimelineEditor(node) {
                         for (let t = from + step; t < to - 0.5 * FRAME; t += step) cuts.push(snapFrame(t));
                     }
                 }
-                if (!cuts.length) { hint(byCount ? "分段数为 1 时无需再拆。" : "按当前每段长度，选中片段内切不出更多点。", true); return; }
+                if (![...cutsByClip.values()].some(cuts=>cuts.length)) { hint(byCount ? "分段数为 1 时无需再拆。" : "按当前每段长度，选中片段内切不出更多点。", true); return; }
                 pushUndo();
-                splitSelectedClips(selectedClips, cuts);
+                splitSelectedClips(selectedClips, cutsByClip);
                 T.segment = -1;
                 const iv = intervals();
                 const avg = iv.length
@@ -2949,36 +3036,7 @@ export function mountTimelineEditor(node) {
                 hint(`已建立 ${count} 段 × ${frames} 帧（共 ${(total).toFixed(3)} 秒）。`);
                 return;
             }
-            // 有音视频、未选中：总长不变
-            // 分段数≥1 → 均分；分段数=0 → 按每段长度切开
-            const total = duration();
-            if (!(total > 0)) { hint("时间线还没有时长，请先加载音视频。", true); return; }
-            const totalFrames = Math.floor(total * FPS + 1e-7);
-            const cuts = [];
-            if (byCount) {
-                if (count > totalFrames) { hint("分段数不能超过总帧数。", true); return; }
-                for (let i = 1; i < count; i++) cuts.push(snapFrame(total * i / count));
-            } else {
-                for (let t = frames / FPS; t < total - 0.5 * FRAME; t += frames / FPS) cuts.push(snapFrame(t));
-            }
-            if (!cuts.length && byCount && count === 1) {
-                writeBackRecipe(totalFrames, 1);
-                afterEdit();
-                hint("分段数为 1，保持整段不切。");
-                return;
-            }
-            if (!cuts.length) { hint("按当前每段长度切不出更多点。", true); return; }
-            pushUndo();
-            cutTimelineAt(T.state, cuts);
-            T.selected = new Set([...T.state.video_tracks, ...T.state.audio_tracks].flat().map(c => c.id));
-            T.segment = -1;
-            const segs = Math.max(1, intervals().length);
-            const each = Math.max(1, Math.round(totalFrames / segs));
-            writeBackRecipe(byCount ? each : frames, segs);
-            afterEdit();
-            hint(byCount
-                ? `已均分成 ${segs} 段（约 ${each} 帧/段，总长不变）。`
-                : `已按每 ${frames} 帧切开，共 ${segs} 段（总长不变）。`);
+            requireSelectedClips();
             return;
         }
         if(button.dataset.unit){
@@ -2993,17 +3051,16 @@ export function mountTimelineEditor(node) {
             // 无音视频：生成段走同一套裁切/切断
             if (!hasAvClips()) { editGeneration(action); return; }
             if (action === "split") {
-                const clips = [...T.state.video_tracks, ...T.state.audio_tracks].flat()
-                    .filter(clip => T.selected.has(clip.id) || T.selected.size === 0);
+                const clips = requireSelectedClips();
                 const targets = clips.filter(clip => t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME);
                 if (!targets.length) { hint("播放头没有落在任何可切断的片段上。", true); return; }
-                for (const clip of targets) splitClipAt(clip, t);
+                pushUndo(); splitSelectedClips(targets,[t]); afterEdit();
                 return;
             }
+            const clips = requireSelectedClips();
+            if (!clips.length) return;
             pushUndo();
             const changed=[];
-            const clips = [...T.state.video_tracks, ...T.state.audio_tracks].flat()
-                .filter(clip => T.selected.size === 0 || T.selected.has(clip.id));
             for (const clip of clips) {
                 if (action === "left") {
                     if (t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME) {
@@ -3085,7 +3142,7 @@ export function mountTimelineEditor(node) {
         // 捕获阶段拦截：仅在编辑器内删片段/撤销，绝不误删整个节点
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase()==="a") {
             event.preventDefault();event.stopPropagation();
-            T.selected=new Set((hasAvClips()?[...T.state.video_tracks,...T.state.audio_tracks].flat():generationClips(T.state)).map(clip=>clip.id));
+            T.selected=new Set((hasAvClips()?activeClips(T.state):generationClips(T.state)).map(clip=>clip.id));
             for(const element of canvas.querySelectorAll(".h3-clip")) element.classList.toggle("selected",T.selected.has(element.dataset.id));
             syncButtons();
         } else if ((event.key === "Delete" || event.key === "Backspace") && T.selected.size) {
@@ -3187,72 +3244,69 @@ export function mountTimelineEditor(node) {
     };
 
     // ---------- 智能切分（踩节拍 / 镜头 / 气口） ----------
-    function smartSource() {
-        const ids = [...T.selected];
-        const lanes = [...T.state.video_tracks, ...T.state.audio_tracks].flat();
-        const selectedClip = lanes.find(clip => ids.includes(clip.id));
-        const fallbackClip = selectedClip || lanes.find(clip => clip.source) || null;
-        const sourceId = selectedClip?.source || root._adSourcePreviewId || fallbackClip?.source;
-        const source = (T.state.sources || []).find(item => item.id === sourceId && ["audio","video"].includes(item.kind))
-            || (T.state.sources || []).find(item => item.kind === "video")
-            || (T.state.sources || []).find(item => item.kind === "audio");
-        return source || null;
+    const clipScope = clip => JSON.stringify([clip.source,clip.tl_start,clip.src_in,clip.src_out]);
+    function rememberCandidates(clip, frames) {
+        T.smartOwners ||= {}; T.smartScopes ||= {};
+        T.smartScopes[clip.id] = clipScope(clip);
+        for (const frame of frames) T.smartOwners[frame] = [...new Set([...(T.smartOwners[frame] || []),clip.id])];
+        T.smartCuts = [...new Set([...T.smartCuts,...frames])].sort((a,b)=>a-b);
+    }
+    function candidateCuts(clip) {
+        if (T.smartScopes?.[clip.id] !== clipScope(clip)) return [];
+        return T.smartCuts.filter(frame=>T.smartOwners?.[frame]?.includes(clip.id) && frame/FPS>clip.tl_start+.5/FPS && frame/FPS<clipEnd(clip)-.5/FPS);
+    }
+    function clearSelectedCandidates(clips) {
+        const ids = new Set(clips.map(clip=>clip.id));
+        for (const frame of T.smartCuts) {
+            T.smartOwners ||= {};
+            T.smartOwners[frame] = (T.smartOwners[frame] || []).filter(id=>!ids.has(id));
+        }
+        T.smartCuts = T.smartCuts.filter(frame=>T.smartOwners[frame]?.length);
+        root._adH3SmartCuts = [...T.smartCuts];
+    }
+    function moveCandidateFrame(oldFrame,newFrame) {
+        T.smartOwners ||= {};
+        if (newFrame != null) T.smartOwners[newFrame] = [...new Set([...(T.smartOwners[newFrame]||[]),...(T.smartOwners[oldFrame]||[])])];
+        delete T.smartOwners[oldFrame];
+        T.smartCuts = [...new Set(T.smartCuts.flatMap(frame=>frame===oldFrame?(newFrame==null?[]:[newFrame]):[frame]))].sort((a,b)=>a-b);
     }
     function paintSmartInfo(extra = "") {
         const info = $("[data-smart-info]");
-        if (!info) return;
-        const cuts = [...(T.smartCuts || [])].sort((a, b) => a - b);
-        if (!cuts.length) { info.textContent = extra; return; }
-        const times = cuts.map(frame => frame / FPS);
-        const total = duration();
-        const points = [0, ...times, total];
-        let longest = 0, shortest = Infinity;
-        for (let i = 1; i < points.length; i++) {
-            const length = points[i] - points[i - 1];
-            longest = Math.max(longest, length);
-            shortest = Math.min(shortest, length);
-        }
-        info.textContent = `${extra}候选 ${cuts.length} 个｜最长 ${longest.toFixed(1)}s｜最短 ${shortest.toFixed(1)}s`;
+        if (info) info.textContent = extra + (T.smartCuts.length ? `候选 ${T.smartCuts.length} 个（仅对所属可见片段生效）` : "");
     }
     async function smartDetect() {
-        if(T.detecting){hint("正在分析保留范围，请勿重复检测。",true);return;}
-        const source = smartSource();
-        if (!source) { hint("请先导入并选中音频或视频素材", true); return; }
-        const clips=[...T.state.video_tracks,...T.state.audio_tracks].flat().filter(clip=>clip.source===source.id);
-        const selected=clips.filter(clip=>T.selected.has(clip.id));
-        const ranges=selected.length?selected:clips;
-        const retained=selected.length===1&&Number.isFinite(selected[0].retained_src_in)
-            ? [selected[0].retained_src_in,selected[0].retained_src_out] : retainedSourceBounds(T.state,source.id);
-        const selection=[...T.selected].sort().join("|");
-        const scope=JSON.stringify(ranges.map(clip=>[clip.id,clip.source,clip.tl_start,clip.src_in,clip.src_out]));
+        if (T.detecting) { hint("正在检测，请稍候。",true); return; }
+        const clips = requireSelectedClips(); if (!clips.length) return;
+        const scopes = JSON.stringify(clips.map(clip=>[clip.id,clipScope(clip)]));
         const kindValue = $("[data-smart-kind]")?.value || "beats-beat";
         const kind = kindValue.startsWith("beats") ? "beats" : kindValue;
         const gap = Number($("[data-smart-gap]")?.value) || 1;
         const maxGap = Number($("[data-smart-max]")?.value) || 15;
-        const sensitivity = Number($("[data-smart-sens]")?.value) || 0.5;
+        const sensitivity = Number($("[data-smart-sens]")?.value) || .5;
         const vocals = $("[data-smart-vocals]")?.getAttribute("aria-pressed") === "true";
-        const options = kind === "beats"
-            ? {mode: kindValue === "beats-bar" ? "bar" : "beat", min_gap: gap, max_gap: maxGap}
-            : kind === "shots" ? {threshold: Math.max(0.15, 0.6 - sensitivity * 0.6), min_shot: Math.max(0.5, gap / 2), max_gap: maxGap}
-            : {sensitivity, min_seg: Math.max(0.8, gap / 2), max_seg: maxGap, min_breath: 0.15, buffer: 0.05, vocals};
-        T.detecting=true;$("[data-smart-detect]").disabled=true;
-        setMaterialProgress(node, {busy: true, phase: "running", fraction: null, text: "检测中"});
-        hint("正在检测裁后保留范围，请稍候…");
+        const options = kind === "beats" ? {mode:kindValue === "beats-bar"?"bar":"beat",min_gap:gap,max_gap:maxGap}
+            : kind === "shots" ? {threshold:Math.max(.15,.6-sensitivity*.6),min_shot:Math.max(.5,gap/2),max_gap:maxGap}
+            : {sensitivity,min_seg:Math.max(.8,gap/2),max_seg:maxGap,min_breath:.15,buffer:.05,vocals};
+        T.detecting=true; $("[data-smart-detect]").disabled=true;
+        setMaterialProgress(node,{busy:true,phase:"running",fraction:null,text:"检测中"});
+        hint("正在检测所选可见片段…");
         try {
-            const response = await api.fetchApi("/aiden_h3/detect_cuts", {
-                method: "POST", timeoutMs:null, headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({kind, origin: source.origin, file: source.file, options, ...(retained?{range:{start:retained[0],end:retained[1]}}:{})}),
-            });
-            const data = await response.json();
-            if (data.error) { setMaterialProgress(node, {busy: false, phase: "error", fraction: 0, text: "检测失败"}); hint(data.error, true); return; }
-            const now=[...T.state.video_tracks,...T.state.audio_tracks].flat();
-            if(selection!==[...T.selected].sort().join("|")||scope!==JSON.stringify(ranges.map(old=>now.find(clip=>clip.id===old.id)).filter(Boolean).map(clip=>[clip.id,clip.source,clip.tl_start,clip.src_in,clip.src_out]))){hint("素材范围已变化，本次旧检测结果不再应用。",true);return;}
-            T.smartCuts=[...new Set((data.cuts||[]).flatMap(frame=>ranges.filter(clip=>frame/FPS>clip.src_in&&frame/FPS<clip.src_out).map(clip=>Math.round((clip.tl_start+frame/FPS-clip.src_in)*FPS))))].filter(frame=>frame>0&&frame<Math.round(duration()*FPS)).sort((a,b)=>a-b);
-            root._adH3SmartCuts = [...T.smartCuts];
-            renderOverlays(); paintSmartInfo();
-            hint(`检测完成：${T.smartCuts.length} 个候选切点（黄色线，双击可删、可拖动、单击定位试听）`);
-            setMaterialProgress(node, {busy: false, phase: "completed", fraction: 1, text: "检测完成"});
-        } catch (error) { setMaterialProgress(node, {busy: false, phase: "error", fraction: 0, text: "检测失败"}); hint(`检测失败：${error.message}`, true); }
+            const results=[];
+            for (const clip of clips) {
+                const source=sourcesOf()[clip.source];
+                const response=await api.fetchApi("/aiden_h3/detect_cuts",{method:"POST",timeoutMs:null,headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({kind,origin:source.origin,file:source.file,options,range:{start:clip.src_in,end:clip.src_out}})});
+                const data=await response.json();if(!response.ok||data.error)throw Error(data.error||"检测失败");
+                results.push([clip,(data.cuts||[]).filter(frame=>frame/FPS>clip.src_in+.5/FPS&&frame/FPS<clip.src_out-.5/FPS)
+                    .map(frame=>Math.round((clip.tl_start+frame/FPS-clip.src_in)*FPS))]);
+            }
+            if(scopes!==JSON.stringify(selectedEditableClips().map(clip=>[clip.id,clipScope(clip)]))){hint("所选片段或可见状态已变化，本次检测结果未应用。",true);setMaterialProgress(node,{busy:false,phase:"paused",fraction:null,text:"检测未应用"});return;}
+            clearSelectedCandidates(clips);
+            for(const [clip,frames] of results)rememberCandidates(clip,frames);
+            root._adH3SmartCuts=[...T.smartCuts];renderOverlays();paintSmartInfo();
+            hint(`检测完成：所选 ${clips.length} 个片段的候选切点已标黄。`);
+            setMaterialProgress(node,{busy:false,phase:"completed",fraction:1,text:"检测完成"});
+        }catch(error){hint(`检测失败：${error.message}`,true);setMaterialProgress(node,{busy:false,phase:"error",fraction:0,text:"检测失败"});}
         finally{T.detecting=false;$("[data-smart-detect]").disabled=false;if(node._adH3LocalProgress)node._adH3LocalProgress.busy=false;}
     }
     function splitVideoAtPlayhead() {
@@ -3263,33 +3317,30 @@ export function mountTimelineEditor(node) {
         if (t <= 0.5 / FPS || t >= total - 0.5 / FPS) {
             hint("请把白色游标移到时间线内部，再点「切分视频」。", true); return;
         }
-        const targets = [...T.state.video_tracks, ...T.state.audio_tracks].flat()
-            .filter(clip => t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME);
-        if (!targets.length) { hint("当前位置没有可切分的片段（游标要落在片段内部）。", true); return; }
+        const selected = requireSelectedClips();
+        if (!selected.length) return;
+        const targets = selected.filter(clip => t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME);
+        if (!targets.length) { hint("请把白色游标移到所选音视频片段内部。", true); return; }
         pushUndo();
         splitSelectedClips(targets, [t]);
         afterEdit();
         paintSmartInfo();
-        hint(`已在 ${fmtClock(t)} 切分视频；可继续移动游标再点按钮切分，或按撤销恢复。`);
+        hint(`已在 ${fmtClock(t)} 切分 ${targets.length} 个所选音视频片段；其它片段保持，可按撤销恢复。`);
     }
     function smartApply() {
         if (smartApply._busy) return;
-        smartApply._busy = true;
-        setTimeout(() => { smartApply._busy = false; }, 0);
-        const cuts=[...new Set(T.smartCuts||[])].filter(frame=>Number.isFinite(frame)&&frame>0&&frame<Math.round(duration()*FPS)).sort((a,b)=>a-b);
-        if (!cuts.length) { hint("还没有候选切点，请先检测", true); return; }
-        if (!hasAvClips()) { hint("时间线上没有音视频片段，无法应用切分", true); return; }
-        const bounds=[0,...cuts,Math.round(duration()*FPS)];
-        if(bounds.some((value,i)=>i&&value-bounds[i-1]>15*FPS)){hint("存在超过15秒的区间，请增加候选切点后应用。",true);return;}
-        pushUndo();
-        cutTimelineAt(T.state, cuts.map(frame => frame / FPS));
-        T.selected = new Set([...T.state.video_tracks, ...T.state.audio_tracks].flat().map(clip => clip.id));
-        T.segment = -1;
-        T.smartCuts = []; root._adH3SmartCuts = [];
-        afterEdit();
-        paintSmartInfo();
-        const segs = Math.max(1, intervals().length);
-        hint(`已应用切分：共 ${segs} 段；可按需撤销。`);
+        const clips = requireSelectedClips(); if (!clips.length) return;
+        const cutsByClip = new Map(clips.map(clip=>[clip.id,candidateCuts(clip).map(frame=>frame/FPS)]));
+        const targets = clips.filter(clip=>cutsByClip.get(clip.id).length);
+        if (!targets.length) { hint("所选片段没有可应用的候选切点，请先检测或添加切分线。",true);return; }
+        const maxFrames=Math.max(1,Math.round((Number($("[data-smart-max]")?.value)||15)*FPS));
+        for(const clip of targets){
+            const bounds=[clip.tl_start,...cutsByClip.get(clip.id),clipEnd(clip)].map(t=>Math.round(t*FPS));
+            if(bounds.some((value,i)=>i&&value-bounds[i-1]>maxFrames)){hint(`所选片段内存在超过 ${maxFrames/FPS} 秒的区间，请增加候选切点后应用。`,true);return;}
+        }
+        smartApply._busy=true;setTimeout(()=>{smartApply._busy=false;},0);
+        pushUndo();splitSelectedClips(targets,cutsByClip);clearSelectedCandidates(targets);T.segment=-1;
+        afterEdit();paintSmartInfo();hint(`已应用所选可见片段的切分，清单共 ${intervals().length} 段；可撤销。`);
     }
     const detectButton = $("[data-smart-detect]");
     if (detectButton && !detectButton.dataset.adH3Bound) {
@@ -3310,8 +3361,9 @@ export function mountTimelineEditor(node) {
             if (frame <= 0 || frame >= Math.round(duration() * FPS)) {
                 hint("请把白色游标移到时间线内部，再添加切分线。", true); return;
             }
-            if (T.smartCuts.includes(frame)) { hint("当前位置已有黄色切分线。", true); return; }
-            T.smartCuts = [...T.smartCuts, frame].sort((a,b)=>a-b);
+            const clips=requireSelectedClips().filter(clip=>frame/FPS>clip.tl_start+.5/FPS&&frame/FPS<clipEnd(clip)-.5/FPS);
+            if(!clips.length){hint("请把游标移到所选可见片段内部。",true);return;}
+            for(const clip of clips)rememberCandidates(clip,[frame]);
             root._adH3SmartCuts = [...T.smartCuts];
             renderOverlays(); paintSmartInfo();
             hint(`已在 ${fmtClock(frame/FPS)} 添加黄色候选线；点「应用切分」后生效。`);
@@ -3321,7 +3373,8 @@ export function mountTimelineEditor(node) {
     if (clearButton && !clearButton.dataset.adH3Bound) {
         clearButton.dataset.adH3Bound = "1";
         clearButton.addEventListener("click", () => {
-            T.smartCuts = []; root._adH3SmartCuts = []; renderOverlays(); paintSmartInfo(); hint("已清空候选切点。");
+            const clips=requireSelectedClips();if(!clips.length)return;
+            clearSelectedCandidates(clips);renderOverlays();paintSmartInfo();hint("已清空所选片段的候选切点。");
         });
     }
 
@@ -3366,17 +3419,18 @@ export function mountTimelineEditor(node) {
             }
             if (!segmentNode) { hint("请先把素材清单连接到「AD-分段生成」的 queue 输入口。", true); return; }
             if (typeof segmentNode._adH3RunAffected !== "function") { hint("请保存工作流后 Ctrl+F5 刷新页面，再使用运行此段。", true); return; }
-            const videos = (T.state.video_tracks || []).flat().filter(clip => T.selected.has(clip.id));
-            const audios = (T.state.audio_tracks || []).flat().filter(clip => T.selected.has(clip.id));
+            const videos = activeClips(T.state,"video_tracks",T.selected);
+            const audios = activeClips(T.state,"audio_tracks",T.selected);
             const generated = generationClips(T.state).filter(clip => T.selected.has(clip.id));
             const selected = videos.length ? videos : (audios.length ? audios : generated);
             const indices = [...new Set(selected.map(segmentIndexForClip).filter(index => index >= 0))].sort((a,b) => a-b);
-            if (!indices.length && T.segment >= 0) indices.push(T.segment);
+            if (hasAvClips() && !selected.length) { requireSelectedClips(); return; }
+            if (!hasAvClips() && !indices.length && T.segment >= 0) indices.push(T.segment);
             if (T.selected.size && !indices.length) { hint("所选片段没有对应的生成分段，请先应用分段。", true); return; }
             hint(indices.length ? `正在准备运行所选第 ${indices.map(i => i+1).join("、")} 段，完成后回到原进度。`
                 : "正在检查并重跑受影响段，完成后回到原运行位置。");
             void segmentNode._adH3RunAffected(indices.length ? {indices} : {}).then(result => {
-                if (result === false) hint("选段运行未完成，请查看预览审批中的提示。", true);
+                if (result === false) hint("选段运行未完成，请查看分段预览中的提示。", true);
             });
         });
     }
@@ -3533,11 +3587,9 @@ export function mountTimelineEditor(node) {
     node.onConfigure = function (info) {
         node._adH3MaterialsReady = false;
         const result = onConfigure?.apply(this, arguments);
-        const saved = (info?.widgets_values || []).find(value => {
-            if (typeof value !== "string") return false;
-            try { const data = JSON.parse(value); return Array.isArray(data.sources) || Array.isArray(data.tracks) || Array.isArray(data.entries); } catch { return false; }
-        });
-        setTimeout(() => { if (node.graph) { if (saved) restoreEditor(saved); else { node._adH3MaterialsReady = true; updateMaterialOutputs(node, T.state); } applyLayoutHeight(); } }, 0);
+        // 旧隐藏控件可能还保存着上次加载的 JSON；当前 DOM 编辑器的值追加在后，优先取它。
+        const saved = savedTimelineValue(info);
+        setTimeout(() => { if (node.graph) { if (saved) restoreEditor(typeof saved === "string" ? saved : JSON.stringify(saved)); else { node._adH3MaterialsReady = true; updateMaterialOutputs(node, T.state); } applyLayoutHeight(); } }, 0);
         return result;
     };
     const onRemoved = node.onRemoved;
@@ -3564,12 +3616,12 @@ export function mountTimelineEditor(node) {
     const planTimer = setInterval(() => {
         if (interactionLock || document.hidden) return;
         renderFramePlan();
-    }, 2500);
+    }, 5000);
     // 素材准备没有任何素材时，正向提示词的 # 段数变化后自动同步分段数（不用再手点「应用分段」）。
     const promptRuleTimer = setInterval(() => {
         if (interactionLock || document.hidden || !node.graph) return;
         node._adH3SyncPromptSegments();
-    }, 800);
+    }, 2000);
     // 首次挂载：用 emptyTimeline 的 recipe 填输入并画出生成段（configure 有存档时再由 restoreEditor 覆盖）
     {
         const recipe = T.state.segment_recipe || defaultSegmentRecipe();

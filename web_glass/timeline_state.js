@@ -56,6 +56,16 @@ export function playbackRange(playhead, total) {
     return [total>0 && cursor>=total ? 0 : cursor,total];
 }
 
+/** 新选片段从其最早起点播放；同一选择停止后继续白线，终点重播仍优先所选起点。 */
+export function selectionPlaybackRange(playhead, total, clips, previousKey = "") {
+    const signature = clips.map(clip=>[clip.id,clip.source,clip.tl_start,clip.src_in,clip.src_out])
+        .sort((a,b)=>String(a[0]).localeCompare(String(b[0])));
+    const selectionKey = signature.length ? JSON.stringify(signature) : "";
+    const fromSelection = !!selectionKey && (selectionKey !== previousKey || playhead >= total - 1e-9);
+    const start = fromSelection ? Math.min(...clips.map(clip=>clip.tl_start)) : playhead;
+    return {range:playbackRange(start,total),selectionKey,fromSelection};
+}
+
 export const clipEnd = clip => clip.tl_start + clip.src_out - clip.src_in;
 
 /**
@@ -129,10 +139,16 @@ export function timelineDuration(state) {
 }
 /** 分段区间：clips 模式按素材片段计段（不含空隙）；markers/纯参考按 split_points 连续切。 */
 export function segmentIntervals(state) {
-    const total = timelineDuration(state);
+    let total = timelineDuration(state);
     if (!(total > 0)) return [];
-    const videos = state.video_tracks.flat();
-    const audios = state.audio_tracks.flat();
+    const hasAv = [...state.video_tracks,...state.audio_tracks].some(lane=>lane.length);
+    const videos = activeClips(state, "video_tracks");
+    const audios = activeClips(state, "audio_tracks");
+    if (hasAv) {
+        if (!videos.length && !audios.length) return [];
+        if (Object.values(state.disabled_tracks || {}).some(flags=>flags.some(Boolean)))
+            total = Math.min(total,Math.max(...[...videos,...audios].map(clipEnd)));
+    }
     if (!videos.length && !audios.length && Array.isArray(state.generation_clips))
         return state.generation_clips.map(clip=>[clip.tl_start,clipEnd(clip)]).sort((a,b)=>a[0]-b[0]);
     if (state.segmentation === "clips" && (videos.length || audios.length)) {
@@ -209,9 +225,20 @@ export function cutTimelineAt(state, points) {
     state.segmentation = "clips";
     return state;
 }
+/** 可见轨道的片段；selection省略时返回全部启用片段，传入空Set时返回空。 */
+export function activeClips(state, key = null, selection = null) {
+    return (key ? [key] : ["video_tracks","audio_tracks"]).flatMap(kind =>
+        (state[kind] || []).flatMap((lane,index)=>trackDisabled(state,kind,index) ? [] :
+            lane.filter(clip=>selection === null || selection.has(clip.id))));
+}
+/** 开关过滤播放、输出与分段推导，编辑布局保留。 */
+export function trackDisabled(state, key, index) {
+    return !!state.disabled_tracks?.[key]?.[index];
+}
 export function topVideoAt(state, time) {
     const t = Math.min(time, Math.max(0, timelineDuration(state) - 1e-7));
-    for (const lane of state.video_tracks) {
+    for (const [index, lane] of state.video_tracks.entries()) {
+        if (trackDisabled(state, "video_tracks", index)) continue;
         const clip = lane.find(clip => t >= clip.tl_start - 1e-8 && t < clipEnd(clip));
         if (clip) return clip;
     }

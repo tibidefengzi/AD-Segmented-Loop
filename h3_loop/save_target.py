@@ -7,6 +7,7 @@
 import os
 import re
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -115,5 +116,15 @@ def save_to_path(source: Path, target: str) -> Path:
         raise ValueError("请选择保存文件名，不能只选文件夹")
     # 系统另存为框已确认最终文件名；此处不得改后缀后覆盖另一个未确认的文件。
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target_path)
+    if target_path.exists() and os.path.samefile(source, target_path):
+        return target_path
+    # 只替换目标目录项，避免原地覆盖其硬链接共享的其它结果。
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".ad-save-", suffix=target_path.suffix, dir=target_path.parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target_path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return target_path

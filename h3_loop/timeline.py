@@ -236,6 +236,8 @@ def validate_timeline(config):
                 clips.append({"id": str(clip.get("id") or digest([source["id"], clip])[0:16]),
                               "source": source["id"], "tl_start": float(clip["tl_start"]),
                               "src_in": float(clip["src_in"]), "src_out": float(clip["src_out"])})
+                if clip.get("audio_muted"):
+                    clips[-1]["audio_muted"] = True
                 if "retained_src_in" in clip or "retained_src_out" in clip:
                     lo, hi = clip.get("retained_src_in"), clip.get("retained_src_out")
                     if not _finite(lo, positive=False) or not _finite(hi) or hi <= lo \
@@ -336,6 +338,12 @@ def validate_timeline(config):
         key: [bool(value) for value in ((config.get("muted_tracks") or {}).get(key) or [])[:TRACK_COUNT]]
         for key in ("video_tracks", "audio_tracks")
     }
+    disabled = config.get("disabled_tracks") or {}
+    if not isinstance(disabled, dict) or any(not isinstance(disabled.get(key, []), list)
+                                          for key in ("video_tracks", "audio_tracks")):
+        raise ValueError("轨道开关状态无效")
+    state["disabled_tracks"] = {key: [bool(value) for value in disabled.get(key, [])[:TRACK_COUNT]]
+                                for key in ("video_tracks", "audio_tracks")}
     recipe = config.get("segment_recipe")
     if isinstance(recipe, dict):
         state["segment_recipe"] = recipe
@@ -424,15 +432,22 @@ def segment_intervals(state):
         count = max(1, len(priority))
         return [(snap_seconds(step * index), snap_seconds(step * (index + 1))) for index in range(count)], snap_seconds(step * count)
     duration = effective_duration(state)
-    videos = [clip for lane in state["video_tracks"] for clip in lane]
-    audios = [clip for lane in state["audio_tracks"] for clip in lane]
+    has_av = any(lane for key in ("video_tracks", "audio_tracks") for lane in state[key])
+    active = output_timeline(state)
+    videos = [clip for lane in active["video_tracks"] for clip in lane]
+    audios = [clip for lane in active["audio_tracks"] for clip in lane]
+    if has_av:
+        if not videos and not audios:
+            return [], 0.0
+        if any(any(flags) for flags in (state.get("disabled_tracks") or {}).values()):
+            duration = min(duration, max(clip_span(clip)[1] for clip in videos + audios))
     if not videos and not audios and "generation_clips" in state:
         return [clip_span(clip) for clip in state["generation_clips"]], duration
     if state.get("segmentation") == "clips" and (videos or audios):
         clips = videos if videos else audios
         points = sorted({max(0, min(snap_seconds(t), duration)) for clip in clips for t in clip_span(clip)})
         intervals, previous_owner = [], None
-        ordered = [clip for lane in state["video_tracks"] for clip in lane] if videos else clips
+        ordered = videos if videos else clips
         for start, end in zip(points, points[1:]):
             if end - start <= HALF_FRAME:
                 continue
@@ -453,6 +468,24 @@ def segment_intervals(state):
         return ([(0.0, duration)] if duration > HALF_FRAME else []), duration
     bounds = [0.0, *points, duration]
     return list(zip(bounds, bounds[1:])), duration
+
+
+def output_timeline(state):
+    """输出视图：禁用轨道保留槽位，源数据与分段范围不变，不回退到被隐藏素材。"""
+    result = dict(state)
+    placed, enabled = set(), set()
+    for key in ("video_tracks", "audio_tracks"):
+        flags = (state.get("disabled_tracks") or {}).get(key) or []
+        result[key] = []
+        for index, lane in enumerate(state.get(key) or []):
+            placed.update(clip["source"] for clip in lane)
+            active = not (index < len(flags) and flags[index])
+            if active:
+                enabled.update(clip["source"] for clip in lane)
+            result[key].append(lane if active else [])
+    excluded = placed - enabled
+    result["sources"] = [source for source in state.get("sources") or [] if source["id"] not in excluded]
+    return result
 
 
 def derive_segments(state):
@@ -478,6 +511,7 @@ def derive_segments(state):
             cursor += seconds
         return {"entries": entries, "duration": cursor, "bounds": [], "intervals": []}
     intervals, duration = segment_intervals(state)
+    state = output_timeline(state)
     bounds = [t for pair in intervals for t in pair]  # [s0,e0,s1,e1,…]；空隙不入清单
     sources = {source["id"]: source for source in state["sources"]}
     entries = []
@@ -508,7 +542,7 @@ def derive_segments(state):
             "source_video": whole_video,
             "reference_video_sources": [audio_pieces(lane, sources, start, end) for lane in state["video_tracks"] if lane],
             "muted_tracks": state.get("muted_tracks") or {},
-            "video_audio_muted": (bool(video_mutes[selected_lane]) if selected_lane is not None and selected_lane < len(video_mutes)
+            "video_audio_muted": bool(selected_video and selected_video.get("audio_muted")) or (bool(video_mutes[selected_lane]) if selected_lane is not None and selected_lane < len(video_mutes)
                                   else bool(whole_video and whole_video.get("muted"))),
             "images": [{"origin": sources[image["source"]]["origin"], "file": sources[image["source"]]["file"],
                         "name": sources[image["source"]]["name"], "segment": image["segment"]}
@@ -567,6 +601,7 @@ def video_range(lanes, sources, start, end, index):
             offset = float(clip["src_in"]) - clip_start
             candidates.append((span, {"origin": source["origin"], "file": source["file"],
                                       "name": source["name"], "src_in": offset + lo, "src_out": offset + hi,
+                                      **({"audio_muted": True} if clip.get("audio_muted") else {}),
                                       **({"retained_range": [clip["retained_src_in"], clip["retained_src_out"]]} if "retained_src_in" in clip else {})}))
         if not candidates:
             continue
@@ -617,7 +652,7 @@ def timeline_identity(raw):
             files.append((source.get("id"), source.get("file")))
     return digest([REVISION, files, config.get("video_tracks"), config.get("audio_tracks"),
                    config.get("images"), config.get("split_points"), config.get("duration"), config.get("segmentation"),
-                   config.get("muted_tracks"), [source.get("muted", False) for source in config.get("sources") or []],
+                   config.get("muted_tracks"), config.get("disabled_tracks"), [source.get("muted", False) for source in config.get("sources") or []],
                    config.get("generation_clips")])
 
 

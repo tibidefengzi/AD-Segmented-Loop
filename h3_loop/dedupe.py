@@ -74,11 +74,12 @@ def canonical_for(hash_value: str) -> Path | None:
         return None
     path = Path(value)
     try:
-        if path.is_file():
+        if path.is_file() and file_hash(path) == hash_value:
             return path
     except OSError:
         pass
     index.pop(hash_value, None)
+    _save(index)
     return None
 
 
@@ -114,9 +115,26 @@ def link_or_copy(source: Path, target: Path) -> Path:
     try:
         os.link(source, target)
         return target
-    except OSError:
-        shutil.copy2(source, target)
+    except FileExistsError:
         return target
+    except OSError:
+        return _exclusive_copy(source, target)
+
+
+def _exclusive_copy(source: Path, target: Path) -> Path:
+    """跨卷回退也独占创建，不覆盖并发发布的已有文件。"""
+    try:
+        output = target.open("xb")
+    except FileExistsError:
+        return target
+    try:
+        with output, source.open("rb") as incoming:
+            shutil.copyfileobj(incoming, output)
+        shutil.copystat(source, target)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    return target
 
 
 def relink_to_canonical(source: Path, canonical: Path) -> bool:
@@ -158,8 +176,9 @@ def publish(source: Path, target: Path) -> Path:
         try:
             os.link(canonical, target)
             return target
-        except OSError:
-            shutil.copy2(canonical, target)
+        except FileExistsError:
             return target
+        except OSError:
+            return _exclusive_copy(canonical, target)
     remember(hash_value, source)
     return link_or_copy(source, target)

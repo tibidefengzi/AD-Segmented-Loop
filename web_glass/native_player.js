@@ -1,8 +1,20 @@
-import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261026-glass-v031";
+import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261031-fullscreen-v27";
+import { interruptOwnedPrompt } from "./queue_runner.js?v=20261031-integrity-v36";
+// 所有入口共用进入/退出切换；状态以浏览器fullscreenElement为准（包括Esc退出）。
+export async function togglePlayerFullscreen(target) {
+    const doc = target.ownerDocument || document;
+    if (doc.fullscreenElement) {
+        await doc.exitFullscreen();
+    } else if (target.requestFullscreen) {
+        await target.requestFullscreen();
+    } else {
+        throw new Error("当前浏览器不支持全屏预览");
+    }
+}
 // 独立播放器。播放选择只存在于此处，绝不修改生成游标或分段选用版本。
-export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
+export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fetchApi:(...args)=>fetch(...args)}) {
     root.classList.add("aiden-h3", "ad-h3-video");
-    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-loop="approve">同意批准</button><button type="button" data-clear-preview title="只清空本轮生成进度与选用记录（预览内容与文件保留）">清空重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions"><button type="button" data-loop="merge" title="按住 Ctrl 在「分段生成」里点选视频后，按序号合并">合并已通过片段</button></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="按分段编号循环播放预览视频">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-panel" data-panel="audio" hidden><div class="ad-h3-media-list" data-audio-list></div></div></div>`;
+    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-clear-preview title="只清空本轮生成进度与选用记录（预览内容与文件保留）">清空重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions ad-h3-merge-wrap"><button type="button" data-loop="merge" title="点击选择 A合并或 B合并；Ctrl 点选片段可只合并选中内容">合并片段</button><span class="ad-h3-merge-menu" data-merge-menu hidden><button type="button" data-merge-source="A">A合并</button><button type="button" data-merge-source="B">B合并</button></span></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="按分段编号循环播放预览视频">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成A</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>分段生成B</span><div class="ad-h3-segments-b"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-panel" data-panel="audio" hidden><div class="ad-h3-media-list" data-audio-list></div></div></div>`;
     const video = root.querySelector("video"), title = root.querySelector(".ad-h3-preview-title");
     const imageView = root.querySelector("[data-media-image]"), audioView = root.querySelector("[data-media-audio]");
     const layout = root.querySelector(".ad-h3-preview-layout");
@@ -10,7 +22,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     root.querySelector(".ad-h3-screen").append(transport);
     audioView.controls = false;
     audioView.muted = true;
-    const segments = root.querySelector(".ad-h3-segments"), merges = root.querySelector(".ad-h3-merges");
+    const segments = root.querySelector(".ad-h3-segments"), segmentsB = root.querySelector(".ad-h3-segments-b"), merges = root.querySelector(".ad-h3-merges");
     // 分段生成/合并生成放在“视频”分类内（缩略图只显示视频），预览仍使用上方大窗口。
     const stripsBlock = root.querySelector(".ad-h3-strips");
     const videoPanel = root.querySelector('[data-panel="video"]');
@@ -270,16 +282,21 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         const hint = root.querySelector("[data-tab-hint]");
         if (hint) { hint.hidden = false; hint.textContent = "已退出 A/B 对比"; }
     };
-    function toggleABFullscreen() {
-        if (document.fullscreenElement) { if (document.exitFullscreen) void document.exitFullscreen().catch(() => {}); return; }
-        if (abOverlay.requestFullscreen) void abOverlay.requestFullscreen().catch(() => {});
+    let fullscreenBusy = false;
+    async function toggleFullscreen(target) {
+        if (fullscreenBusy) return;
+        fullscreenBusy = true;
+        try { await togglePlayerFullscreen(target); }
+        catch (error) { node._adH3Hint?.("全屏切换失败：" + error.message, true); }
+        finally { fullscreenBusy = false; onFullscreenChange(); }
     }
+    function toggleABFullscreen() { void toggleFullscreen(abOverlay); }
     abOverlay.querySelector("[data-ab-fullscreen]").addEventListener("click", event => {
         event.stopPropagation();
         toggleABFullscreen();
     });
     abOverlay.addEventListener("click", event => {
-        if (event.target.closest(".ad-h3-ab-exit, .ad-h3-ab-controls, .ad-h3-ab-mode")) return;
+        if (event.target.closest("button,input,select,a,.ad-h3-ab-controls")) return;
         if (!abSlots.A || !abSlots.B) return;
         const rect = abOverlay.getBoundingClientRect();
         const ratio = (event.clientX - rect.left) / (rect.width || 1);
@@ -299,9 +316,17 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     abOverlay.querySelector("[data-ab-exit]").addEventListener("click", event => {
         event.stopPropagation(); exitAB();
     });
-    window.addEventListener("keydown", event => {
-        if (event.key === "Escape" && !abOverlay.hidden) exitAB();
-    });
+    const onPreviewEscape = event => {
+        if (event.key !== "Escape") return;
+        const current = document.fullscreenElement;
+        if (current && root.contains(current)) {
+            event.preventDefault(); event.stopPropagation();
+            void document.exitFullscreen().then(onFullscreenChange).catch(() => {});
+            return;
+        }
+        if (!abOverlay.hidden) exitAB();
+    };
+    window.addEventListener("keydown", onPreviewEscape, true);
     abSeek.addEventListener("input", () => {
         const value = Number(abSeek.value) || 0;
         for (const videoEl of [abVideoA, abVideoB]) videoEl.currentTime = Math.min(value, videoEl.duration || value);
@@ -439,7 +464,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     }, {passive: false});
 
     abOverlay.addEventListener("pointerdown", event => {
-        if (event.target.closest(".ad-h3-ab-exit, .ad-h3-ab-controls, .ad-h3-ab-mode")) return;
+        if (event.target.closest("button,input,select,a,.ad-h3-ab-controls")) return;
         if ((abSlots.A?.kind === "image" && abSlots.B?.kind === "image") && event.button === 0) {
             const rect = abOverlay.getBoundingClientRect();
             const localX = event.clientX - rect.left;
@@ -518,6 +543,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         if (node._adH3AffectedRunning) { node._adH3Hint?.("正在运行所选段，请等待完成或先点停止。", true); return false; }
         node._adH3FollowCurrent?.();
         previewPinned = false;
+        if (typeof node._adH3QueueOwned === "function") return node._adH3QueueOwned().catch(error=>{node._adH3Hint?.(error.message,true);return false;});
         const buttons = [...document.querySelectorAll("button")];
         const native = buttons.find(button => /^(运行|Queue)$/.test((button.textContent || "").trim()))
             || buttons.find(button => (button.getAttribute("data-testid") || "") === "queue-button");
@@ -550,6 +576,31 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     const panels = {image: root.querySelector('[data-panel="image"]'), audio: root.querySelector('[data-panel="audio"]'), video: root.querySelector('[data-panel="video"]')};
     const mediaLists = {image: root.querySelector("[data-image-list]"), audio: root.querySelector("[data-audio-list]"), video: root.querySelector("[data-video-list]")};
     const mediaRecords = {image: [], audio: [], video: []};
+    // 预览分类卡片按 (kind, origin, file) 复用 DOM：新结果只追加/更新一张卡，不重建整表。
+    const mediaCards = {image: new Map(), audio: new Map(), video: new Map()};
+    // 内存里最多展示 200 条结果卡片（落盘仍按现有 60 条规则），避免抽卡很多轮后单次刷新构建过多 DOM。
+    const MEDIA_DISPLAY_LIMIT = 200;
+    const mediaCardKey = (kind, record) => `${kind}|${record?.origin || "media"}|${record?.file || ""}`;
+    const trimMediaRecords = kind => {
+        const list = mediaRecords[kind];
+        if (list.length > MEDIA_DISPLAY_LIMIT) list.splice(0, list.length - MEDIA_DISPLAY_LIMIT);
+    };
+    // 合并同类卡片触发的节点高度重算，每轮渲染只安排一次。
+    let mediaResizeToken = 0;
+    function scheduleMediaResize(minHeight = 200) {
+        const token = ++mediaResizeToken;
+        setTimeout(() => {
+            if (token !== mediaResizeToken) return;
+            try {
+                const size = node.computeSize?.();
+                if (size) {
+                    const target = Math.max(minHeight, Math.round(size[1]));
+                    if (Math.abs((Number(node.size?.[1]) || 0) - target) > 2) node.setSize([node.size[0], target]);
+                }
+                node.setDirtyCanvas?.(true, true);
+            } catch {}
+        }, 0);
+    }
     // 分段生成/合并生成缩略图的本地隐藏记录（X 只移除预览，不删文件/进度）；持久化到节点属性。
     const hiddenStrips = new Set(
         (Array.isArray(node.properties?.ad_h3_hidden_strips) ? node.properties.ad_h3_hidden_strips : [])
@@ -559,11 +610,25 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         node.properties ||= {};
         node.properties.ad_h3_hidden_strips = [...hiddenStrips].slice(-300);
     };
-    const stripRecords = {segment: [], merged: []};
-    // 「合并已通过片段」的新用法：按住 Ctrl 在分段生成里多选视频，按序号合并。
+    const stripRecords = {segment: [], segmentB: [], merged: []};
+    // 「合并片段」Ctrl 多选：只合并选中的同来源片段；不选则按合并来源合并全部段最新结果。
     const mergeSelection = new Map();
-    // 分段/合并缩略图持久化：后台会话切换或重开后仍展示之前生成的缩略图。
+    // 分段A/分段B/合并缩略图持久化：后台会话切换或重开后仍展示之前生成的缩略图。
     const stripStore = {segment: [], merged: []};
+    // 完整合并索引每段每端只留最新视频；与限量显示的缩略图历史分开。
+    const mergeIndex = new Map();
+    const mergeIndexKey = record => `${record.role === "B" ? "B" : "A"}:${Number(record.segment_index) || Number(record.serial) || 0}`;
+    const rememberMergeRecord = (record, replace = true) => {
+        if (!record?.file || inferMediaKind(record.file, record.kind) !== "video") return;
+        const number = Number(record.segment_index) || Number(record.serial) || 0;
+        if (number <= 0) return;
+        const key = mergeIndexKey(record);
+        if (replace || !mergeIndex.has(key)) mergeIndex.set(key, {
+            file:record.file, origin:record.origin || "media", kind:"video", segment_index:number,
+            role:record.role === "B" ? "B" : "A", label:record.label
+        });
+    };
+    const persistMergeIndex = () => {node.properties.ad_h3_merge_index = [...mergeIndex.values()];};
     const savedStrip = node.properties?.ad_h3_strip_previews;
     if (savedStrip && typeof savedStrip === "object") {
         for (const kind of ["segment", "merged"]) {
@@ -573,11 +638,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     }
     const persistStripPreviews = () => {
         node.properties ||= {};
-        const clean = list => list.slice(-60).map(({file, origin, label, kind, segment_index}) =>
-            ({file, origin: origin || "session", label, kind, segment_index}));
+        const clean = list => list.slice(-60).map(({file, origin, label, kind, segment_index, role, session_id, segment_key}) =>
+            ({file, origin: origin || "session", label, kind, segment_index, role: role === "B" ? "B" : "A", session_id, segment_key}));
         node.properties.ad_h3_strip_previews = {segment: clean(stripStore.segment), merged: clean(stripStore.merged)};
     };
-    // 「分段生成」按生成历史展示：和图片区域一致，所有生成/抽卡结果都保留，不随当前选用版本变动。
+    // 「分段生成A/B」按生成历史展示：A/B 输入端口各一排，所有结果都保留；合并生成单独一排。
     const syncStripFromMedia = () => {
         const history = [];
         for (const kind of ["image", "audio", "video"]) {
@@ -585,7 +650,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
                 if (!record?.file) continue;
                 history.push({file: record.file, origin: record.origin || "media",
                     label: recordLabel(record, 0), kind: record.kind || kind,
+                    role: record.role === "B" ? "B" : "A",
                     segment_index: Number(record.segment_index) || 0,
+                    session_id: record.session_id, segment_key: record.segment_key,
                     serial: Number(record.serial) || 0,
                     redraw: !!record.redraw,
                     redraw_base: Number(record.redraw_base) || 0,
@@ -596,14 +663,21 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             const left = numberOrder(a), right = numberOrder(b);
             return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
         });
+        // 兼容旧存档：已有完整索引不被较早的可见历史覆盖。
+        const legacyLatest = new Map();
+        for (const record of history) legacyLatest.set(mergeIndexKey(record), record);
+        for (const record of legacyLatest.values()) rememberMergeRecord(record, false);
+        persistMergeIndex();
         stripStore.segment = history.slice(-60);
         for (const key of [...mergeSelection.keys()])
             if (!stripStore.segment.some(record => keyOf(record) === key)) mergeSelection.delete(key);
         persistStripPreviews();
-        renderRecords(segments, stripStore.segment, "segment");
+        renderRecords(segments, stripStore.segment.filter(record => record.role !== "B"), "segment");
+        renderRecords(segmentsB, stripStore.segment.filter(record => record.role === "B"), "segmentB");
     };
     const stripKey = (kind, record) => `${kind}:${record?.origin || "session"}/${record?.file || ""}`;
     let redoTarget = null;
+    let resumeTarget = null;
     // 本段抽卡（2026-10-28 用户要求）：
     // - 任意时候（含分段循环已完成）选中任意预览卡片即可指定段重抽；
     // - 运行中必须先点「停止」让流程待命，再点「本段抽卡」；
@@ -683,6 +757,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
                 fallback.push({file: record.file, origin: record.origin || "media",
                     label: record.label || (Number(record.serial) > 0 ? `第 ${record.serial} 段` : "历史生成"),
                     kind: record.kind || kind,
+                    role: record.role === "B" ? "B" : "A",
                     segment_index: Number(record.segment_index) || Number(record.serial) || 0});
             }
         }
@@ -740,6 +815,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     function setRedoTarget(record, button) {
         const resolved = record ? (Number(record.segment_index) || Number(record.serial) || 0) : 0;
         redoTarget = record ? {...record, segment_index: resolved} : null;
+        resumeTarget = redoTarget ? {...redoTarget} : null;
         // 选中哪张预览只作为本段抽卡的内部目标，不再给缩略图加黄色高亮（用户 2026-10-28 要求去掉）。
         void button;
         const redoButton = root.querySelector('[data-loop="redo"]');
@@ -749,51 +825,61 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
                 : "重抽当前段；点下方预览可指定要重抽的段（运行中请先停止）";
         }
         if (record) {
-            node._adH3ReviewStatus?.(resolved ? `已选为本段抽卡目标：第 ${resolved} 段（旧版本文件保留）`
+            node._adH3ReviewStatus?.(resolved ? `已选第 ${resolved} 段：点「分段循环」从下一段续跑；「本段抽卡」重抽该段`
                                               : "该预览缺少段号，本段抽卡将重抽当前段");
         }
     }
     function renderMedia(kind) {
         const list = mediaLists[kind];
         if (!list) return;
-        list.replaceChildren();
-        mediaRecords[kind].forEach((record, index) => {
-            const button = document.createElement("button");
-            button.type = "button"; button.className = "ad-h3-media-card";
+        const owned = mediaCards[kind];
+        const records = mediaRecords[kind];
+        const wanted = new Set();
+        records.forEach((record, index) => {
+            const key = mediaCardKey(kind, record);
+            wanted.add(key);
+            let button = owned.get(key);
+            if (!button) {
+                button = document.createElement("button");
+                button.type = "button"; button.className = "ad-h3-media-card";
+                const media = document.createElement(kind === "audio" ? "span" : "img");
+                if (kind === "audio") {
+                    media.className = "ad-h3-audio-icon"; media.textContent = "♪";
+                } else {
+                    media.loading = "lazy"; media.decoding = "async"; media.setAttribute("aria-hidden", "true");
+                }
+                const label = document.createElement("span"); label.className = "ad-h3-media-serial";
+                const remove = document.createElement("span");
+                remove.className = "ad-h3-media-remove"; remove.textContent = "×"; remove.title = "删除这条缩略图记录";
+                button.append(media, label, remove);
+                owned.set(key, button);
+            }
             button.dataset.file = record.file || ""; button.dataset.origin = record.origin || "media";
             // 重抽结果：编号标黄，方便和普通结果区分。
             button.classList.toggle("redraw", !!record.redraw);
-            if (record.redraw) button.title = "本段抽卡结果（黄色编号）";
+            button.title = record.redraw ? "本段抽卡结果（黄色编号）" : "";
             const labelText = recordLabel(record, index);
-            if (kind === "image") {
-                const image = document.createElement("img");
-                image.src = record.thumb_b64
+            const media = button.firstElementChild;
+            let thumbURL = "";
+            if (kind === "video") {
+                // 使用后端首帧 webp 缩略图（24h 缓存）；不再为每张卡片创建 video 解码器/媒体请求。
+                thumbURL = thumbnailUrl(record.origin || "media", record.file);
+            } else if (kind === "image") {
+                thumbURL = record.thumb_b64
                     ? `data:${record.thumb_mime || "image/webp"};base64,${record.thumb_b64}`
                     : thumbnailUrl(record.origin || "media", record.file);
-                image.alt = String(record.file || "").split("/").pop() || labelText;
-                button.append(image);
-            } else if (kind === "video") {
-                const clip = document.createElement("video");
-                clip.muted = true; clip.playsInline = true; clip.preload = "metadata";
-                // 分段/合并结果 origin 是 session；缩略图接口只处理图片，视频卡片直接用媒体地址取首帧。
-                clip.src = mediaUrl(record.origin || "media", record.file);
-                clip.addEventListener("loadeddata", () => { try { clip.currentTime = 0.05; } catch {} }, {once: true});
-                button.append(clip);
-            } else {
-                const icon = document.createElement("span");
-                icon.className = "ad-h3-audio-icon"; icon.textContent = "♪";
-                button.append(icon);
             }
-            const label = document.createElement("span");
-            label.className = "ad-h3-media-serial"; label.textContent = labelText;
-            button.append(label);
-            const remove = document.createElement("span");
-            remove.className = "ad-h3-media-remove"; remove.textContent = "×"; remove.title = "删除这条缩略图记录";
+            if (thumbURL && media.dataset.thumbUrl !== thumbURL) {
+                media.dataset.thumbUrl = thumbURL;
+                media.src = thumbURL;
+            }
+            if (thumbURL) media.alt = String(record.file || "").split("/").pop() || labelText;
+            button.children[1].textContent = labelText;
+            const remove = button.lastElementChild;
             remove.onclick = event => {
                 event.stopPropagation();
                 clearRecordPreview(record, null);
             };
-            button.append(remove);
             button.onclick = () => {
                 pickAB(record, kind);
                 show({...record, kind, label: recordLabel(record, index), url: mediaUrl(record.origin || "media", record.file)});
@@ -803,27 +889,22 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             };
             list.append(button);
         });
-        if (!mediaRecords[kind].length) {
-            const empty = document.createElement("span"); empty.className = "ad-h3-strip-empty";
+        // 只移除本轮不再需要的卡片；已有卡片不重建、不重新加载缩略图。
+        for (const [key, button] of [...owned]) {
+            if (wanted.has(key)) continue;
+            button.remove(); owned.delete(key);
+        }
+        let empty = list.querySelector(".ad-h3-strip-empty");
+        if (!records.length) {
+            if (!empty) {
+                empty = document.createElement("span");
+                empty.className = "ad-h3-strip-empty";
+            }
             empty.textContent = kind === "image" ? "暂无图像" : kind === "video" ? "暂无视频" : "暂无音频";
             list.append(empty);
-        }
-        setTimeout(() => {
-            try {
-                const size = node.computeSize?.();
-                if (size) node.setSize([node.size[0], Math.max(240, Math.round(size[1]))]);
-                node.setDirtyCanvas?.(true, false);
-            } catch {}
-        }, 0);
-        if (mediaLists[kind]?.parentElement && !mediaLists[kind].parentElement.hidden) {
-            setTimeout(() => {
-                try {
-                    const size = node.computeSize?.();
-                    if (size) node.setSize([node.size[0], Math.max(200, Math.round(size[1]))]);
-                    node.setDirtyCanvas?.(true, true);
-                } catch {}
-            }, 0);
-        }
+        } else if (empty) empty.remove();
+        const visible = mediaLists[kind]?.parentElement && !mediaLists[kind].parentElement.hidden;
+        scheduleMediaResize(visible ? 200 : 240);
     }
     for (const button of tabButtons) button.onclick = () => setTab(button.dataset.tab);
     const clearButton = root.querySelector("[data-clear-preview]");
@@ -841,9 +922,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         const kind = activeTab || "image";
         const names = {image: "图片", audio: "音频", video: "视频"};
         const sameKind = record => inferMediaKind(record?.file, record?.kind) === kind;
-        const stripMatches = ["segment", "merged"].flatMap(key =>
-            [...stripStore[key], ...stripRecords[key]].filter(sameKind).map(record => ({key, record})));
-        if (!(mediaRecords[kind] || []).length && !stripMatches.length) {
+        const stripMatches = ["segment", "segmentB", "merged"].flatMap(key => {
+            const source = key === "segment" ? [...stripStore.segment.filter(record => record.role !== "B"), ...stripRecords.segment]
+                : key === "segmentB" ? [...stripStore.segment.filter(record => record.role === "B"), ...stripRecords.segmentB]
+                : [...stripStore.merged, ...stripRecords.merged];
+            return source.filter(sameKind).map(record => ({key, record}));
+        });
+        if (!(mediaRecords[kind] || []).length && !stripMatches.length && !(kind === "video" && mergeIndex.size)) {
             lastShown[kind] = null;
             active = null; generationKey = "";
             showLastForTab(kind);
@@ -857,15 +942,22 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             item.file === redoTarget.file && (item.origin || "media") === (redoTarget.origin || "media"));
         // 清除的分段/合并记录也持久化隐藏，防止重新打开后被会话进度补回。
         for (const {key, record} of stripMatches) hiddenStrips.add(stripKey(key, record));
-        for (const record of mediaRecords[kind] || []) hiddenStrips.add(stripKey("segment", record));
+        for (const record of mediaRecords[kind] || []) {
+            hiddenStrips.add(stripKey("segment", record));
+            hiddenStrips.add(stripKey("segmentB", record));
+        }
         for (const row of latestSessionState?.segments || []) for (const version of row.versions || []) {
             const record = {origin:"session", file:`${latestSessionState.id}/${version.file}`, kind:version.media_kind};
-            if (sameKind(record)) hiddenStrips.add(stripKey("segment", record));
+            if (sameKind(record)) {
+                hiddenStrips.add(stripKey("segment", record));
+                hiddenStrips.add(stripKey("segmentB", record));
+            }
         }
         persistHiddenStrips();
         node.graph?.change?.(); // 通知工作流记录这次清空，刷新时使用新的预览状态。
         stripStore.segment = stripStore.segment.filter(record => !sameKind(record));
         stripStore.merged = stripStore.merged.filter(record => !sameKind(record));
+        if (kind === "video") {mergeIndex.clear();persistMergeIndex();}
         persistStripPreviews();
         mediaRecords[kind] = [];
         lastShown[kind] = null;
@@ -873,8 +965,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         persistMedia();
         renderMedia(kind);
         syncStripFromMedia();
-        renderRecords(merges, stripStore.merged, "merged");
-        // 清空预览后主预览统一回到大黑屏空闲态（即使当前显示的是其它分类/分段预览）。
+        renderRecords(merges, stripStore.merged, "merged");        // 清空预览后主预览统一回到大黑屏空闲态（即使当前显示的是其它分类/分段预览）。
         active = null; generationKey = "";
         showLastForTab(kind);
         previewPinned = false;
@@ -883,26 +974,37 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     });
     const runningStatuses = ["queued", "running", "merging"];
     const sessionIsRunning = () => !!latestSessionState && runningStatuses.includes(latestSessionState.status);
-    const interruptNow = () => { try { void fetch("/interrupt", { method: "POST", headers: { "Content-Type": "application/json" } }); } catch {} };
-    for (const button of root.querySelectorAll("[data-loop]")) button.addEventListener("click", () => {
+    const interruptNow = () => { void interruptOwnedPrompt(api,node).catch(error=>node._adH3Hint?.(error.message,true)); };
+    let resolvingStart = false;
+    for (const button of root.querySelectorAll("[data-loop]")) button.addEventListener("click", async () => {
         const command = button.dataset.loop;
+        if (command === "start" && node.properties?.ad_execution_round?.id && node._adH3RefreshState) {
+            if(resolvingStart) return;
+            resolvingStart=true;
+            try {await node._adH3RefreshState();}
+            catch(error) {node._adH3Hint?.(error.message,true);return;}
+            finally {resolvingStart=false;}
+        }
         if (node._adH3AffectedRunning && command !== "pause") {
             node._adH3Hint?.("正在运行所选段，请等待完成或先点停止。", true); return;
         }
         // 用户主动开始生成/分段循环/批准/合并时解除预览固定，新结果照常自动显示。
         if (["start", "auto", "approve", "merge"].includes(command)) previewPinned = false;
         if (command === "start") {
+            if (latestSessionState?.draft_trial) {
+                node._adH3Hint?.("本段抽卡尚未结束，完成后再继续原循环。",false); return;
+            }
             // 点「停止」时如果分段循环正在运行：抽卡只是预览备选，点「开始」续接原来的分段循环位置。
-            if (batchResume) {
+            if (batchResume || latestSessionState?.execution_round?.batch && latestSessionState.status !== "completed") {
                 // 抽卡还在生成（预览结果尚未到达）时点开始：提示稍后再点，不抢跑。
-                if (sessionIsRunning() && !redrawReview) {
+                if (sessionIsRunning()) {
                     node._adH3Hint?.("本段抽卡的生成还未结束，完成后点「开始」续接分段循环", false);
                     return;
                 }
                 batchResume = false; redrawPending = null; redrawReview = null;
                 previewPinned = false;
                 node._adH3Hint?.("已续接分段循环，从停止处继续…", false);
-                if (typeof node._adH3Batch === "function") { void node._adH3Batch({merge:false}); return; }
+                if (typeof node._adH3Batch === "function") { void node._adH3Batch({merge:false,resumeSelection:false}); return; }
             }
             // 分段循环已完成：点「开始」直接清空本轮进度（保留素材/分段/提示词/已生成文件）并重新开始第 1 段。
             if (latestSessionState && latestSessionState.status === "completed") {
@@ -917,25 +1019,21 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
                     return;
                 }
             }
-            // 与 ComfyUI 蓝色“运行”按钮一致：把当前工作流加入执行队列
-            // 当前段已有有效但未批准的结果：点「开始」= 先按「通过」处理，再继续下一段，
-            // 不再把请求直接塞进队列触发后台“当前段有待审核结果”的保护。
-            if (latestSessionState && latestSessionState.status === "review") {
+            // 兼容旧会话：当前段有效但尚未自动通过时，点「开始」先自动通过再继续；新会话生成即通过。
+            if (latestSessionState && (latestSessionState.status === "review" || latestSessionState.status === "paused" && latestSessionState.segments?.[latestSessionState.cursor]?.valid)) {
                 const currentRow = latestSessionState.segments?.[latestSessionState.cursor];
                 if (currentRow?.valid && typeof node._adH3Act === "function") {
-                    node._adH3Hint?.("当前段有待审核结果：先按「通过」处理，并继续生成下一段…", false);
+                    node._adH3Hint?.("正在自动通过上一段并继续…", false);
                     Promise.resolve(node._adH3Act("approve"))
-                        .then(result => {
-                            if (result && result.status !== "completed" && typeof node._adH3Run === "function") node._adH3Run();
-                        })
                         .catch(error => {
-                            node._adH3Hint?.("通过当前段失败：" + (error?.message || String(error)), true);
+                            node._adH3Hint?.("自动通过当前段失败：" + (error?.message || String(error)), true);
                         });
                     return;
                 }
-                node._adH3Hint?.("当前段有待审核结果，请先在预览审批点「同意批准」或「本段抽卡」。", true);
+                node._adH3Hint?.("当前段已有结果，点「开始」或「分段循环」继续下一段。", false);
                 return;
             }
+            if (typeof node._adH3Act === "function") { void node._adH3Act("start"); return; }
             const app = window.app || (window.comfyAPI && window.comfyAPI.app && window.comfyAPI.app.app);
             if (typeof node._adH3Run === "function") node._adH3Run();
             else try { void app?.queuePrompt?.(0, 1); } catch {}
@@ -981,7 +1079,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             redrawReview = null;
             previewPinned = false;  // 抽卡结果要自动显示
             if (typeof node._adH3Act === "function") {
-                node._adH3Hint?.(`正在本段抽卡（第 ${base} 段，仅预览备选，不改分段循环进度）…`, false);
+                node._adH3Hint?.(`正在本段抽卡（第 ${base} 段，新结果将作为该段当前选用）…`, false);
                 Promise.resolve(node._adH3Act("redo_preview", targetIndex === null ? undefined : {index: targetIndex}))
                     .then(result => { if(request!==redrawRequest)return; if (result === false && !node._adH3ActionCancelled) {
                         redrawPending = null;
@@ -991,9 +1089,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             } else if (node._adH3ReviewStatus) node._adH3ReviewStatus("请先连接「当前段上下文」再使用", true);
             return;
         }
-        if (command === "approve" && sessionIsRunning()) {node._adH3Hint?.("当前任务尚未结束，请完成后再批准。",true);return;}
+        if (command === "approve" && sessionIsRunning()) {node._adH3Hint?.("当前任务尚未结束，请完成后再操作。",true);return;}
         if (command === "approve" || command === "clear") {redrawRequest++;redrawPending=null;redrawReview=null;batchResume=false;}
-        if (command === "merge") { void mergeSelectedVideos(); return; }
+        if (command === "merge") { const menu=root.querySelector("[data-merge-menu]"); if(menu) menu.hidden=!menu.hidden; return; }
         if (typeof node._adH3Act === "function") void node._adH3Act(command, command === "pause" ? { skipConfirm: true } : undefined);
         else if (node._adH3ReviewStatus) node._adH3ReviewStatus("请先连接「当前段上下文」再使用", true);
     });
@@ -1030,7 +1128,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         playPlaylistRecord(records.find(record=>active?.key===keyOf(record))||records[0]);
     });
     function markCards() {
-        for (const [key, button] of cards) button.classList.toggle("selected", key === active?.key);
+        for (const [key, button] of cards) button.classList.toggle("selected", button._recordKey === active?.key);
     }
     function setMode(kind) {
         const isVideo = !kind || kind === "video" || kind === "segment";
@@ -1100,13 +1198,15 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         fullscreen.type = "button"; fullscreen.className = "ad-h3-lightbox-fullscreen"; fullscreen.textContent = "全屏";
         fullscreen.onclick = event => {
             event.stopPropagation();
-            if (overlay.requestFullscreen) { void overlay.requestFullscreen().catch(() => {}); return; }
-            if (isVideo && mediaEl.webkitEnterFullscreen) { try { mediaEl.webkitEnterFullscreen(); } catch {} }
+            void toggleFullscreen(overlay).then(syncLightboxFullscreen);
         };
+        const syncLightboxFullscreen = () => { fullscreen.textContent = document.fullscreenElement === overlay ? "退出全屏" : "全屏"; };
+        document.addEventListener("fullscreenchange", syncLightboxFullscreen);
         overlay.append(mediaEl, download, fullscreen, closeButton, hint);
         overlay.dataset.role = "lightbox";
         document.body.append(overlay);
         const cleanup = () => {
+            document.removeEventListener("fullscreenchange", syncLightboxFullscreen);
             window.removeEventListener("mousemove", move);
             window.removeEventListener("mouseup", up);
             window.removeEventListener("keydown", keyHandler);
@@ -1225,15 +1325,16 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
     seek.oninput = () => { const media=playingMedia();media.pause();media.currentTime = Number(seek.value) / (active?.kind === "audio" ? 1000 : activeFps > 0 ? activeFps : 24); };
     mute.onclick = () => { const media=playingMedia();media.muted = !media.muted; mute.textContent = media.muted ? "取消静音" : "静音"; };
     root.querySelector("[data-rate]").onchange = event => { playingMedia().playbackRate = Number(event.target.value); };
-    root.querySelector("[data-fullscreen]").onclick = () => { void root.querySelector(".ad-h3-screen").requestFullscreen?.().catch(() => {}); };
+    root.querySelector("[data-fullscreen]").onclick = event => { event.stopPropagation(); void toggleFullscreen(root.querySelector(".ad-h3-screen")); };
     function renderRecords(target, records, kind) {
-        const stripKind = kind === "merged" ? "merged" : "segment";
+        const stripKind = kind === "merged" ? "merged" : kind === "segmentB" ? "segmentB" : "segment";
         stripRecords[stripKind] = records;
         if (stripKind==="segment" && playlistEnabled && !playlistVideos().length) setPlaylistEnabled(false);
         const visible = records.filter(record => !hiddenStrips.has(stripKey(stripKind, record)));
-        const wanted = new Set(visible.map(keyOf));
+        const cardKey = record => `${stripKind}|${keyOf(record)}`;
+        const wanted = new Set(visible.map(cardKey));
         for (const [key, button] of cards) if (button.parentElement === target && !wanted.has(key)) {button.remove(); cards.delete(key);}
-        // 没有记录时给一行提示，避免只显示“分段生成 / 合并生成”两个空行。
+        // 没有记录时给一行提示，避免只显示空行。
         let placeholder = target.querySelector(".ad-h3-strip-empty");
         if (!visible.length) {
             if (!placeholder) {
@@ -1241,12 +1342,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
                 placeholder.className = "ad-h3-strip-empty";
                 target.append(placeholder);
             }
-            placeholder.textContent = kind === "merged" ? "暂无合并结果" : "暂无分段";
+            placeholder.textContent = kind === "merged" ? "暂无合并结果" : kind === "segmentB" ? "暂无B输入内容" : "暂无分段";
         } else if (placeholder) {
             placeholder.remove();
         }
         for (const record of visible) {
-            const key = keyOf(record);
+            const key = cardKey(record);
             const itemKind = inferMediaKind(record.file, record.kind);
             const wantsImage = itemKind === "image";
             let button = cards.get(key);
@@ -1256,41 +1357,38 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             if (!button) {
                 button = document.createElement("button"); button.type = "button"; button.className = "ad-h3-preview-thumb";
                 button.dataset.thumbKind = wantsImage ? "image" : "video";
-                // 缩略图直接用媒体首帧：不依赖后端缩略图接口，避免出现裂图图标。
-                let thumb;
-                if (wantsImage) {
-                    thumb = document.createElement("img");
-                    thumb.alt = ""; thumb.setAttribute("aria-hidden", "true");
-                } else {
-                    thumb = document.createElement("video");
-                    thumb.muted = true; thumb.playsInline = true; thumb.disablePictureInPicture = true;
-                    thumb.preload = "metadata"; thumb.setAttribute("aria-hidden", "true");
-                    thumb.addEventListener("loadedmetadata", () => {
-                        try { thumb.currentTime = Math.min(0.12, Math.max(0.01, (thumb.duration || 0.2) / 2)); } catch { /* 忽略定位失败 */ }
-                    }, {once: true});
-                }
+                const thumb = document.createElement("img");
+                thumb.alt = ""; thumb.loading = "lazy"; thumb.decoding = "async";
+                thumb.setAttribute("aria-hidden", "true");
                 const label = document.createElement("span");
                 const remove = document.createElement("span");
                 remove.className = "ad-h3-preview-remove"; remove.textContent = "×"; remove.title = "删除这条预览记录（不删除文件）";
                 remove.onclick = event => { event.stopPropagation(); hideStripRecord(stripKind, record); };
                 button.append(thumb, remove, label); cards.set(key, button);
             }
-            button.firstElementChild.src = mediaUrl(record.origin || "session", record.file);
+            const thumbURL = record.thumb_b64
+                ? `data:${record.thumb_mime || "image/webp"};base64,${record.thumb_b64}`
+                : thumbnailUrl(record.origin || "session", record.file);
+            if (button.firstElementChild.dataset.thumbUrl !== thumbURL) {
+                button.firstElementChild.dataset.thumbUrl = thumbURL;
+                button.firstElementChild.src = thumbURL;
+            }
             button.lastElementChild.textContent = record.label; button.title = record.label; button.setAttribute("aria-label", record.label);
+            button._mergeKey = keyOf(record); button._recordKey = keyOf(record);
             button.classList.toggle("redraw", !!record.redraw);
-            button.classList.toggle("merge-selected", mergeSelection.has(key));
+            button.classList.toggle("merge-selected", mergeSelection.has(keyOf(record)));
             button.onclick = event => {
                 // Ctrl/Cmd + 点击：多选要合并的视频片段（外框高亮），不改变当前预览。
                 if (event?.ctrlKey || event?.metaKey) {
                     event.preventDefault(); event.stopPropagation();
-                    toggleMergeSelection(record, itemKind);
+                    toggleMergeSelection(record, itemKind, stripKind === "segmentB" ? "B" : stripKind === "segment" ? "A" : "");
                     return;
                 }
                 pickAB({...record, kind: itemKind}, itemKind);
                 if (stripKind==="segment" && itemKind==="video" && playlistEnabled) playPlaylistRecord(record);
-                else show({...record, key, kind: itemKind, url: mediaUrl(record.origin || "session",record.file)});
-                // 分段生成缩略图与图片缩略图一致：点选即成为「本段抽卡」目标（合并片段无段号，只预览）。
-                if (stripKind === "segment") setRedoTarget({...record, kind: itemKind}, button);
+                else show({...record, key: keyOf(record), kind: itemKind, url: mediaUrl(record.origin || "session",record.file)});
+                // 分段生成A/B缩略图：点选即成为「本段抽卡」目标（合并片段无段号，只预览）。
+                if (stripKind === "segment" || stripKind === "segmentB") setRedoTarget({...record, kind: itemKind}, button);
             };
             target.append(button);
         }
@@ -1307,6 +1405,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         const removedActive = !!active && active.file === record.file && (active.origin || "media") === origin;
         const canonical = {...record, origin};
         hiddenStrips.add(stripKey("segment",canonical));
+        hiddenStrips.add(stripKey("segmentB",canonical));
         hiddenStrips.add(stripKey("merged",canonical));
         persistHiddenStrips();
         for (const mediaKind of ["image","audio","video"]) {
@@ -1318,8 +1417,15 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         if (mergeSelection.delete(keyOf(canonical))) paintMergeSelection();
         stripStore.segment = stripStore.segment.filter(item => !same(item));
         stripStore.merged = stripStore.merged.filter(item => !same(item));
+        for (const [key,item] of mergeIndex) if (same(item)) {
+            mergeIndex.delete(key);
+            const alternatives = mediaRecords.video.filter(value=>mergeIndexKey(value)===key);
+            if (alternatives.length) rememberMergeRecord(alternatives.at(-1));
+        }
+        persistMergeIndex();
         persistMedia(); persistStripPreviews();
-        renderRecords(segments,stripStore.segment,"segment");
+        renderRecords(segments,stripStore.segment.filter(record => record.role !== "B"),"segment");
+        renderRecords(segmentsB,stripStore.segment.filter(record => record.role === "B"),"segmentB");
         renderRecords(merges,stripStore.merged,"merged");
         // 清除当前条时主预览自动跳到下一张；末尾退回剩余最后一张。
         if (removedActive) {
@@ -1345,18 +1451,18 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         return match ? [Number(match[1]), Number(match[2] || 0), Number(record?.serial) || 0] : [1e9, 0, Number(record?.serial) || 0];
     };
     function paintMergeSelection() {
-        for (const [key, button] of cards) button.classList.toggle("merge-selected", mergeSelection.has(key));
+        for (const button of cards.values()) button.classList.toggle("merge-selected", mergeSelection.has(button._mergeKey));
     }
-    function toggleMergeSelection(record, kind) {
+    function toggleMergeSelection(record, kind, role = "") {
         if (kind !== "video") {
             node._adH3Hint?.("只能选择视频片段进行合并", true);
             return;
         }
         const key = keyOf(record);
         if (mergeSelection.has(key)) mergeSelection.delete(key);
-        else mergeSelection.set(key, {...record, kind: "video"});
+        else mergeSelection.set(key, {...record, kind: "video", merge_source: role || (record.role === "B" ? "B" : "A")});
         paintMergeSelection();
-        node._adH3Hint?.(mergeSelection.size ? `已选中 ${mergeSelection.size} 个视频片段，点「合并已通过片段」按序号合并` : "已取消合并选中", false);
+        node._adH3Hint?.(mergeSelection.size ? `已选中 ${mergeSelection.size} 个视频片段，点「合并片段」按序号合并` : "已取消合并选中", false);
     }
     function numberMergedHistory(items) {
         let serial = 0;
@@ -1367,12 +1473,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             return {...item,merge_serial:serial,label:`选中合并 #${String(serial).padStart(2,"0")}`};
         });
     }
-    function addMergedPreview(source) {
+    function addMergedPreview(source, sourceTag = "") {
         if (!source?.file) return;
         node.properties ||= {};
         const list = numberMergedHistory(Array.isArray(node.properties.ad_h3_merged_previews) ? node.properties.ad_h3_merged_previews : []);
         const serial = Math.max(Number(node.properties.ad_h3_merge_serial)||0, ...list.map(item=>Number(item.merge_serial)||0))+1;
-        const label = `选中合并 #${String(serial).padStart(2,"0")}`;
+        const label = `${sourceTag || ""}合并 #${String(serial).padStart(2,"0")}`;
         node.properties.ad_h3_merge_serial = serial;
         list.push({session:currentSession||"media",file:source.file,origin:"media",label,merge_serial:serial});
         node.properties.ad_h3_merged_previews = list.slice(-24);
@@ -1385,16 +1491,54 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         previewPinned = true;
         show({...source, kind: "video", label, url: mediaUrl(source.origin || "media", source.file)}, {auto: true});
     }
-    async function mergeSelectedVideos() {
-        const selected = [...mergeSelection.values()].sort((left, right) => {
+    async function mergeSelectedVideos(chosenSource) {
+        let selected = [...mergeSelection.values()].sort((left, right) => {
             const a = mergeOrderKey(left), b = mergeOrderKey(right);
             return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
         });
-        if (selected.length < 2) {
-            node._adH3Hint?.("请按住 Ctrl 在「分段生成」里点选至少 2 个视频，再点「合并已通过片段」", true);
-            return;
+        let sourceTag = "";
+        if (selected.length) {
+            if (selected.length < 2) {
+                node._adH3Hint?.("Ctrl 已选 1 个片段；再选一个，或取消选中后点「合并片段」合并全部段最新结果。", true);
+                return;
+            }
+            const sources = new Set(selected.map(item => item.merge_source === "B" ? "B" : "A"));
+            if (sources.size > 1) {
+                node._adH3Hint?.("A、B 请分别合并：Ctrl 选中的片段只能来自同一边。", true);
+                return;
+            }
+            sourceTag = [...sources][0];
+            if (chosenSource && chosenSource !== sourceTag) {
+                node._adH3Hint?.(`已选中的是 ${sourceTag} 端片段，请点「${sourceTag}合并」。`, true);
+                return;
+            }
+        } else {
+            // 没点选片段：按点击的 A合并/B合并，合并该端全部段的最新结果。
+            sourceTag = chosenSource === "B" ? "B" : "A";
+            const latest = new Map();
+            for (const record of mergeIndex.values()) {
+                if ((record.role === "B" ? "B" : "A") !== sourceTag) continue;
+                const number = Number(record.segment_index) || mergeOrderKey(record)[0];
+                if (number > 0) latest.set(number, record);
+            }
+            const total = Math.max(Number(latestSessionState?.segments?.length) || 0, ...latest.keys(), 0);
+            const missing = [];
+            selected = [];
+            for (let number = 1; number <= total; number++) {
+                const record = latest.get(number);
+                if (!record) missing.push(number);
+                else selected.push(record);
+            }
+            if (missing.length) {
+                node._adH3Hint?.(`${sourceTag} 端第 ${missing.slice(0, 6).join("、")} 段还没有生成结果，无法整体合并。`, true);
+                return;
+            }
+            if (selected.length < 2) {
+                node._adH3Hint?.(`${sourceTag} 端还没有足够的视频片段可以合并。`, true);
+                return;
+            }
         }
-        node._adH3Hint?.(`正在按序号合并 ${selected.length} 个视频…`, false);
+        node._adH3Hint?.(`正在按序号合并 ${sourceTag} 端 ${selected.length} 个视频…`, false);
         try {
             const response = await fetch("/aiden_h3/merge_clips", {
                 method: "POST", headers: {"Content-Type": "application/json"},
@@ -1402,23 +1546,32 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || "合并失败");
-            addMergedPreview(data.source || {});
+            addMergedPreview(data.source || {}, sourceTag);
             mergeSelection.clear();
             paintMergeSelection();
-            node._adH3Hint?.(`已按序号合并 ${selected.length} 个视频。`, false);
+            node._adH3Hint?.(`已按序号合并 ${sourceTag} 端 ${selected.length} 个视频。`, false);
         } catch (error) {
             node._adH3Hint?.(error.message || "合并失败", true);
         }
+    }
+    for (const sourceButton of root.querySelectorAll("[data-merge-menu] [data-merge-source]")) {
+        sourceButton.addEventListener("click", event => {
+            event.stopPropagation();
+            const menu = root.querySelector("[data-merge-menu]");
+            if (menu) menu.hidden = true;
+            void mergeSelectedVideos(sourceButton.dataset.mergeSource);
+        });
     }
     function updateState(state) {
         if (disposed || !state?.id) return;
         latestSessionState = {...state};
         if (currentSession && currentSession !== state.id) {
             video.pause(); video.removeAttribute("src"); video.load(); active = null; generationKey = "";
-            segments.replaceChildren(); merges.replaceChildren(); cards.clear();
+            segments.replaceChildren(); segmentsB.replaceChildren(); merges.replaceChildren(); cards.clear();
             title.textContent = "生成完成后在这里预览视频";
             setIdle(true);
-            renderRecords(segments, stripStore.segment, "segment");
+            renderRecords(segments, stripStore.segment.filter(record => record.role !== "B"), "segment");
+            renderRecords(segmentsB, stripStore.segment.filter(record => record.role === "B"), "segmentB");
             renderRecords(merges, stripStore.merged, "merged");
         }
         currentSession = state.id;
@@ -1468,9 +1621,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         }
     }
     function markRedrawRecord(item, kind, record) {
-        if (!(redrawPending && (redrawPending.index === Number(record.segment_index)
-            || !redrawPending.exact || !Number(record.segment_index)))) return false;
-        const base = Number(redrawPending.base) || Number(record.segment_index) || redrawPending.index;
+        const pending = redrawPending || (record.preview_only && Number(record.segment_index) > 0
+            ? {index:Number(record.segment_index),base:Number(record.segment_index),exact:true} : null);
+        if (!(pending && (pending.index === Number(record.segment_index)
+            || !pending.exact || !Number(record.segment_index)))) return false;
+        const base = Number(pending.base) || Number(record.segment_index) || pending.index;
         const used = mediaRecords[kind].filter(entry => entry !== item && entry.redraw
             && Number(entry.redraw_base) === base).length;
         item.redraw = true;
@@ -1478,9 +1633,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         item.redraw_count = used + 1;
         item.serial = 0;  // 抽卡结果不占用正常生成的整数序号
         item.label = recordLabel(item, 0);
-        redrawReview = Number(record.segment_index) || redrawPending.index;
+        redrawReview = Number(record.segment_index) || pending.index;
         redrawPending = null;
-        node._adH3Hint?.(`第 ${base} 段已重抽完成（${item.label}，仅预览备选，不改变循环进度）；点「开始」续接分段循环`, false);
+        node._adH3Hint?.(`第 ${base} 段已重抽完成（${item.label}，已作为该段当前选用）；点「开始」继续下一段`, false);
         return true;
     }
     function receive(record) {
@@ -1501,6 +1656,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
             if (index >= 0) mediaRecords[kind][index] = item; else mediaRecords[kind].push(item);
             // 本段抽卡结果：编号为「原编号-第几次」（黄色），并记录待继续的段号。
             if (markRedrawRecord(item, kind, record)) placeRedrawRecord(kind, item);
+            trimMediaRecords(kind);
             persistMedia();
             renderMedia(kind);
             syncStripFromMedia();
@@ -1517,6 +1673,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         const index = mediaRecords.video.findIndex(entry => entry.file === record.file && entry.origin === record.origin);
         if (index >= 0) mediaRecords.video[index] = item; else mediaRecords.video.push(item);
         if (markRedrawRecord(item, "video", record)) placeRedrawRecord("video", item);
+        rememberMergeRecord(item);persistMergeIndex();
+        trimMediaRecords("video");
         persistMedia(); renderMedia("video"); syncStripFromMedia();
         if (previewPinned) return;
         markActiveCard(item);
@@ -1536,6 +1694,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         } catch { /* 无效的旧界面状态不影响生成。 */ }
     }
     function restoreSavedMedia() {
+        mergeIndex.clear();
+        for (const record of node.properties?.ad_h3_merge_index || []) rememberMergeRecord(record);
         hiddenStrips.clear();
         for (const key of node.properties?.ad_h3_hidden_strips || []) hiddenStrips.add(String(key));
         const strips = node.properties?.ad_h3_strip_previews;
@@ -1549,7 +1709,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         renderRecords(merges, stripStore.merged, "merged");
         const saved = node.properties?.ad_h3_media_records;
         if (!saved || typeof saved !== "object") {
-            renderRecords(segments, stripStore.segment, "segment");
+            renderRecords(segments, stripStore.segment.filter(record => record.role !== "B"), "segment");
+            renderRecords(segmentsB, stripStore.segment.filter(record => record.role === "B"), "segmentB");
             return;
         }
         for (const kind of ["image", "audio", "video"]) {
@@ -1562,22 +1723,39 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl) {
         syncStripFromMedia();
         setTab(node.properties?.ad_h3_active_tab || "image", {sync: false});
     }
+    for (const record of node.properties?.ad_h3_merge_index || []) rememberMergeRecord(record);
     // 初始就是空闲态：两排缩略图先给出“暂无”提示，避免只显示空行。
     syncStripFromMedia();
     renderRecords(merges, stripStore.merged, "merged");
     renderMedia("image");
     renderMedia("audio");
     setTab(node.properties?.ad_h3_active_tab || (mediaRecords.image.length ? "image" : mediaRecords.audio.length ? "audio" : "image"), {sync: false});
+    const onFullscreenChange = () => {
+        if (disposed) return;
+        const screen = root.querySelector(".ad-h3-screen"), current = document.fullscreenElement;
+        const owned = !!current && (current === screen || screen.contains(current));
+        for (const button of root.querySelectorAll("[data-fullscreen],[data-ab-fullscreen]")) {
+            button.textContent = owned ? "退出全屏" : "全屏";
+            button.setAttribute("aria-label", owned ? "退出全屏" : "全屏预览");
+            button.setAttribute("aria-pressed", String(owned));
+        }
+        requestAnimationFrame(() => { if (!disposed) applyAB(); });
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    onFullscreenChange();
     return {show, updateState, receive, restoreLegacy, restoreSavedMedia, getTab: () => activeTab,
+        selectedSegment: () => (redoTarget && Number(redoTarget.segment_index) > 0 ? Number(redoTarget.segment_index) : 0),
+        resumeTarget: () => resumeTarget ? {...resumeTarget} : null,
+        consumeResumeTarget(){resumeTarget = null;},
         clearPin(){ previewPinned = false; }, get revision(){return revision;},
-        dispose(){disposed=true; setPlaylistEnabled(false); setIdle(true); video.pause(); video.removeAttribute("src"); video.load(); cards.clear();}};
+        dispose(){disposed=true; document.removeEventListener("fullscreenchange",onFullscreenChange); window.removeEventListener("keydown",onPreviewEscape,true); setPlaylistEnabled(false); setIdle(true); video.pause(); video.removeAttribute("src"); video.load(); cards.clear();}};
 }
 
 export function mountNativePlayer(node, api) {
     if (node._adH3Preview) return;
     const root = document.createElement("div");
     const url = (route, origin, file) => api.apiURL(`/aiden_h3/${route}/${origin}/${file.split("/").map(encodeURIComponent).join("/")}`);
-    node._adH3Preview = createNativePlayer(node,root,(origin,file)=>url("media",origin,file),(origin,file)=>url("thumbnail",origin,file));
+    node._adH3Preview = createNativePlayer(node,root,(origin,file)=>url("media",origin,file),(origin,file)=>url("thumbnail",origin,file),api);
     const legacy = node.widgets?.find(widget=>widget.name==="video_oasis_ui");
     if (legacy) {legacy.type="hidden"; legacy.computeSize=()=>[0,-4];}
     const height = () => Math.max(300,root.querySelector(".ad-h3-preview-layout").scrollHeight+24)+20;

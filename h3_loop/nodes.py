@@ -12,7 +12,7 @@ from .storage import ROOT, STORE, digest
 from .spec import (ASPECT_CHOICES, DEFAULT_ASPECT, DEFAULT_MEGAPIXELS, FPS, MEGAPIXEL_CHOICES,
                        resolve_canvas, validate_fps)
 from .timeline import (EMPTY_TIMELINE, MAX_AUDIO_PORTS, MAX_IMAGE_PORTS, MAX_VIDEO_PORTS,
-                       audio_pieces, clip_span, loop_settings, reference_pack, source_pieces, timeline_identity, timeline_plan)
+                       audio_pieces, clip_span, loop_settings, output_timeline, reference_pack, source_pieces, timeline_identity, timeline_plan)
 from .video import check_alignment, video_identity, video_plan, video_window
 from .continuum import (
     continuum_available, continuum_node, continuum_status_report,
@@ -566,7 +566,7 @@ def _reference_video_audio(state, number, lane, sources, start, end):
             lo, hi = max(start, clip_span(clip)[0]), min(end, clip_span(clip)[1])
             source = sources[clip["source"]]
             flags = (state.get("muted_tracks") or {}).get("video_tracks") or []
-            if hi <= lo or (source.get("muted") and number >= len(flags)):
+            if hi <= lo or clip.get("audio_muted") or (source.get("muted") and number >= len(flags)):
                 continue
             path = assets.resolve_source(_original_source(source))
             if not assets.has_audio_stream(path):
@@ -594,7 +594,7 @@ def _video_clip_audio(state, number, clip, source_map):
     span = max(1, round((float(clip["src_out"]) - float(clip["src_in"])) * rate))
     result = torch.zeros((1, 2, span))
     flags = (state.get("muted_tracks") or {}).get("video_tracks") or []
-    if number < len(flags) and bool(flags[number]):
+    if clip.get("audio_muted") or (number < len(flags) and bool(flags[number])):
         return {"waveform": result, "sample_rate": rate}
     path = assets.resolve_source(_original_source(source))
     if not assets.has_audio_stream(path):
@@ -617,7 +617,7 @@ def _timeline_material_values(queue, used=None, index=None, window=None):
 
     used 为下游实际连接的输出口序号集合；未连接的口不加载素材（避免无谓解码）。
     """
-    state = queue.get("timeline") or {}
+    state = output_timeline(queue.get("timeline") or {})
     sources = state.get("sources") or []
     image_sources = [source for source in sources if source.get("kind") == "image"]
     image_scopes = {image.get("source"): image.get("segment", -1) for image in (state.get("images") or [])}
@@ -900,7 +900,7 @@ class AidenH3Segment:
     CATEGORY = CATEGORY
     DESCRIPTION = ("当前段（纯数据）：按分段清单的当前轮输出宽度/高度、正向/反向提示词、本轮图像/音频/视频与参考素材端口；"
                   "提示词用 # 每行一段并按轮取用。不接分段清单时进入独立模式：按提示词 # 段落数分段，可用段索引指定轮次，"
-                  "并配合预览与审核的分段循环逐段执行。")
+                  "并配合预览与分段循环逐段执行。")
 
     @classmethod
     def IS_CHANGED(cls, queue=None, aspect_ratio=DEFAULT_ASPECT, megapixels=DEFAULT_MEGAPIXELS,
@@ -914,10 +914,14 @@ class AidenH3Segment:
         negative_text = kwargs.get("反向提示词", negative_prompt)
         prefix_text = kwargs.get("统一提示词前缀", prompt_prefix)
         queue = queue or {}
-        state = queue.get("timeline") or {}
+        assets.PREPARED_MEDIA.trim()
+        state = output_timeline(queue.get("timeline") or {})
         entries = queue.get("entries") or []
         if not entries and state.get("generation_clips") == []:
             raise ValueError("时间线已清空，请导入素材或重新应用分段后生成")
+        if not entries and any(lane for key in ("video_tracks", "audio_tracks")
+                               for lane in (queue.get("timeline") or {}).get(key) or []):
+            raise ValueError("所有音视频轨道均已隐藏，请先开启需要输出的轨道")
         if not entries:
             # 独立模式：不接素材清单库时，按正向提示词的 # 段落数决定分段数量
             from .prompts import select_prompt
@@ -958,7 +962,7 @@ class AidenH3Segment:
             for size, count in zip(sizes, wanted):
                 total += min(size, count) if isinstance(count, int) and count >= 0 else size
             return fixed + tuple([None] * total) + (None,)
-        session_id = str(state.get("session_id") or (f"AD-H3-{unique_id}" if unique_id is not None else "AD-H3-session"))
+        session_id = str(kwargs.get("session_id") or state.get("session_id") or (f"AD-H3-{unique_id}" if unique_id is not None else "AD-H3-session"))
         fps = float(FPS)
         validate_fps(fps)
         aspect_ratio = str(aspect_ratio or DEFAULT_ASPECT)
@@ -1079,6 +1083,8 @@ class AidenH3Segment:
         except Exception:
             positive = str(body_text or "")
             negative = str(negative_text or "")
+        if session.get("preview_parent"):
+            context["preview_parent_session"] = session["preview_parent"]["session_id"]
         context["prompt_text"] = positive
         if batch_source: context["batch_mode"] = "source_files"
         fixed = (context, index, first_frame, window["frame_count"], fps,
@@ -1236,11 +1242,12 @@ class AidenH3PreviousFrames:
         selected=row.get("selected")
         version=next((v for v in (row.get("versions") or []) if selected and v.get("id")==selected),None)
         if version is None:
-            if state.get("preview_hold"):
+            if state.get("preview_hold") or state.get("preview_parent"):
                 return None,None,False
-            raise ValueError(f"第 {context['index']} 段没有可用的选中版本，无法读取前段尾帧，请先生成并批准前段")
+            raise ValueError(f"第 {context['index']} 段没有可用的选中版本，无法读取前段尾帧，请先生成前段")
         if not version.get("tail_file"):raise ValueError("前段缺少保真尾帧，请用当前版本重做前段")
-        data=np.load(contained(STORE.directory(context["session_id"]),version["tail_file"]),allow_pickle=False)
+        history_session = context.get("preview_parent_session") or context["session_id"]
+        data=np.load(contained(STORE.directory(history_session),version["tail_file"]),allow_pickle=False)
         # 本节点 frames 独立控制取多少尾帧；不再强制等于 Segment.overlap_frames。
         count = int(frames)
         if count < 1:
@@ -1267,7 +1274,7 @@ class AidenH3Commit:
     FUNCTION = "commit"
     OUTPUT_NODE = True
     CATEGORY = CATEGORY
-    DESCRIPTION = "保存当前段的选用版本、保真素材与同步信息，并交给视频预览审核。"
+    DESCRIPTION = "保存当前段的选用版本、保真素材与同步信息，并交给视频预览。"
 
     def commit(self, video, context, strict_sync=True, prompt_text="", prompt=None):
         session_id, token = context["session_id"], context["token"]
@@ -1313,13 +1320,15 @@ class AidenH3VideoPreview:
     FUNCTION = "preview"
     OUTPUT_NODE = True
     CATEGORY = CATEGORY
-    DESCRIPTION = "预览与审核：可接图像、音频、视频；分段、合并条与版本对比共用同一播放器。"
+    DESCRIPTION = "分段预览：可接图像、音频、视频；分段、合并条与版本对比共用同一播放器。"
 
     def preview(self, media=None, context=None, video_oasis_ui="{}", save_config="{}", prompt=None, extra_pnginfo=None, 对比媒体=None, compare_media=None):
         compare_media = 对比媒体 if 对比媒体 is not None else compare_media
+        primary_role = "A"
         # 媒体A为空、媒体B有内容时：把 B 当作主媒体处理（A 可以空着）
         if media is None and compare_media is not None:
             media, compare_media = compare_media, None
+            primary_role = "B"
         try:
             import json as _json
             preview_config = _json.loads(save_config) if isinstance(save_config, str) and save_config.strip() else {}
@@ -1336,7 +1345,7 @@ class AidenH3VideoPreview:
                     save_index = 1
             only = self._preview_single(compare_media, context, "{}", save_config, prompt, extra_pnginfo, save_index=save_index)
             for record in only["ui"].get("h3_preview") or []:
-                record.setdefault("role", "A")
+                record["role"] = "B"
                 record["segment_index"] = save_index
             only["ui"]["h3_preview"] = only["ui"].get("h3_preview") or []
             only["result"] = (media,)
@@ -1344,7 +1353,7 @@ class AidenH3VideoPreview:
         result = self._preview_single(media, context, video_oasis_ui, save_config, prompt, extra_pnginfo)
         records = result["ui"].get("h3_preview") or []
         for record in records:
-            record.setdefault("role", "A")
+            record["role"] = primary_role
         if compare_media is not None:
             save_index = 1
             if isinstance(context, dict) and context.get("token"):
@@ -1356,6 +1365,10 @@ class AidenH3VideoPreview:
             for record in second["ui"].get("h3_preview") or []:
                 record["role"] = "B"
                 record["segment_index"] = save_index
+                if isinstance(context, dict) and context.get("session_id"):
+                    record["session_id"] = context.get("preview_parent_session") or context["session_id"]
+                    if context.get("segment_key"):
+                        record["segment_key"] = context["segment_key"]
                 records.append(record)
         result["ui"]["h3_preview"] = records
         return result
@@ -1436,6 +1449,11 @@ class AidenH3VideoPreview:
         if loop_context and record is None:
             raise ValueError("当前段没有可记录的媒体结果，请检查预览输入连线")
         if record and loop_context:
+            record["session_id"] = loop_context.get("preview_parent_session") or loop_context["session_id"]
+            if loop_context.get("segment_key"):
+                record["segment_key"] = loop_context["segment_key"]
+            if loop_context.get("preview_parent_session"):
+                record["preview_only"] = True
             # 预览卡片据此识别所属段：点选预览后“重置抽卡”可只重抽该段。
             try:
                 record["segment_index"] = int(loop_context.get("index", 0)) + 1
@@ -1543,7 +1561,7 @@ class AidenH3MergedVideo:
         from .storage import contained
         state=STORE.read(session_id)
         if not state.get("merged") or state["status"]!="completed":
-            raise ValueError("请先在视频预览侧完成审核与合并，再读取成片")
+            raise ValueError("请先在视频预览侧完成选择与合并，再读取成片")
         path=contained(STORE.directory(session_id),state["merged"])
         if not path.is_file():raise ValueError("合并视频文件缺失，请重新合并")
         video = VideoFromFile(str(path))
@@ -1666,11 +1684,11 @@ class AidenH3ContinuumPrepare:
         used = False
         index = int(context.get("index", 0))
         if index > 0:
-            previous = load_continuum_state(STORE.directory(context["session_id"]), index - 1)
+            previous = load_continuum_state(STORE.directory(context.get("preview_parent_session") or context["session_id"]), index - 1)
             if previous is None:
                 raise ValueError(
                     f"第 {index + 1} 段需要 Continuum 续段，但第 {index} 段没有入库状态。"
-                    "请确认上一段采样后接了「AD-续段存盘」，并审核通过。"
+                    "请确认上一段采样后接了「AD-续段存盘」，并完成生成。"
                 )
             used = True
         continuity_en = _join_continuity(continuity)
@@ -1769,15 +1787,39 @@ class AidenH3ContinuumRecall:
 
 
 
+class AidenH3RoundBlocked:
+    """内部保护节点：整轮设置准备失败时阻断执行，并给出可读原因。
+
+    由 rounds.prompt_handler 在无法安全准备本轮快照时写入排队副本；
+    正常 Workflow 不会使用。它让 ComfyUI 正常排队后在执行阶段报出真实原因，
+    而不是用未注册的假 class 让用户只看到“节点不存在”。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"reason": ("STRING", {"default": "", "multiline": True})}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "block"
+    OUTPUT_NODE = True
+    CATEGORY = CATEGORY
+    DESCRIPTION = "内部：整轮设置准备失败时停止执行并显示原因（不在正常流程中使用）。"
+
+    def block(self, reason=""):
+        raise ValueError("本轮排队被阻止：" + (str(reason or "").strip() or "未知原因"))
+
+
 NODE_CLASS_MAPPINGS = {
     "AidenH3AudioQueue": AidenH3AudioQueue,
     "AidenH3Segment": AidenH3Segment,
     "AidenH3VideoPreview": AidenH3VideoPreview,
+    "AD_RoundBlocked": AidenH3RoundBlocked,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AidenH3AudioQueue": "AD-素材准备",
     "AidenH3Segment": "AD-分段生成",
-    "AidenH3VideoPreview": "AD-预览审批",
+    "AidenH3VideoPreview": "AD-分段预览",
+    "AD_RoundBlocked": "AD-本轮排队保护（内部）",
 }
 
 

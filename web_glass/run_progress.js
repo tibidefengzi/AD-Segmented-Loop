@@ -45,12 +45,12 @@ export function setMaterialProgress(node, progress) {
 export function updateSessionProgress(viewer, segment, queue, state) {
     const total = state.segments?.length || 0;
     if (!total) return;
-    const index = Number(state.cursor) || 0;
+    const index = Number(state.execution?.index ?? state.cursor) || 0;
     const done = state.segments.filter(row => row.valid && row.accepted).length;
     const busy = ["queued", "running", "merging"].includes(state.status);
-    const names = {queued: "排队中", running: "处理中", merging: "合并中", review: "待审核",
+    const names = {queued: "排队中", running: "处理中", merging: "合并中", review: "已生成",
         paused: "已停止", error: "失败", completed: "已完成", ready: "待运行"};
-    const prefix = `第 ${index + 1}/${total} 段`;
+    const prefix = state.draft_trial ? `试跑第 ${index+1} 段` : `第 ${index + 1}/${total} 段`;
     const promptId = state.execution?.prompt_id || "";
     const previous = viewers.get(viewer);
     const sampling = busy && state.status !== "merging" && promptId && previous?.promptId === promptId ? previous.sampling : null;

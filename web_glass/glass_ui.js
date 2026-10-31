@@ -145,20 +145,21 @@ const CSS = `
 .ad-h3-ab-exit:hover{background:#324969!important}
 .ad-h3-ab-fullscreen{position:absolute;top:auto!important;bottom:8px;right:104px;z-index:8;min-height:26px;height:26px;padding:0 12px;font-size:12px;border-radius:6px;background:#23354fe6!important;border:1px solid #98a6ba!important;color:#f0f6ff!important;cursor:pointer;transform:scale(.65);transform-origin:right bottom}
 .ad-h3-ab-fullscreen:hover{background:#324969!important}
-.ad-h3-ab-overlay:fullscreen{width:100vw!important;height:100vh!important;aspect-ratio:auto!important;max-height:none!important;border-radius:0!important;background:#101826!important}
+.ad-h3-ab-overlay:fullscreen{width:100vw!important;height:100vh!important;aspect-ratio:auto!important;max-height:none!important;border-radius:0!important;background:#000!important}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-layer img{object-fit:contain}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-fullscreen,.ad-h3-ab-overlay:fullscreen .ad-h3-ab-exit{transform:none;bottom:16px;font-size:13px;height:32px;min-height:32px}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-fullscreen{right:150px}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-exit{right:24px}
 .ad-h3-ab-tag{position:absolute;top:8px;max-width:40%;padding:1px 6px;border-radius:4px;background:#000a;color:#fff;font:9px system-ui;z-index:4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
 .ad-h3-ab-tag.on{background:#376496!important;border:1px solid #a6c9ff;color:#fff}
-.ad-h3-ab-videos{position:absolute;inset:0 0 46px 0;display:grid;grid-template-columns:1fr 1fr;gap:6px;background:#202c41;z-index:1}
+.ad-h3-ab-videos{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:6px;background:#202c41;z-index:1}
 .ad-h3-ab-audios{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px;background:#202c41;z-index:2;box-sizing:border-box}
 .ad-h3-ab-acell{display:flex;align-items:center;justify-content:center;background:#202d41;border:1px solid #3a4c65;border-radius:8px;padding:10px}
 .ad-h3-ab-acell audio{width:100%}
 .ad-h3-ab-mode{position:absolute;top:auto!important;left:auto!important;bottom:8px;right:76px;z-index:8;min-height:26px;height:26px;padding:0 10px;font-size:12px;border-radius:6px;background:#23354fe6!important;border:1px solid #98a6ba!important;color:#f0f6ff!important;cursor:pointer;transform:scale(.65)!important;transform-origin:right bottom}
 .ad-h3-ab-vcell{position:relative;background:#1b2b46;overflow:hidden;border:1px solid #3a4c65;border-radius:6px}
-.ad-h3-ab-vcell video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#1b2b46}
+.ad-h3-video.aiden-h3 .ad-h3-ab-vcell video{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain!important;object-position:center center!important;background:#000}
+.ad-h3-video.aiden-h3 .ad-h3-ab-layer img{width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain!important;object-position:center center!important}
 .ad-h3-ab-controls{position:absolute;left:0;right:0;bottom:0;height:44px;display:flex;align-items:center;gap:6px;padding:6px 100px 6px 8px;background:#202d41e6;border-top:1px solid #3a4c65;z-index:3;box-sizing:border-box}
 .ad-h3-ab-controls input[type=range]{flex:1;min-width:80px}
 .ad-h3-ab-controls button{min-height:26px;height:26px;font-size:12px;padding:0 8px}
@@ -264,7 +265,7 @@ const CSS = `
 .ad-h3-video.aiden-h3 .ad-h3-player-controls [data-seek]{flex:1 1 90px;min-width:50px;width:auto}
 .ad-h3-video.aiden-h3.ad-h3-audio-mode [data-frame]{display:none}
 .ad-h3-video.aiden-h3 .ad-h3-strip-row{min-height:0!important;height:auto!important;padding:8px}
-.ad-h3-video.aiden-h3 .ad-h3-segments,.ad-h3-video.aiden-h3 .ad-h3-merges{min-height:0!important;align-items:flex-start;display:flex;flex-wrap:wrap!important;align-content:flex-start;overflow-x:hidden!important;overflow-y:visible!important}
+.ad-h3-video.aiden-h3 .ad-h3-segments,.ad-h3-video.aiden-h3 .ad-h3-segments-b,.ad-h3-video.aiden-h3 .ad-h3-merges{min-height:0!important;align-items:flex-start;display:flex;flex-wrap:wrap!important;align-content:flex-start;overflow-x:hidden!important;overflow-y:visible!important}
 .ad-h3-video.aiden-h3 button.ad-h3-preview-thumb{box-sizing:content-box!important;flex:0 0 160px!important;width:160px!important;min-width:160px!important;max-width:160px!important;height:auto!important;min-height:0!important;max-height:none!important;padding:4px!important;display:flex!important;flex-direction:column;overflow:hidden}
 .ad-h3-video.aiden-h3 button.ad-h3-preview-thumb>img,.ad-h3-video.aiden-h3 button.ad-h3-preview-thumb>video{width:160px!important;height:90px!important;min-height:90px!important;max-height:90px!important;aspect-ratio:16/9;object-fit:contain;flex:0 0 90px}
 .ad-h3-video.aiden-h3 button.ad-h3-preview-thumb>span{display:block;line-height:22px;min-height:22px;width:100%;text-align:center}

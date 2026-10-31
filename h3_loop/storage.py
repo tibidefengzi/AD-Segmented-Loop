@@ -45,15 +45,15 @@ ROOT = default_root()
 def blocked_state_message(status) -> str:
     """按会话状态给出准确的中文阻止原因，避免把“本轮已完成”误报成“待审核”。"""
     if status == "completed":
-        return ("本轮全部段已通过并完成，不能再次开始；若要重新划分轮次，请在预览审批点"
+        return ("本轮全部段已通过并完成，不能再次开始；若要重新划分轮次，请在分段预览点"
                 "『清空全部进度』（二次确认，保留文件与分段），或重做其中一段；不会自动清空进度")
     if status in {"queued", "running"}:
         return "当前段有任务正在运行或排队，请等待本段完成或点停止；不会自动清空进度"
     if status == "review":
-        return "当前段有待审核结果，请先在预览审批点通过或重做；不会自动清空进度"
+        return "当前段已有生成结果，请点开始/分段循环继续；不会自动清空进度"
     if status == "merging":
         return "片段正在合并，请等待合并完成；不会自动清空进度"
-    return f"当前会话状态为 {status or '未知'}，无法开始新的分段；请在预览审批处理后再运行；不会自动清空进度"
+    return f"当前会话状态为 {status or '未知'}，无法开始新的分段；请在分段预览处理后再运行；不会自动清空进度"
 _LOCKS: dict[str, threading.RLock] = {}
 _GUARD = threading.Lock()
 _MIGRATING = False
@@ -177,7 +177,7 @@ class SessionStore:
         with _GUARD:
             return _LOCKS.setdefault(key, threading.RLock())
 
-    def _load(self, session_id):
+    def state_path(self, session_id):
         path = self.directory(session_id) / "progress.json"
         if not path.is_file():
             for root in data_roots()[1:]:
@@ -185,7 +185,19 @@ class SessionStore:
                 if candidate.is_file():
                     path = candidate
                     break
-        with path.open(encoding="utf-8") as handle:
+        return path
+
+    def read_if_changed(self, session_id, etag=None):
+        with self.lock(session_id):
+            path = self.state_path(session_id)
+            stamp = path.stat()
+            revision = '"' + digest([str(path), stamp.st_mtime_ns, stamp.st_size]) + '"'
+            if etag == revision:
+                return None, revision
+            return self._load(session_id), revision
+
+    def _load(self, session_id):
+        with self.state_path(session_id).open(encoding="utf-8") as handle:
             state = json.load(handle)
         if state.get("schema") != 1:
             raise ValueError("不支持的进度格式，请使用对应版本插件")
@@ -346,7 +358,16 @@ class SessionStore:
                 state = {"schema": 1, "id": session_id, "cursor": 0, "epoch": 0,
                          "status": "ready", "auto": False, "pause_after": False,
                          "segments": [], "active": None, "merged": None, "error": ""}
+            if state.get("execution_round") or state.get("draft_trial"):
+                return copy.deepcopy(state)
             old = state["segments"]
+            # 完全未变化的同步不重写进度，也不进入范围匹配；关键变更仍原子持久化。
+            if (len(old) == len(entries) == len(signatures) and all(row.get("segment_key") for row in old)
+                    and (not state.get("active") or (state["active"].get("segment_key") and state["active"].get("entry_snapshot")))
+                    and all(row.get("entry") == entry and row.get("signature") == signature
+                            for row, entry, signature in zip(old, entries, signatures))
+                    and (template is None or state.get("template") == template)):
+                return copy.deepcopy(state)
             for row in old:
                 row.setdefault("segment_key", uuid.uuid4().hex)
             self._bind_active(state)
@@ -440,7 +461,7 @@ class SessionStore:
             # 纯预览模式（没有生成版本）不做前段依赖阻断，按轮依次预览素材
             if not row.get("versions"):
                 return None
-            raise ValueError("前一段尚未通过或依赖已失效，请先处理前段")
+            raise ValueError("前一段尚未生成或依赖已失效，请先处理前段")
         return row["selected"]
 
     def reserve(self, session_id):
@@ -475,11 +496,16 @@ class SessionStore:
     def _reset_round(self, state):
         """清空本轮进度（保留分段、素材、提示词与已生成文件），回到第 1 段待生成。"""
         self._invalidate(state, 0)
+        if state.get("execution_round"):
+            state["resume_round"] = copy.deepcopy(state["execution_round"])
+        state.pop("execution_round", None)
+        state.pop("draft_trial", None)
         state.pop("preview_hold", None)
         state.pop("sequential_stop", None)
         state.pop("run_return", None)
         state.pop("affected_run", None)
         state.pop("run_origins", None)
+        state.pop("draft_candidates", None)
         for row in state["segments"]:
             row["selected"] = None
             row["reroll"] = 0
@@ -653,7 +679,10 @@ class SessionStore:
             if self._restore_preview_hold(state, successful=True):
                 return self._save(state)
             state["status"] = "review"
-            if state["auto"] and not state["pause_after"]:
+            if state.get("auto_accept") and not state.get("pause_after"):
+                # 生成即通过：新界面不再需要「同意批准」步骤，完成后自动通过并前进一段。
+                self._accept(state)
+            elif state["auto"] and not state["pause_after"]:
                 self._accept(state)
             elif state["pause_after"]:
                 state["status"] = "paused"
@@ -691,7 +720,7 @@ class SessionStore:
             row["versions"].append(version)
             row["selected"] = version["id"]
             row["valid"] = True
-            row["accepted"] = False
+            row["accepted"] = bool(state.get("auto_accept"))
             row["boundary_changed"] = False
             if not current:
                 row["valid"] = False
@@ -702,11 +731,18 @@ class SessionStore:
             if matched:
                 state["active"] = None
                 if not self._restore_preview_hold(state, successful=True):
-                    state["status"] = "review"
+                    if state.get("auto_accept"):
+                        current_row = state["segments"][state["cursor"]]
+                        if current_row.get("valid") and current_row.get("selected"):
+                            self._accept(state)
+                        else:
+                            state["status"] = "ready"
+                    else:
+                        state["status"] = "review"
             else:
                 # 停止/改参数/中断后才到达的结果：只追加版本并等待审核，不动当前运行状态。
                 state["error"] = ""
-                if state["status"] not in {"queued", "running"} and not state.get("preview_hold"):
+                if not state.get("auto_accept") and state["status"] not in {"queued", "running"} and not state.get("preview_hold"):
                     state["status"] = "review"
                 self._restore_preview_hold(state, successful=True)
             return self._save(state)
@@ -912,7 +948,7 @@ class SessionStore:
                     self._reset_round(state)
                 row = state["segments"][state["cursor"]]
                 if row["valid"] and row["selected"]:
-                    raise ValueError("当前段已有待审核结果，请选择通过、重做或自动完成")
+                    raise ValueError("当前段已有生成结果，请选择开始、重做或分段循环")
                 state.update(status="ready", auto=False, pause_after=False)
             else:
                 raise ValueError("未知操作")
@@ -935,7 +971,7 @@ class SessionStore:
             selected = next((v for v in row["versions"] if v["id"] == row["selected"]), None)
             # 进度只增不减：允许不同参数下生成的版本继续合并，只要求该段有已通过的有效选用。
             if not row["valid"] or not row["accepted"] or not selected:
-                raise ValueError("仍有未通过或依赖失效的片段，暂不能合并")
+                raise ValueError("仍有未生成或依赖失效的片段，暂不能合并")
             path = self.session_file(state["id"], selected["file"])
             if not path.is_file():
                 raise ValueError("选用版本文件缺失，请重做对应段")

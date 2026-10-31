@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from collections import OrderedDict
 from threading import RLock
@@ -31,6 +32,8 @@ class PreparedMediaCache:
         self.lock = RLock()
         self.epoch = 0
         self.signatures = OrderedDict()
+        self.touched = {}
+        self.clock = time.monotonic
 
     @staticmethod
     def size(value, seen=None):
@@ -53,11 +56,13 @@ class PreparedMediaCache:
     def get(self, key, loader, allow_large=False):
         with self.lock:
             if key in self.entries:
+                self.touched[key] = self.clock()
                 self.hits += 1
                 value, size = self.entries[key]
                 self.entries.move_to_end(key)
                 return value
             if self.large is not None and self.large[0] == key:
+                self.touched[key] = self.clock()
                 self.hits += 1
                 return self.large[1]
             pending = self.pending.get(key)
@@ -76,12 +81,16 @@ class PreparedMediaCache:
                 if value is not None and epoch == self.epoch:
                     if size > self.budget:
                         if allow_large:
+                            if self.large is not None: self.touched.pop(self.large[0], None)
                             self.large = (key, value, size)
+                            self.touched[key] = self.clock()
                     else:
                         self.entries[key] = (value, size)
+                        self.touched[key] = self.clock()
                         self.bytes += size
                         while self.bytes > self.budget or len(self.entries) > self.limit:
-                            _, (_, evicted) = self.entries.popitem(last=False)
+                            evicted_key, (_, evicted) = self.entries.popitem(last=False)
+                            self.touched.pop(evicted_key, None)
                             self.bytes -= evicted
                 pending.set_result(value)
             return value
@@ -93,6 +102,24 @@ class PreparedMediaCache:
                 if self.pending.get(key) is pending:
                     self.pending.pop(key, None)
 
+    def trim(self, keep_recent=8, max_age=120):
+        """任务边界回收旧缓存；仍被执行器持有的对象按Python引用规则继续有效。"""
+        with self.lock:
+            now = self.clock()
+            before = self.bytes + (self.large[2] if self.large else 0)
+            for key in list(self.entries):
+                if key in self.pending:
+                    continue
+                if (len(self.entries) > keep_recent or self.bytes > self.budget // 2
+                        or now - self.touched.get(key, now) >= max_age):
+                    _, size = self.entries.pop(key)
+                    self.bytes -= size
+                    self.touched.pop(key, None)
+            if self.large and self.large[0] not in self.pending:
+                self.touched.pop(self.large[0], None)
+                self.large = None
+            return {"cache_bytes_before": before, "cache_bytes_after": self.bytes}
+
     def clear(self):
         with self.lock:
             self.epoch += 1
@@ -100,6 +127,7 @@ class PreparedMediaCache:
             self.pending.clear()
             self.large = None
             self.bytes = 0
+            self.touched.clear()
 
     def bind(self, owner, signature):
         with self.lock:
