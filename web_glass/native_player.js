@@ -1,4 +1,5 @@
 import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261031-fullscreen-v27";
+import { retainedHistoryRounds, previewHistoryGroups } from "./preview_history.js?v=20261101-history-v46";
 import { interruptOwnedPrompt } from "./queue_runner.js?v=20261031-integrity-v36";
 // 所有入口共用进入/退出切换；状态以浏览器fullscreenElement为准（包括Esc退出）。
 export async function togglePlayerFullscreen(target) {
@@ -578,12 +579,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const mediaRecords = {image: [], audio: [], video: []};
     // 预览分类卡片按 (kind, origin, file) 复用 DOM：新结果只追加/更新一张卡，不重建整表。
     const mediaCards = {image: new Map(), audio: new Map(), video: new Map()};
-    // 内存里最多展示 200 条结果卡片（落盘仍按现有 60 条规则），避免抽卡很多轮后单次刷新构建过多 DOM。
+    // 每页最多绘制200条；完整历史按最近10组保留，显示限额不截断历史。
     const MEDIA_DISPLAY_LIMIT = 200;
     const mediaCardKey = (kind, record) => `${kind}|${record?.origin || "media"}|${record?.file || ""}`;
     const trimMediaRecords = kind => {
-        const list = mediaRecords[kind];
-        if (list.length > MEDIA_DISPLAY_LIMIT) list.splice(0, list.length - MEDIA_DISPLAY_LIMIT);
+        enforceHistoryRetention();
     };
     // 合并同类卡片触发的节点高度重算，每轮渲染只安排一次。
     let mediaResizeToken = 0;
@@ -608,16 +608,55 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     );
     const persistHiddenStrips = () => {
         node.properties ||= {};
-        node.properties.ad_h3_hidden_strips = [...hiddenStrips].slice(-300);
+        node.properties.ad_h3_hidden_strips = [...hiddenStrips];
     };
     const stripRecords = {segment: [], segmentB: [], merged: []};
     // 「合并片段」Ctrl 多选：只合并选中的同来源片段；不选则按合并来源合并全部段最新结果。
     const mergeSelection = new Map();
+    let processingRecord = null;  // 单选仅跟随手动点击，自动到达的新结果不抢目标。
+    // 轮次：后端 state.round_no 是“逻辑轮次”（只有完成后再开始/清空重置才 +1；
+    // 续跑、运行此段、抽卡都不变）。roundMap 仅用于兼容没有 round_no 的旧会话。
+    const roundMap = new Map((node.properties?.ad_h3_round_map || [])
+        .filter(item => item && item.id).map(item => [String(item.id), Number(item.no) || 0]));
+    let showHistoryRounds = !!node.properties?.ad_h3_show_history;
+    const expandedHistoryRounds = new Set(node.properties?.ad_h3_expanded_rounds || []);
+    const historyPages = new Map(), mediaPages = {image:0,audio:0,video:0};
+    const persistRoundMap = () => {
+        node.properties ||= {};
+        node.properties.ad_h3_round_map = [...roundMap.entries()].map(([id, no]) => ({id, no}));
+    };
+    const roundNoOf = id => (id ? (roundMap.get(String(id)) || 0) : 0);
+    const activeRoundId = () => String(node.properties?.ad_execution_round?.id
+        || latestSessionState?.execution_round?.id || "");
+    const activeRoundNo = () => {
+        const stored = Number(node.properties?.ad_h3_round_no) || 0;
+        if (stored) return stored;
+        const logical = Number(latestSessionState?.round_no) || 0;
+        if (logical) return logical;
+        return roundNoOf(activeRoundId());  // 旧会话兜底
+    };
+    const rememberRound = state => {
+        const logical = Number(state?.round_no) || 0;
+        if (logical) {
+            node.properties ||= {};
+            node.properties.ad_h3_round_no = logical;
+            return logical;
+        }
+        const id = String(state?.execution_round?.id || "");
+        if (!id) return activeRoundNo();
+        if (!roundMap.has(id)) {
+            const next = Math.max(0, ...[...roundMap.values()]) + 1;
+            roundMap.set(id, next);
+            persistRoundMap();
+        }
+        return roundMap.get(id);
+    };
+    const recordRoundNo = record => Number(record?.round_no) || 0;
     // 分段A/分段B/合并缩略图持久化：后台会话切换或重开后仍展示之前生成的缩略图。
     const stripStore = {segment: [], merged: []};
     // 完整合并索引每段每端只留最新视频；与限量显示的缩略图历史分开。
     const mergeIndex = new Map();
-    const mergeIndexKey = record => `${record.role === "B" ? "B" : "A"}:${Number(record.segment_index) || Number(record.serial) || 0}`;
+    const mergeIndexKey = record => `${record.role === "B" ? "B" : "A"}:${recordRoundNo(record)}:${Number(record.segment_index) || Number(record.serial) || 0}`;
     const rememberMergeRecord = (record, replace = true) => {
         if (!record?.file || inferMediaKind(record.file, record.kind) !== "video") return;
         const number = Number(record.segment_index) || Number(record.serial) || 0;
@@ -625,7 +664,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const key = mergeIndexKey(record);
         if (replace || !mergeIndex.has(key)) mergeIndex.set(key, {
             file:record.file, origin:record.origin || "media", kind:"video", segment_index:number,
-            role:record.role === "B" ? "B" : "A", label:record.label
+            role:record.role === "B" ? "B" : "A", label:record.label,
+            redraw:!!record.redraw, redraw_base:Number(record.redraw_base)||0,
+            redraw_count:Number(record.redraw_count)||0, serial:Number(record.serial)||0,
+            round_id: record.round_id || "", round_no: recordRoundNo(record)
         });
     };
     const persistMergeIndex = () => {node.properties.ad_h3_merge_index = [...mergeIndex.values()];};
@@ -633,17 +675,20 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     if (savedStrip && typeof savedStrip === "object") {
         for (const kind of ["segment", "merged"]) {
             if (Array.isArray(savedStrip[kind]))
-                stripStore[kind] = savedStrip[kind].filter(item => item && item.file).slice(-60);
+                stripStore[kind] = savedStrip[kind].filter(item => item && item.file);
         }
     }
     const persistStripPreviews = () => {
         node.properties ||= {};
-        const clean = list => list.slice(-60).map(({file, origin, label, kind, segment_index, role, session_id, segment_key}) =>
-            ({file, origin: origin || "session", label, kind, segment_index, role: role === "B" ? "B" : "A", session_id, segment_key}));
+        const clean = list => list.map(item => {
+            const {thumb_b64, thumb_mime, url, ...record} = item;
+            return {...record,origin:record.origin || "session",round_no:recordRoundNo(record)};
+        });
         node.properties.ad_h3_strip_previews = {segment: clean(stripStore.segment), merged: clean(stripStore.merged)};
     };
     // 「分段生成A/B」按生成历史展示：A/B 输入端口各一排，所有结果都保留；合并生成单独一排。
     const syncStripFromMedia = () => {
+        enforceHistoryRetention();
         const history = [];
         for (const kind of ["image", "audio", "video"]) {
             for (const record of mediaRecords[kind]) {
@@ -654,6 +699,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     segment_index: Number(record.segment_index) || 0,
                     session_id: record.session_id, segment_key: record.segment_key,
                     serial: Number(record.serial) || 0,
+                    round_id: record.round_id || "", round_no: recordRoundNo(record),
                     redraw: !!record.redraw,
                     redraw_base: Number(record.redraw_base) || 0,
                     redraw_count: Number(record.redraw_count) || 0});
@@ -661,14 +707,18 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
         history.sort((a, b) => {
             const left = numberOrder(a), right = numberOrder(b);
-            return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
+            for (let i = 0; i < Math.max(left.length, right.length); i++) {
+                const diff = (left[i] || 0) - (right[i] || 0);
+                if (diff) return diff;
+            }
+            return 0;
         });
         // 兼容旧存档：已有完整索引不被较早的可见历史覆盖。
         const legacyLatest = new Map();
         for (const record of history) legacyLatest.set(mergeIndexKey(record), record);
         for (const record of legacyLatest.values()) rememberMergeRecord(record, false);
         persistMergeIndex();
-        stripStore.segment = history.slice(-60);
+        stripStore.segment = history;
         for (const key of [...mergeSelection.keys()])
             if (!stripStore.segment.some(record => keyOf(record) === key)) mergeSelection.delete(key);
         persistStripPreviews();
@@ -700,35 +750,39 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         for (const [pattern, kind] of kindPatterns) if (pattern.test(name)) return kind;
         return "video";
     };
-    // 卡片编号：普通结果用分段序号；本段抽卡结果用「原编号-第几次」显示（如 #02-1、#02-2）。
-    const numberOrder = record => {
-        const match = /(\d+)(?:-(\d+))?/.exec(String(record?.label || ""));
-        if (match) return [Number(match[1]), Number(match[2] || 0), Number(record?.serial) || 0];
-        const serial = Number(record?.serial) || 0;
-        return [serial || 1e9, 0, serial];
-    };
-    const displayedBase = record => {
-        const byLabel = /(\d+)(?:-(\d+))?/.exec(String(record?.label || ""));
-        return Number(record?.redraw_base) || (byLabel ? Number(byLabel[1]) : 0) || Number(record?.serial) || 0;
-    };
+    // 卡片编号：R{轮次}-{段号}，本段抽卡追加「-第几次」（如 R2-05、R2-05-1）。
+    // 排序按 [轮次, 段号, 抽卡次数, 流水号]；没有轮次信息的旧记录按第 0 轮处理。
+    const recordSegmentNo = record => Number(record?.segment_index) || Number(record?.serial) || 0;
+    const numberOrder = record => [
+        recordRoundNo(record),
+        recordSegmentNo(record),
+        record?.redraw ? (Number(record.redraw_count) || 1) : 0,
+        Number(record?.serial) || 0,
+    ];
+    const displayedBase = record => Number(record?.redraw_base) || recordSegmentNo(record) || Number(record?.serial) || 0;
     function placeRedrawRecord(kind, item) {
         const list = mediaRecords[kind];
         const at = list.indexOf(item);
         if (at >= 0) list.splice(at, 1);
         const base = Number(item.redraw_base) || 0;
+        const round = recordRoundNo(item);
         let insert = -1;
-        if (base) list.forEach((entry, index) => { if (numberOrder(entry)[0] === base) insert = index; });
+        if (base) list.forEach((entry, index) => {
+            if (recordRoundNo(entry) === round && recordSegmentNo(entry) === base) insert = index;
+        });
         if (insert >= 0) list.splice(insert + 1, 0, item);
         else list.push(item);
     }
     const recordLabel = (record, index) => {
+        const round = recordRoundNo(record);
+        const segment = recordSegmentNo(record) || (Number(index) + 1);
+        const prefix = round > 0 ? `R${round}-` : "#";
+        const base = String(segment).padStart(2, "0");
         if (record?.redraw && Number(record.redraw_base) > 0) {
-            const base = String(Number(record.redraw_base)).padStart(2, "0");
             const count = Number(record.redraw_count) > 0 ? Number(record.redraw_count) : 1;
-            return `#${base}-${count}`;
+            return `${prefix}${base}-${count}`;
         }
-        const serial = Number(record?.serial) > 0 ? Number(record.serial) : Number(index) + 1;
-        return `#${String(serial).padStart(2, "0")}`;
+        return `${prefix}${base}`;
     };
     let previewPinned = false;
     // 记录持久化到节点属性：重新打开工作流/刷新页面后仍能在分类里看到缩略图
@@ -736,18 +790,77 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     if (savedMedia && typeof savedMedia === "object") {
         for (const kind of ["image", "audio", "video"]) {
             if (Array.isArray(savedMedia[kind]))
-                mediaRecords[kind] = savedMedia[kind].filter(item => item && item.file).slice(-60)
+                mediaRecords[kind] = savedMedia[kind].filter(item => item && item.file)
                     .map((item, index) => ({...item, serial: item.redraw ? 0 : (Number(item.serial) > 0 ? Number(item.serial) : index + 1)}));
         }
     }
+    // 编号高水位单独持久化，不随删卡、清空预览或60条存档裁剪回收。
+    function rememberRedrawCounts() {
+        node.properties ||= {};
+        const saved = node.properties.ad_h3_redraw_counts;
+        const counts = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+        for (const kind of ["image", "audio", "video"]) {
+            for (const entry of mediaRecords[kind]) {
+                if (!entry.redraw) continue;
+                const key = `${kind}:${recordRoundNo(entry)}:${Number(entry.redraw_base) || Number(entry.segment_index) || 0}`;
+                counts[key] = Math.max(0, Number(counts[key]) || 0, Number(entry.redraw_count) || 0);
+            }
+        }
+        node.properties.ad_h3_redraw_counts = counts;
+        return counts;
+    }
+    rememberRedrawCounts();
     const persistMedia = () => {
         node.properties ||= {};
-        const strip = list => list.slice(-60).map(item => {
+        rememberRedrawCounts();
+        const strip = list => list.map(item => {
             const {thumb_b64, thumb_mime, ...rest} = item;
             return rest;
         });
         node.properties.ad_h3_media_records = {image: strip(mediaRecords.image), audio: strip(mediaRecords.audio), video: strip(mediaRecords.video)};
     };
+    function enforceHistoryRetention() {
+        const all = [...Object.values(mediaRecords).flat(), ...stripStore.segment, ...stripStore.merged,
+            ...mergeIndex.values(), ...(node.properties.ad_h3_merged_previews || [])];
+        const keep = retainedHistoryRounds(all, activeRoundNo());
+        for (const kind of ["image","audio","video"]) mediaRecords[kind] = mediaRecords[kind].filter(record => keep.has(recordRoundNo(record)));
+        stripStore.segment = stripStore.segment.filter(record => keep.has(recordRoundNo(record)));
+        stripStore.merged = stripStore.merged.filter(record => keep.has(recordRoundNo(record)));
+        for (const [key,record] of mergeIndex) if (!keep.has(recordRoundNo(record))) mergeIndex.delete(key);
+        node.properties.ad_h3_merged_previews = (node.properties.ad_h3_merged_previews || []).filter(record => keep.has(recordRoundNo(record)));
+        for (const round of expandedHistoryRounds) if (!keep.has(round)) expandedHistoryRounds.delete(round);
+        node.properties.ad_h3_expanded_rounds = [...expandedHistoryRounds];
+    }
+    function restoreHistoryRecords() {
+        // 只用仍保存的精确文件索引兜底；不扫描磁盘猜轮号，不复活已删除项。
+        const known = new Set(Object.values(mediaRecords).flat().map(record => `${record.origin || "media"}/${record.file}`));
+        for (const record of [...stripStore.segment,...mergeIndex.values()]) {
+            const origin = record.origin || "session", key = `${origin}/${record.file}`;
+            if (!record.file || known.has(key) || hiddenStrips.has(`segment:${key}`) || hiddenStrips.has(`segmentB:${key}`)) continue;
+            const kind = inferMediaKind(record.file,record.kind);
+            mediaRecords[kind].push({...record,origin,kind,serial:record.redraw?0:Number(record.serial)||Number(record.segment_index)||0});
+            known.add(key);
+        }
+        if (showHistoryRounds) {
+            for (const record of Object.values(mediaRecords).flat()) if (recordRoundNo(record)!==activeRoundNo()) expandedHistoryRounds.add(recordRoundNo(record));
+            showHistoryRounds = false;
+            node.properties.ad_h3_show_history = false;
+        }
+        enforceHistoryRetention();
+        persistMedia();
+    }
+    function appendHistoryPager(target,group,refresh) {
+        if (group.all.length <= MEDIA_DISPLAY_LIMIT || !group.open) return;
+        const pager = document.createElement("div");
+        pager.className = "ad-h3-history-control ad-h3-history-page";
+        pager.style.cssText = "display:flex;gap:8px;align-items:center;flex-basis:100%;grid-column:1/-1;width:100%;padding:4px 0";
+        for (const [text,delta] of [["上一页",-1],["下一页",1]]) {
+            const button = document.createElement("button");button.textContent=text;
+            button.disabled = delta<0 ? group.page===0 : (group.page+1)*MEDIA_DISPLAY_LIMIT>=group.all.length;
+            button.onclick = event => {event.stopPropagation();historyPages.set(group.key,group.page+delta);refresh();};pager.append(button);
+        }
+        const text=document.createElement("span");text.textContent=`第 ${group.page+1} / ${Math.ceil(group.all.length/MEDIA_DISPLAY_LIMIT)} 页`;pager.append(text);target.append(pager);
+    }
     // 工作流没存过分段缩略图时，用已保存的媒体记录兜底，保证重新打开后预览区仍有历史缩略图。
     if (!stripStore.segment.length && !stripStore.merged.length) {
         const fallback = [];
@@ -758,10 +871,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     label: record.label || (Number(record.serial) > 0 ? `第 ${record.serial} 段` : "历史生成"),
                     kind: record.kind || kind,
                     role: record.role === "B" ? "B" : "A",
+                    round_id: record.round_id || "", round_no: recordRoundNo(record),
                     segment_index: Number(record.segment_index) || Number(record.serial) || 0});
             }
         }
-        stripStore.segment = fallback.sort((a, b) => (a.segment_index || 0) - (b.segment_index || 0)).slice(-60);
+        stripStore.segment = fallback.sort((a, b) => (a.segment_index || 0) - (b.segment_index || 0));
     }
     let activeTab = node.properties?.ad_h3_active_tab || "image";
     function setTab(kind, options = {}) {
@@ -833,7 +947,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const list = mediaLists[kind];
         if (!list) return;
         const owned = mediaCards[kind];
-        const records = mediaRecords[kind];
+        const current = activeRoundNo();
+        const all = mediaRecords[kind].filter(record => !current || recordRoundNo(record)===current);
+        const page = Math.max(0,Math.min(mediaPages[kind],Math.ceil(all.length/MEDIA_DISPLAY_LIMIT)-1));
+        const records = all.slice(page*MEDIA_DISPLAY_LIMIT,(page+1)*MEDIA_DISPLAY_LIMIT);
         const wanted = new Set();
         records.forEach((record, index) => {
             const key = mediaCardKey(kind, record);
@@ -880,7 +997,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 event.stopPropagation();
                 clearRecordPreview(record, null);
             };
-            button.onclick = () => {
+            button.classList.toggle("merge-selected", mergeSelection.has(keyOf(record)));
+            button.onclick = event => {
+                if (event?.ctrlKey || event?.metaKey) {
+                    event.preventDefault(); event.stopPropagation();
+                    toggleMergeSelection(record, kind, record.role === "B" ? "B" : "A");
+                    return;
+                }
                 pickAB(record, kind);
                 show({...record, kind, label: recordLabel(record, index), url: mediaUrl(record.origin || "media", record.file)});
                 markActiveCard(record);
@@ -903,6 +1026,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             empty.textContent = kind === "image" ? "暂无图像" : kind === "video" ? "暂无视频" : "暂无音频";
             list.append(empty);
         } else if (empty) empty.remove();
+        for (const stale of list.querySelectorAll(".ad-h3-history-control")) stale.remove();
+        const pageKey=`media:${kind}`;historyPages.set(pageKey,page);
+        appendHistoryPager(list,{all,page,key:pageKey,open:true},()=>{mediaPages[kind]=historyPages.get(pageKey);renderMedia(kind);});
         const visible = mediaLists[kind]?.parentElement && !mediaLists[kind].parentElement.hidden;
         scheduleMediaResize(visible ? 200 : 240);
     }
@@ -922,6 +1048,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const kind = activeTab || "image";
         const names = {image: "图片", audio: "音频", video: "视频"};
         const sameKind = record => inferMediaKind(record?.file, record?.kind) === kind;
+        if (processingRecord && sameKind(processingRecord)) processingRecord = null;
         const stripMatches = ["segment", "segmentB", "merged"].flatMap(key => {
             const source = key === "segment" ? [...stripStore.segment.filter(record => record.role !== "B"), ...stripRecords.segment]
                 : key === "segmentB" ? [...stripStore.segment.filter(record => record.role === "B"), ...stripRecords.segmentB]
@@ -1099,7 +1226,14 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     function playlistVideos() {
         return stripStore.segment.filter(record => inferMediaKind(record.file,record.kind)==="video"
             && !hiddenStrips.has(stripKey("segment",record)))
-            .slice().sort((a,b)=>{const left=numberOrder(a),right=numberOrder(b);return left[0]-right[0]||left[1]-right[1]||left[2]-right[2];});
+            .slice().sort((a,b)=>{
+                const left=numberOrder(a),right=numberOrder(b);
+                for(let i=0;i<Math.max(left.length,right.length);i++){
+                    const diff=(left[i]||0)-(right[i]||0);
+                    if(diff) return diff;
+                }
+                return 0;
+            });
     }
     function setPlaylistEnabled(enabled) {
         playlistEnabled=!!enabled;
@@ -1251,7 +1385,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         // 显示内容与分类保持一致：显示视频/音频时切到对应分类，图片分类只显示图片。
         if (options.tabSynced !== true && activeTab !== category) setTab(category, {sync: false});
         // 只有用户手动点选预览才固定画面；自动结果默认不改变用户正在查看的内容（除非未被固定）。
-        if (options.auto !== true) previewPinned = true;
+        if (options.auto !== true) {
+            previewPinned = true;
+            mergeSelection.clear();
+            processingRecord = {...info, kind, label: info.label || recordLabel(info, 0)};
+            paintMergeSelection();
+        }
         video.pause(); audioView.pause(); revision++;
         active = {...info, kind, key: info.key || `${info.origin || "session"}/${info.file || info.url}`};
         lastShown[category] = {...active};
@@ -1330,7 +1469,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const stripKind = kind === "merged" ? "merged" : kind === "segmentB" ? "segmentB" : "segment";
         stripRecords[stripKind] = records;
         if (stripKind==="segment" && playlistEnabled && !playlistVideos().length) setPlaylistEnabled(false);
-        const visible = records.filter(record => !hiddenStrips.has(stripKey(stripKind, record)));
+        const allVisible = records.filter(record => !hiddenStrips.has(stripKey(stripKind, record)));
+        const currentRound = activeRoundNo();
+        const groups = stripKind === "merged"
+            ? previewHistoryGroups(allVisible.map(record=>({...record,round_no:-1})), -1, new Set(), historyPages, stripKind)
+                .map(group=>({...group,visible:allVisible.slice(group.page*MEDIA_DISPLAY_LIMIT,(group.page+1)*MEDIA_DISPLAY_LIMIT),all:allVisible,current:true}))
+            : previewHistoryGroups(allVisible,currentRound,expandedHistoryRounds,historyPages,stripKind);
+        const visible = groups.flatMap(group=>group.visible);
         const cardKey = record => `${stripKind}|${keyOf(record)}`;
         const wanted = new Set(visible.map(cardKey));
         for (const [key, button] of cards) if (button.parentElement === target && !wanted.has(key)) {button.remove(); cards.delete(key);}
@@ -1356,15 +1501,19 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             }
             if (!button) {
                 button = document.createElement("button"); button.type = "button"; button.className = "ad-h3-preview-thumb";
+                if (!button.style.position) button.style.position = "relative";
                 button.dataset.thumbKind = wantsImage ? "image" : "video";
                 const thumb = document.createElement("img");
                 thumb.alt = ""; thumb.loading = "lazy"; thumb.decoding = "async";
                 thumb.setAttribute("aria-hidden", "true");
                 const label = document.createElement("span");
+                const order = document.createElement("span");
+                order.className = "ad-h3-merge-order";
+                order.style.cssText = "position:absolute;left:2px;top:2px;min-width:16px;height:16px;line-height:16px;text-align:center;font-size:11px;font-weight:700;border-radius:8px;background:#ffcf4d;color:#111;padding:0 3px;display:none;pointer-events:none;z-index:2;";
                 const remove = document.createElement("span");
                 remove.className = "ad-h3-preview-remove"; remove.textContent = "×"; remove.title = "删除这条预览记录（不删除文件）";
                 remove.onclick = event => { event.stopPropagation(); hideStripRecord(stripKind, record); };
-                button.append(thumb, remove, label); cards.set(key, button);
+                button.append(thumb, remove, order, label); cards.set(key, button);
             }
             const thumbURL = record.thumb_b64
                 ? `data:${record.thumb_mime || "image/webp"};base64,${record.thumb_b64}`
@@ -1385,12 +1534,38 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     return;
                 }
                 pickAB({...record, kind: itemKind}, itemKind);
+                mergeSelection.clear();
+                processingRecord = {...record, kind: itemKind, label: record.label || recordLabel(record, 0)};
+                paintMergeSelection();
                 if (stripKind==="segment" && itemKind==="video" && playlistEnabled) playPlaylistRecord(record);
                 else show({...record, key: keyOf(record), kind: itemKind, url: mediaUrl(record.origin || "session",record.file)});
                 // 分段生成A/B缩略图：点选即成为「本段抽卡」目标（合并片段无段号，只预览）。
-                if (stripKind === "segment" || stripKind === "segmentB") setRedoTarget({...record, kind: itemKind}, button);
+                if (stripKind === "segment" || stripKind === "segmentB") {
+                    setRedoTarget({...record, kind: itemKind}, button);
+                    const current = activeRoundNo(), cardRound = recordRoundNo(record);
+                    if (current > 0 && cardRound > 0 && cardRound !== current) {
+                        // 历史轮卡片：续跑/抽卡只作用于当前轮，提示一下避免误解。
+                        node._adH3Hint?.(`这是第 ${cardRound} 轮的结果；点「分段循环」或「本段抽卡」会作用于当前第 ${current} 轮的第 ${recordSegmentNo(record)} 段`, true);
+                    }
+                }
             };
             target.append(button);
+        }
+        for (const stale of target.querySelectorAll(".ad-h3-history-control,.ad-h3-round-toggle")) stale.remove();
+        for (const group of groups) {
+            if (!group.current && stripKind!=="merged") {
+                const toggle=document.createElement("button");
+                toggle.className="ad-h3-round-toggle ad-h3-history-control";toggle.dataset.round=String(group.round);
+                toggle.setAttribute("aria-expanded",String(group.open));
+                toggle.style.cssText="flex-basis:100%;width:100%;text-align:left;margin:4px 0 2px;padding:3px 8px;font-size:12px;background:transparent;border:0;border-top:1px solid rgba(255,255,255,.16);cursor:pointer;color:inherit";
+                toggle.textContent=`${group.open?"▾":"▸"} ${group.round>0?`第 ${group.round} 组历史`:'旧版历史（轮号未记录）'} · ${group.all.length} 条`;
+                toggle.onclick=event=>{event.preventDefault();event.stopPropagation();if(expandedHistoryRounds.has(group.round))expandedHistoryRounds.delete(group.round);else expandedHistoryRounds.add(group.round);node.properties.ad_h3_expanded_rounds=[...expandedHistoryRounds];renderRecords(segments,stripStore.segment.filter(r=>r.role!=="B"),"segment");renderRecords(segmentsB,stripStore.segment.filter(r=>r.role==="B"),"segmentB");node.graph?.change?.();};
+                target.append(toggle);
+            }
+            for (const record of group.visible) {
+                const button=cards.get(cardKey(record));if(button)target.append(button);
+            }
+            appendHistoryPager(target,group,()=>renderRecords(target,records,kind));
         }
         markCards();
     }
@@ -1414,6 +1589,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             renderMedia(mediaKind);
         }
         if (same(redoTarget)) setRedoTarget(null,null);
+        if (same(processingRecord)) processingRecord = null;
         if (mergeSelection.delete(keyOf(canonical))) paintMergeSelection();
         stripStore.segment = stripStore.segment.filter(item => !same(item));
         stripStore.merged = stripStore.merged.filter(item => !same(item));
@@ -1445,24 +1621,51 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         node.setDirtyCanvas?.(true,true);
     }
     function hideStripRecord(kind,record) { clearRecordPreview(record,kind); }
-    // 合并多选：只允许视频；按显示编号（#05、#02-1…）排序后合并。
-    const mergeOrderKey = record => {
-        const match = /(\d+)(?:-(\d+))?/.exec(String(record?.label || ""));
-        return match ? [Number(match[1]), Number(match[2] || 0), Number(record?.serial) || 0] : [1e9, 0, Number(record?.serial) || 0];
-    };
+    // 合并多选：只允许视频，且必须同一轮；Ctrl 点击的先后顺序就是合并顺序。
+    const mergeOrderKey = record => [recordRoundNo(record), recordSegmentNo(record),
+        record?.redraw ? (Number(record.redraw_count) || 1) : 0, Number(record?.serial) || 0];
     function paintMergeSelection() {
-        for (const button of cards.values()) button.classList.toggle("merge-selected", mergeSelection.has(button._mergeKey));
+        const order = new Map();
+        let index = 0;
+        for (const key of mergeSelection.keys()) order.set(key, ++index);
+        for (const button of cards.values()) {
+            const selected = mergeSelection.has(button._mergeKey);
+            button.classList.toggle("merge-selected", selected);
+            const badge = button.querySelector(".ad-h3-merge-order");
+            if (!badge) continue;
+            const number = order.get(button._mergeKey);
+            badge.textContent = number ? String(number) : "";
+            badge.style.display = number ? "block" : "none";
+        }
+        for (const kind of ["image", "audio", "video"]) {
+            for (const button of mediaCards[kind].values()) {
+                button.classList.toggle("merge-selected", mergeSelection.has(`${button.dataset.origin || "media"}/${button.dataset.file}`));
+            }
+        }
     }
     function toggleMergeSelection(record, kind, role = "") {
-        if (kind !== "video") {
-            node._adH3Hint?.("只能选择视频片段进行合并", true);
-            return;
+        // 普通单选后Ctrl追加时，把原单选纳入同一选择集合；取消最后一项则为空。
+        if (!mergeSelection.size && processingRecord) {
+            const single = processingRecord;
+            mergeSelection.set(keyOf(single), {...single, kind: inferMediaKind(single.file,single.kind), merge_source: single.role === "B" ? "B" : "A"});
+            processingRecord = null;
         }
         const key = keyOf(record);
-        if (mergeSelection.has(key)) mergeSelection.delete(key);
-        else mergeSelection.set(key, {...record, kind: "video", merge_source: role || (record.role === "B" ? "B" : "A")});
+        if (mergeSelection.has(key)) {
+            mergeSelection.delete(key);
+        } else {
+            const round = recordRoundNo(record);
+            const other = [...mergeSelection.values()].find(item => recordRoundNo(item) !== round);
+            if (other) {
+                node._adH3Hint?.("不同轮次的片段不能一起合并，请只选同一轮的结果", true);
+                return;
+            }
+            mergeSelection.set(key, {...record, kind, label: recordLabel(record, 0), merge_source: role || (record.role === "B" ? "B" : "A")});
+        }
         paintMergeSelection();
-        node._adH3Hint?.(mergeSelection.size ? `已选中 ${mergeSelection.size} 个视频片段，点「合并片段」按序号合并` : "已取消合并选中", false);
+        node._adH3Hint?.(mergeSelection.size
+            ? `已按点击顺序选中 ${mergeSelection.size} 个片段（${[...mergeSelection.values()].map(item => recordLabel(item, 0)).join(" → ")}），点「合并片段」按此顺序合并`
+            : "已取消合并选中", false);
     }
     function numberMergedHistory(items) {
         let serial = 0;
@@ -1478,10 +1681,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         node.properties ||= {};
         const list = numberMergedHistory(Array.isArray(node.properties.ad_h3_merged_previews) ? node.properties.ad_h3_merged_previews : []);
         const serial = Math.max(Number(node.properties.ad_h3_merge_serial)||0, ...list.map(item=>Number(item.merge_serial)||0))+1;
-        const label = `${sourceTag || ""}合并 #${String(serial).padStart(2,"0")}`;
+        const roundNo = activeRoundNo();
+        const label = `${roundNo > 0 ? `R${roundNo} ` : ""}${sourceTag || ""}合并 #${String(serial).padStart(2,"0")}`;
         node.properties.ad_h3_merge_serial = serial;
-        list.push({session:currentSession||"media",file:source.file,origin:"media",label,merge_serial:serial});
-        node.properties.ad_h3_merged_previews = list.slice(-24);
+        list.push({session:currentSession||"media",file:source.file,origin:"media",label,merge_serial:serial,round_no:activeRoundNo(),round_id:activeRoundId()});
+        node.properties.ad_h3_merged_previews = list;
         const records = list.map((item, index) => item.origin === "media"
             ? {file: item.file, origin: "media", label: item.label || `合并片段 ${index+1}`, kind: inferMediaKind(item.file)}
             : {file: `${item.session}/${item.file}`, origin: "session", label: item.label || `合并片段 ${index+1}`, kind: inferMediaKind(item.file)});
@@ -1492,19 +1696,26 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         show({...source, kind: "video", label, url: mediaUrl(source.origin || "media", source.file)}, {auto: true});
     }
     async function mergeSelectedVideos(chosenSource) {
-        let selected = [...mergeSelection.values()].sort((left, right) => {
-            const a = mergeOrderKey(left), b = mergeOrderKey(right);
-            return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
-        });
+        // 按 Ctrl 点击的先后顺序合并（Map 的插入顺序），不再按编号重排。
+        let selected = [...mergeSelection.values()];
+        if (selected.some(record => inferMediaKind(record.file,record.kind) !== "video")) {
+            node._adH3Hint?.("原预览的合并片段仅支持视频；图片或音频可送入最终保存逐个加工。",true);
+            return;
+        }
         let sourceTag = "";
         if (selected.length) {
             if (selected.length < 2) {
-                node._adH3Hint?.("Ctrl 已选 1 个片段；再选一个，或取消选中后点「合并片段」合并全部段最新结果。", true);
+                node._adH3Hint?.("Ctrl 已选 1 个片段；再选一个，或取消选中后点「合并片段」合并当前轮全部段最新结果。", true);
                 return;
             }
             const sources = new Set(selected.map(item => item.merge_source === "B" ? "B" : "A"));
             if (sources.size > 1) {
                 node._adH3Hint?.("A、B 请分别合并：Ctrl 选中的片段只能来自同一边。", true);
+                return;
+            }
+            const rounds = new Set(selected.map(item => recordRoundNo(item)));
+            if (rounds.size > 1) {
+                node._adH3Hint?.("不同轮次的片段不能一起合并，请只选同一轮的结果", true);
                 return;
             }
             sourceTag = [...sources][0];
@@ -1513,12 +1724,14 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 return;
             }
         } else {
-            // 没点选片段：按点击的 A合并/B合并，合并该端全部段的最新结果。
+            // 没点选片段：按点击的 A合并/B合并，合并该端当前轮全部段的最新结果（按段号顺序）。
             sourceTag = chosenSource === "B" ? "B" : "A";
+            const currentRound = activeRoundNo();
             const latest = new Map();
             for (const record of mergeIndex.values()) {
                 if ((record.role === "B" ? "B" : "A") !== sourceTag) continue;
-                const number = Number(record.segment_index) || mergeOrderKey(record)[0];
+                if (currentRound > 0 && recordRoundNo(record) !== currentRound) continue;
+                const number = Number(record.segment_index) || 0;
                 if (number > 0) latest.set(number, record);
             }
             const total = Math.max(Number(latestSessionState?.segments?.length) || 0, ...latest.keys(), 0);
@@ -1538,7 +1751,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 return;
             }
         }
-        node._adH3Hint?.(`正在按序号合并 ${sourceTag} 端 ${selected.length} 个视频…`, false);
+        const orderText = mergeSelection.size
+            ? `按点击顺序（${selected.map(item => recordLabel(item, 0)).join(" → ")}）`
+            : "按段号顺序";
+        node._adH3Hint?.(`正在${orderText}合并 ${sourceTag} 端 ${selected.length} 个视频…`, false);
         try {
             const response = await fetch("/aiden_h3/merge_clips", {
                 method: "POST", headers: {"Content-Type": "application/json"},
@@ -1564,6 +1780,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     }
     function updateState(state) {
         if (disposed || !state?.id) return;
+        const previousRound = activeRoundNo();
         latestSessionState = {...state};
         if (currentSession && currentSession !== state.id) {
             video.pause(); video.removeAttribute("src"); video.load(); active = null; generationKey = "";
@@ -1576,15 +1793,23 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
         currentSession = state.id;
         node.properties ||= {};
+        rememberRound(state);
+        if (previousRound !== activeRoundNo()) {
+            expandedHistoryRounds.clear();historyPages.clear();
+            for (const kind of ["image","audio","video"]) mediaPages[kind]=0;
+            enforceHistoryRetention();persistMedia();persistMergeIndex();
+            syncStripFromMedia();
+            for (const kind of ["image","audio","video"]) renderMedia(kind);
+        }
         let merged = numberMergedHistory(Array.isArray(node.properties.ad_h3_merged_previews) ? node.properties.ad_h3_merged_previews : []);
         node.properties.ad_h3_merged_previews = merged;
         if (state.merged && !merged.some(item => item.session === state.id && item.file === state.merged)) {
-            merged = [...merged, {session: state.id, file: state.merged}].slice(-24);
+            merged = [...merged, {session: state.id, file: state.merged,round_no:activeRoundNo(),round_id:activeRoundId()}];
             node.properties.ad_h3_merged_previews = merged;
         }
         const liveMergedRecords = merged.map((item,index) => item.origin === "media"
-            ? {file:item.file,origin:"media",label:item.label||`合并片段 ${index+1}`,kind:inferMediaKind(item.file)}
-            : {file:`${item.session}/${item.file}`,origin:"session",label:item.label||`合并片段 ${index+1}`,kind:inferMediaKind(item.file)});
+            ? {...item,file:item.file,origin:"media",label:item.label||`合并片段 ${index+1}`,kind:inferMediaKind(item.file)}
+            : {...item,file:`${item.session}/${item.file}`,origin:"session",label:item.label||`合并片段 ${index+1}`,kind:inferMediaKind(item.file)});
         if (liveMergedRecords.length) {
             stripStore.merged = liveMergedRecords;
             persistStripPreviews();
@@ -1620,17 +1845,20 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             }
         }
     }
-    function markRedrawRecord(item, kind, record) {
+    function markRedrawRecord(item, kind, record, previous) {
         const pending = redrawPending || (record.preview_only && Number(record.segment_index) > 0
             ? {index:Number(record.segment_index),base:Number(record.segment_index),exact:true} : null);
         if (!(pending && (pending.index === Number(record.segment_index)
             || !pending.exact || !Number(record.segment_index)))) return false;
         const base = Number(pending.base) || Number(record.segment_index) || pending.index;
-        const used = mediaRecords[kind].filter(entry => entry !== item && entry.redraw
-            && Number(entry.redraw_base) === base).length;
+        const counts = rememberRedrawCounts();
+        const key = `${kind}:${recordRoundNo(item)}:${base}`;
+        const repeated = previous?.redraw && recordRoundNo(previous) === recordRoundNo(item)
+            && Number(previous.redraw_base) === base && Number(previous.redraw_count) > 0;
         item.redraw = true;
         item.redraw_base = base;
-        item.redraw_count = used + 1;
+        item.redraw_count = repeated ? Number(previous.redraw_count) : (Number(counts[key]) || 0) + 1;
+        counts[key] = Math.max(Number(counts[key]) || 0, item.redraw_count);
         item.serial = 0;  // 抽卡结果不占用正常生成的整数序号
         item.label = recordLabel(item, 0);
         redrawReview = Number(record.segment_index) || pending.index;
@@ -1645,6 +1873,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             else if (record?.auto_saved) node._adH3ReviewStatus?.(`已保存：${record.auto_saved}`);
         } catch (_error) {}
         if (!record?.file) return;
+        // 轮次标记：新结果属于「当前执行轮」，编号 R{轮}-{段} 与折叠分组都靠它。
+        rememberRound(latestSessionState);
+        record.round_id = record.round_id || activeRoundId();
+        record.round_no = Number(record.round_no) || activeRoundNo();
         node._adH3StandaloneReady = true;
         const kind = record.kind || "video";
         const label = kind === "image" ? "本次图像" : kind === "audio" ? "本次音频" : "本次生成片段";
@@ -1655,7 +1887,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             const index = mediaRecords[kind].findIndex(entry => entry.file === record.file && entry.origin === record.origin);
             if (index >= 0) mediaRecords[kind][index] = item; else mediaRecords[kind].push(item);
             // 本段抽卡结果：编号为「原编号-第几次」（黄色），并记录待继续的段号。
-            if (markRedrawRecord(item, kind, record)) placeRedrawRecord(kind, item);
+            if (markRedrawRecord(item, kind, record, existing)) placeRedrawRecord(kind, item);
             trimMediaRecords(kind);
             persistMedia();
             renderMedia(kind);
@@ -1672,7 +1904,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const item = {...record, label, kind: "video", serial: existingVideo?.serial || videoSerial};
         const index = mediaRecords.video.findIndex(entry => entry.file === record.file && entry.origin === record.origin);
         if (index >= 0) mediaRecords.video[index] = item; else mediaRecords.video.push(item);
-        if (markRedrawRecord(item, "video", record)) placeRedrawRecord("video", item);
+        if (markRedrawRecord(item, "video", record, existingVideo)) placeRedrawRecord("video", item);
         rememberMergeRecord(item);persistMergeIndex();
         trimMediaRecords("video");
         persistMedia(); renderMedia("video"); syncStripFromMedia();
@@ -1694,13 +1926,16 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         } catch { /* 无效的旧界面状态不影响生成。 */ }
     }
     function restoreSavedMedia() {
+        expandedHistoryRounds.clear();
+        for (const round of node.properties?.ad_h3_expanded_rounds || []) expandedHistoryRounds.add(Number(round)||0);
+        showHistoryRounds = !!node.properties?.ad_h3_show_history;
         mergeIndex.clear();
         for (const record of node.properties?.ad_h3_merge_index || []) rememberMergeRecord(record);
         hiddenStrips.clear();
         for (const key of node.properties?.ad_h3_hidden_strips || []) hiddenStrips.add(String(key));
         const strips = node.properties?.ad_h3_strip_previews;
         for (const kind of ["segment","merged"]) {
-            if (Array.isArray(strips?.[kind])) stripStore[kind] = strips[kind].filter(item=>item?.file).slice(-60);
+            if (Array.isArray(strips?.[kind])) stripStore[kind] = strips[kind].filter(item=>item?.file);
         }
         stripStore.merged = numberMergedHistory(stripStore.merged);
         if (Array.isArray(node.properties?.ad_h3_merged_previews))
@@ -1709,22 +1944,26 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         renderRecords(merges, stripStore.merged, "merged");
         const saved = node.properties?.ad_h3_media_records;
         if (!saved || typeof saved !== "object") {
+            restoreHistoryRecords();syncStripFromMedia();
             renderRecords(segments, stripStore.segment.filter(record => record.role !== "B"), "segment");
             renderRecords(segmentsB, stripStore.segment.filter(record => record.role === "B"), "segmentB");
             return;
         }
         for (const kind of ["image", "audio", "video"]) {
             mediaRecords[kind] = (Array.isArray(saved[kind]) ? saved[kind] : [])
-                .filter(item => item && item.file).slice(-60)
+                .filter(item => item && item.file)
                 .map((item, index) => ({...item, serial: item.redraw ? 0 : (Number(item.serial) > 0 ? Number(item.serial) : index + 1)}));
             renderMedia(kind);
         }
+        restoreHistoryRecords();rememberRedrawCounts();
+        for (const kind of ["image","audio","video"]) renderMedia(kind);
         // 重新打开工作流时保持原先的分类与空闲画面，不自动弹出别的预览。
         syncStripFromMedia();
         setTab(node.properties?.ad_h3_active_tab || "image", {sync: false});
     }
     for (const record of node.properties?.ad_h3_merge_index || []) rememberMergeRecord(record);
-    // 初始就是空闲态：两排缩略图先给出“暂无”提示，避免只显示空行。
+    // 恢复现存完整索引中的历史，完整保留最近10组。
+    restoreHistoryRecords();
     syncStripFromMedia();
     renderRecords(merges, stripStore.merged, "merged");
     renderMedia("image");
@@ -1744,6 +1983,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     document.addEventListener("fullscreenchange", onFullscreenChange);
     onFullscreenChange();
     return {show, updateState, receive, restoreLegacy, restoreSavedMedia, getTab: () => activeTab,
+        processingSelection: () => (mergeSelection.size ? [...mergeSelection.values()] : processingRecord ? [processingRecord] : [])
+            .map(record => {const {url,thumb_b64,thumb_mime,...clean}=record;return {...clean};}),
         selectedSegment: () => (redoTarget && Number(redoTarget.segment_index) > 0 ? Number(redoTarget.segment_index) : 0),
         resumeTarget: () => resumeTarget ? {...resumeTarget} : null,
         consumeResumeTarget(){resumeTarget = null;},

@@ -230,6 +230,12 @@ async def enqueue(session_id):
             validate_assets(snapshot)
             prompt = execution_prompt(state, snapshot)
         prompt[template["segment_node"]]["inputs"]["run_token"] = active["token"]
+        # 方案 A：把“当前段号”写进节点输入，缓存键才能区分不同段；
+        # 同一段抽卡时段号不变 → 上游命中缓存，只重跑种子相关节点。
+        try:
+            prompt[template["segment_node"]]["inputs"]["段索引"] = int(active.get("index", 0))
+        except (TypeError, ValueError):
+            pass
         if active.get("reroll") and not state.get("execution_round"):
             for node in prompt.values():
                 for name in ("seed","noise_seed"):

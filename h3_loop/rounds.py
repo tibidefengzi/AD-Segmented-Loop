@@ -371,6 +371,13 @@ def prepare(data):
         if node_id in draft:
             removed.update(component(draft, node_id))
         frozen = execution_prompt(state, snapshot)
+        # 把“当前段号”写进段节点输入：缓存键靠它区分不同段；同一段抽卡（只换种子）
+        # 时段号不变，上游条件/编码即可命中缓存。浏览器直连排队的抽卡也走这里。
+        try:
+            frozen.setdefault(str(node_id), {}).setdefault("inputs", {})["段索引"] = int(
+                (state.get("active") or {}).get("index", state.get("cursor") or 0))
+        except (TypeError, ValueError, AttributeError):
+            pass
         for key in set(frozen) & set(replacements):
             if frozen[key] != replacements[key]:
                 raise ValueError("两套循环共享的节点设置不同，请分别运行，避免其中一轮被另一轮覆盖")
@@ -417,6 +424,8 @@ def start_trial(data):
             child["segments"][index].update(versions=copy.deepcopy(row["versions"]),
                                             selected=row["selected"], valid=row["valid"], accepted=row["accepted"])
         child.update(cursor=target, auto=False, status="ready",
+                     # 抽卡属于父会话的同一轮：trial 子会话继承父轮号，结果为 R{轮}-{段}-{次}。
+                     round_no=int(parent.get("round_no", 1) or 1),
                      preview_parent={"session_id": sid, "epoch": parent["epoch"], "request_id": request,
                                      "index": target, "segment_key": parent["segments"][target]["segment_key"] if target < len(parent["segments"]) else None})
         STORE._save(child)

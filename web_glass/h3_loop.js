@@ -2,12 +2,13 @@
 // cachebust 20261025-0440 segment-dedupe-materials
 // CACHEBUST 2026-10-25-restore-v027-approved-043100
 import "./ad_theme.js?v=20261027-v039-share";
+// final_output.js由ComfyUI作为扩展入口自动加载，不重复注册。
 import { installGlassTheme } from "./glass_ui.js?v=20261031-fullscreen-center-v27";
 import { executeQueueOnce, interruptOwnedPrompt } from "./queue_runner.js?v=20261031-integrity-v36";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js?v=20261031-p0-v30";
-import { mountNativePlayer } from "./native_player.js?v=20261031-resume-v37";
+import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js?v=20261101-five-fixes-v44";
+import { mountNativePlayer } from "./native_player.js?v=20261101-history-v46";
 import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261031-fullscreen-v27";
 import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261031-round-v29";
 

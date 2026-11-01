@@ -586,6 +586,8 @@ async def manifest(request):
 
 def public_state(state):
     result = {key: value for key, value in state.items() if key not in {"template", "active", "retired_segments", "run_origins"}}
+    # 旧会话没有 round_no：按第 1 轮处理，前端据此编号 R1-xx。
+    result.setdefault("round_no", 1)
     active = state.get("active") or {}
     result["execution"] = {"index": active.get("index"), "prompt_id": active.get("prompt_id")}
     pending = state.get("draft_trial")

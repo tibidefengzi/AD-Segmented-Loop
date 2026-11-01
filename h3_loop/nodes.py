@@ -905,8 +905,11 @@ class AidenH3Segment:
     @classmethod
     def IS_CHANGED(cls, queue=None, aspect_ratio=DEFAULT_ASPECT, megapixels=DEFAULT_MEGAPIXELS,
                    multiple=32, prompt=None, unique_id=None, **kwargs):
-        # 每轮都必须重新取“当前段”素材，避免轮次变化被缓存复用
-        return float("nan")
+        # select除素材输出外还预约任务、建立token/epoch；整节点不能当作纯素材缓存。
+        # 素材解码缓存独立保留，运行上下文须在每次执行中重新取得。
+        from .cache_identity import segment_changed
+        return segment_changed(queue=queue, aspect_ratio=aspect_ratio, megapixels=megapixels,
+                               multiple=multiple, inputs=kwargs)
 
     def select(self, queue=None, aspect_ratio=DEFAULT_ASPECT, megapixels=DEFAULT_MEGAPIXELS, multiple=32,
                prompt_text="", prompt_prefix="", negative_prompt="", prompt=None, unique_id=None, extra_pnginfo=None, **kwargs):
@@ -1384,6 +1387,11 @@ class AidenH3VideoPreview:
         loop_context = context if isinstance(context, dict) and context.get("token") else None
         details = {}
         previous_record = getattr(media, "_ad_h3_preview_record", None)
+        if loop_context and not previous_record:
+            # 在编码/尾帧落盘前拦截真实旧结果；登记时仍再次检查，防止处理中被重置。
+            current_epoch = STORE.read(loop_context["session_id"]).get("epoch", 0)
+            if loop_context.get("epoch") is not None and int(loop_context["epoch"]) != int(current_epoch):
+                raise ValueError("生成结果属于已被清空重置的进度；文件保留，不纳入当前进度")
         if hasattr(media, "save_to") or previous_record:
             if loop_context and not previous_record:
                 from .media import normalize_video
@@ -1809,13 +1817,19 @@ class AidenH3RoundBlocked:
         raise ValueError("本轮排队被阻止：" + (str(reason or "").strip() or "未知原因"))
 
 
+from .final_output import FinalSave, SelectedResult
+
 NODE_CLASS_MAPPINGS = {
+    "AD_FinalSave": FinalSave,
+    "AD_FinalSelectedMedia": SelectedResult,
     "AidenH3AudioQueue": AidenH3AudioQueue,
     "AidenH3Segment": AidenH3Segment,
     "AidenH3VideoPreview": AidenH3VideoPreview,
     "AD_RoundBlocked": AidenH3RoundBlocked,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "AD_FinalSave": "AD-最终保存",
+    "AD_FinalSelectedMedia": "AD-已选成果读取（内部）",
     "AidenH3AudioQueue": "AD-素材准备",
     "AidenH3Segment": "AD-分段生成",
     "AidenH3VideoPreview": "AD-分段预览",

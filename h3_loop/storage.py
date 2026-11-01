@@ -355,7 +355,7 @@ class SessionStore:
             try:
                 state = self._load(session_id)
             except FileNotFoundError:
-                state = {"schema": 1, "id": session_id, "cursor": 0, "epoch": 0,
+                state = {"schema": 1, "id": session_id, "cursor": 0, "epoch": 0, "round_no": 1,
                          "status": "ready", "auto": False, "pause_after": False,
                          "segments": [], "active": None, "merged": None, "error": ""}
             if state.get("execution_round") or state.get("draft_trial"):
@@ -510,7 +510,11 @@ class SessionStore:
             row["selected"] = None
             row["reroll"] = 0
         state.update(cursor=0, status="ready", auto=False, active=None, pause_after=False,
-                     epoch=state["epoch"] + 1, error="")
+                     epoch=state["epoch"] + 1,
+                     # 逻辑轮次：只有真正开新一轮（完成后开始 / 清空重置 / 批处理完成）才 +1；
+                     # 续跑、运行此段、本段抽卡都不走这里，所以轮号不变。
+                     round_no=int(state.get("round_no", 1) or 1) + 1,
+                     error="")
 
     def ensure_run_token(self, session_id, token=""):
         """Return a token that matches an active reservation.

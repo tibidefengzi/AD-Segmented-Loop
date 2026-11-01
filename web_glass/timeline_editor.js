@@ -541,8 +541,8 @@ export function mountTimelineEditor(node) {
             applyLayoutHeight();
         }, delay);
     };
-    const doUndo = () => { if (!undoStack.length) return; redoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(undoStack.pop()); afterEdit(false);hint("已撤销上一步操作。"); };
-    const doRedo = () => { if (!redoStack.length) return; undoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(redoStack.pop()); afterEdit(false);hint("已重做上一步操作。"); };
+    const doUndo = () => { if (!undoStack.length) return; redoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(undoStack.pop()); afterEdit(false, true);hint("已撤销上一步操作。"); };
+    const doRedo = () => { if (!redoStack.length) return; undoStack.push(JSON.stringify(T.state)); T.state = JSON.parse(redoStack.pop()); afterEdit(false, true);hint("已重做上一步操作。"); };
     const syncHistory = () => { root.querySelector("[data-undo]").disabled = !undoStack.length; root.querySelector("[data-redo]").disabled = !redoStack.length; };
     // 开关类按钮补 aria-pressed，读屏能读出磁吸与秒/帧当前状态。
     const syncToggleA11y = () => {
@@ -855,6 +855,41 @@ export function mountTimelineEditor(node) {
         const rect = root.getBoundingClientRect();
         return rect.width > 0 && root.offsetWidth > 0 ? rect.width / root.offsetWidth : 1;
     };
+    // 标尺步长：保证每格至少约 42px，避免放大时刻度无限加密（DOM 过多会把缩放拖卡）。
+    const RULER_STEPS = [0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+    const rulerStep = () => RULER_STEPS.find(step => step * T.pxs >= 42) || RULER_STEPS[RULER_STEPS.length - 1];
+    // 段号漂移修复：段线增删/移动后，按时间重叠把图片的「第 N 段参考」自动迁移到新段号。
+    let lastIntervals = null;
+    const snapshotIntervals = () => segmentIntervals(T.state).map(([start, end]) => [start, end]);
+    function remapImageSegments() {
+        const next = snapshotIntervals();
+        const old = lastIntervals;
+        lastIntervals = next;
+        if (!old || !old.length || !next.length) return;
+        const same = old.length === next.length && old.every((pair, index) =>
+            Math.abs(pair[0] - next[index][0]) < 1e-6 && Math.abs(pair[1] - next[index][1]) < 1e-6);
+        if (same) return;
+        const mapping = old.map(([a, b]) => {
+            let best = -1, bestOverlap = 0;
+            next.forEach(([c, d], index) => {
+                const overlap = Math.min(b, d) - Math.max(a, c);
+                if (overlap > bestOverlap) { bestOverlap = overlap; best = index; }
+            });
+            return bestOverlap > 1e-6 ? best : -1;
+        });
+        let changed = false, dropped = 0;
+        for (const image of T.state.images || []) {
+            const segment = Number(image.segment);
+            if (!(segment >= 1)) continue;
+            const mapped = mapping[segment - 1];
+            if (mapped === undefined) continue;
+            if (mapped < 0) { image.segment = -1; dropped += 1; changed = true; }
+            else if (mapped + 1 !== segment) { image.segment = mapped + 1; changed = true; }
+        }
+        if (changed) hint(dropped
+            ? `段线变化：${dropped} 张图片的原段已不存在，已改为「全局参考」`
+            : "段线变化：已按时间重叠自动迁移图片的「第 N 段参考」");
+    }
     // 磁吸锚点缓存：同一帧内多次 snapTo 复用；片段位置变了用 ++snapEpoch 失效
     let snapEpoch = 0, snapCacheEpoch = -1, snapCacheAnchors = null, snapCacheTotal = 0;
     const bumpSnapCache = () => { snapEpoch++; };
@@ -940,18 +975,7 @@ export function mountTimelineEditor(node) {
         const width = Math.max(view.clientWidth - 80, offset + timeToX(total) + 160);
         canvas.style.width = `${width}px`;
         // 标尺（轨道建好后绘制，零点与轨道内容区对齐）
-        ruler.innerHTML = "";
-        const step = T.pxs > 120 ? 0.5 : T.pxs > 50 ? 1 : T.pxs > 22 ? 5 : 15;
-        const rulerEnd = Math.max(total + step, xToTime(Math.max(0, width - offset)));
-        for (let t = 0; t <= rulerEnd; t += step) {
-            const tick = document.createElement("div");
-            const major = Math.abs(t % (step >= 5 ? 15 : 5)) < 1e-6 || step < 5 && Math.abs(t % 5) < 1e-6;
-            tick.className = `h3-tick${major ? " major" : ""}`;
-            tick.dataset.time = String(t);
-            tick.style.left = `${offset + timeToX(t)}px`;
-            if (major || step >= 5) { const label = document.createElement("span"); label.textContent = fmtClock(t); tick.append(label); }
-            ruler.append(tick);
-        }
+        ensureRulerCoverage();
         if (genBody) {
             const body = genBody, iv = intervals();
             if (!iv.length) body.innerHTML = '<div class="h3-lane-empty">填每段目标帧数和分段数，再点应用分段；之后可拖左右边改单段时长</div>';
@@ -1015,14 +1039,10 @@ export function mountTimelineEditor(node) {
                     element.style.width = `${Math.max(6, timeToX(clip.src_out - clip.src_in))}px`;
                     element.classList.toggle("selected", T.selected.has(clip.id));
                     element.innerHTML = `<div class="label">${source?.name || "?"}</div>` +
-                        `<canvas ${isVideo ? `data-thumb="${clip.source}"` : ""}></canvas>` +
+                        `<canvas width="1" height="1" ${isVideo ? `data-thumb="${clip.source}"` : ""}></canvas>` +
                         `<div class="edge l"></div><div class="edge r"></div>`;
                     element.ondblclick = () => splitClipAt(clip, T.playhead);
                     body.append(element);
-                    if (!interactionLock) {
-                        if (isVideo) { paintThumbs(element.querySelector("canvas"), clip); void thumbsFor(source); }
-                        else void drawWave(element.querySelector("canvas"), source, clip);
-                    }
                 }
             }
         }
@@ -1031,34 +1051,79 @@ export function mountTimelineEditor(node) {
         renderClock({ seekPreview: !interactionLock });
         syncButtons();
         renderFramePlan();
+        if (lastIntervals === null) lastIntervals = snapshotIntervals();  // 首次绘制记录段线基线
         syncViewHeight();  // 每次重绘后重算高度（缩放/无素材都不留底空白）
         syncTrackMuteButtons();
         syncTrackVisibilityButtons();
+        paintViewportMedia();
+    }
+    // 缩放只改几何位置，不重建轨道、图片池、片段事件或分段参数表。
+    function renderTimelineZoom() {
+        canvas.style.width = `${Math.max(view.clientWidth - 80, headOffset() + timeToX(duration()) + 160)}px`;
+        const clips = new Map([...T.state.video_tracks, ...T.state.audio_tracks,
+            hasAvClips() ? [] : generationClips(T.state)].flat().map(clip => [clip.id, clip]));
+        for (const element of canvas.querySelectorAll(".h3-clip")) {
+            const clip = clips.get(element.dataset.id);
+            if (!clip) continue;
+            element.style.left = `${timeToX(clip.tl_start)}px`;
+            element.style.width = `${Math.max(6, timeToX(clip.src_out - clip.src_in))}px`;
+        }
+        renderOverlays();
+    }
+    const paintViewport = () => ({left: view.scrollLeft, width: view.clientWidth, offset: headOffset()});
+    function clipPaintRegion(clip, viewport = paintViewport()) {
+        const fullWidth = Math.max(8, Math.round(timeToX(clip.src_out - clip.src_in)));
+        const left = viewport.offset + timeToX(clip.tl_start);
+        const start = Math.max(0, Math.floor(viewport.left - left - 160));
+        const end = Math.min(fullWidth, Math.ceil(viewport.left + viewport.width - left + 160));
+        return end > start ? {start, width: end - start, fullWidth} : null;
+    }
+    function paintViewportMedia() {
+        if (interactionLock || previewDisposed) return;
+        const clips = new Map([...T.state.video_tracks, ...T.state.audio_tracks].flat().map(clip => [clip.id, clip]));
+        const sources = sourcesOf();
+        const viewport = paintViewport();  // 集中读布局，避免每画一张缩略图都强制重排。
+        for (const element of canvas.querySelectorAll(".h3-clip canvas")) {
+            const clip = clips.get(element.parentElement.dataset.id);
+            if (!clip) continue;
+            const region = clipPaintRegion(clip, viewport);
+            if (!region) {
+                // 释放画布像素；保留片段壳和交互，滚入窗口再补绘。
+                if (element.width !== 1) { element.width = 1; element.height = 1; }
+                element.style.width = "0px";
+                delete element.dataset.paintKey;
+                continue;
+            }
+            if (element.dataset.thumb) { paintThumbs(element, clip, region); void thumbsFor(sources[clip.source]); }
+            else void drawWave(element, sources[clip.source], clip, region);
+        }
     }
     function ensureRulerCoverage() {
         const viewEl = root.querySelector("[data-view]");
         if (!viewEl) return;
         const width = viewEl.clientWidth;
         if (!width) return;
-        const ticks = [...ruler.querySelectorAll(".h3-tick")];
-        if (!ticks.length) return;
-        const last = ticks[ticks.length - 1];
-        const step = T.pxs > 120 ? 0.5 : T.pxs > 50 ? 1 : T.pxs > 22 ? 5 : 15;
+        const step = rulerStep();
         const offset = headOffset();
-        const target = width - 13;
-        if (last.offsetLeft >= target) return;
-        let t = Number(last.dataset.time) || 0;
-        let guard = 0;
-        while (offset + timeToX(t) < target + step && guard++ < 4000) {
-            t += step;
+        // 只绘制可见窗口及两侧余量；总时长再长也不截断后半段。
+        const first = Math.max(0, Math.floor(xToTime(Math.max(0, viewEl.scrollLeft - offset)) / step) - 2);
+        const last = Math.ceil(xToTime(Math.max(0, viewEl.scrollLeft + width - offset)) / step) + 2;
+        const range = `${first}:${last}:${step}:${T.pxs}:${offset}`;
+        if (ruler.dataset.range === range && ruler.childElementCount) return;
+        const fragment = document.createDocumentFragment();
+        for (let index = first; index <= last; index++) {
+            const t = index * step;
             const tick = document.createElement("div");
-            const major = Math.abs(t % (step >= 5 ? 15 : 5)) < 1e-6 || (step < 5 && Math.abs(t % 5) < 1e-6);
+            const majorUnit = step >= 5 ? 15 : 5;
+            const major = Math.abs(t / majorUnit - Math.round(t / majorUnit)) < 1e-6;
             tick.className = `h3-tick${major ? " major" : ""}`;
             tick.dataset.time = String(t);
             tick.style.left = `${offset + timeToX(t)}px`;
             if (major || step >= 5) { const label = document.createElement("span"); label.textContent = fmtClock(t); tick.append(label); }
-            ruler.append(tick);
+            fragment.append(tick);
         }
+        ruler.replaceChildren(fragment);
+        ruler.dataset.range = range;
     }
     function renderOverlays() {
         const total = duration(), offset = headOffset();
@@ -1576,7 +1641,7 @@ export function mountTimelineEditor(node) {
         node.setDirtyCanvas?.(true, true);
         return true;
     };
-    function afterEdit(outputs = true) {
+    function afterEdit(outputs = true, restoredBindings = false) {
         applyImageOnlySegments();
         applyPromptOnlySegments();
         if (!hasAvClips() && !Array.isArray(T.state.generation_clips) && T.state.duration>0) generationClips(T.state);
@@ -1586,6 +1651,9 @@ export function mountTimelineEditor(node) {
         const available = new Set([...activeClips(T.state), ...(hasAvClips() ? [] : T.state.generation_clips || [])].map(clip=>clip.id));
         T.selected = new Set([...T.selected].filter(id => available.has(id)));
         if (outputs) try { updateMaterialOutputs(node, T.state); } catch (error) { hint(error.message, true); throw error; }
+        // 历史快照已包含正确绑定，不能拿编辑后的段线再次迁移。
+        if (restoredBindings) lastIntervals = snapshotIntervals();
+        else remapImageSegments();
         render();
         scheduleLayout(40);
         node.setDirtyCanvas(true, true);
@@ -1618,26 +1686,33 @@ export function mountTimelineEditor(node) {
         audioPending.set(key, job);
         return job.promise;
     }
-    async function drawWave(canvasElement, source, clip) {
+    async function drawWave(canvasElement, source, clip, region = clipPaintRegion(clip)) {
         if (!canvasElement || !source) return;
+        if (!region) return;
+        const key = JSON.stringify([mediaURL(source), clip.src_in, clip.src_out, region]);
+        if (canvasElement.dataset.paintKey === key) return;
+        canvasElement.dataset.paintKey = key;
         try {
             const buffer = await bufferFor(source);
-            const width = Math.max(8, Math.round(timeToX(clip.src_out - clip.src_in))), height = 44;
+            if (previewDisposed || !canvasElement.isConnected || canvasElement.dataset.paintKey !== key) return;
+            const width = region.width, height = 44;
             canvasElement.width = width; canvasElement.height = height;
+            canvasElement.style.left = `${region.start}px`; canvasElement.style.right = "auto";
+            canvasElement.style.width = `${width}px`;
             const context = canvasElement.getContext("2d");
             const channel = buffer.getChannelData(0);
             const rate = buffer.sampleRate;
             context.clearRect(0, 0, width, height);
             context.fillStyle = "#7fb2ff";
             for (let x = 0; x < width; x++) {
-                const from = Math.floor((clip.src_in + x / width * (clip.src_out - clip.src_in)) * rate);
-                const to = Math.floor((clip.src_in + (x + 1) / width * (clip.src_out - clip.src_in)) * rate);
+                const from = Math.floor((clip.src_in + (region.start + x) / region.fullWidth * (clip.src_out - clip.src_in)) * rate);
+                const to = Math.floor((clip.src_in + (region.start + x + 1) / region.fullWidth * (clip.src_out - clip.src_in)) * rate);
                 let peak = 0;
                 for (let i = from; i < Math.min(to, channel.length); i += 16) peak = Math.max(peak, Math.abs(channel[i]));
                 const bar = Math.max(1, peak * height);
                 context.fillRect(x, (height - bar) / 2, 1, bar);
             }
-        } catch { /* 波形只是装饰，失败不打断 */ }
+        } catch { if (canvasElement.dataset.paintKey === key) delete canvasElement.dataset.paintKey; /* 波形只是装饰，失败不打断 */ }
     }
 
     // ---------- 视频缩略图（按源时间网格后台抽帧，渐进刷新所有片段） ----------
@@ -1710,29 +1785,36 @@ export function mountTimelineEditor(node) {
         });
         return job;
     }
-    function paintThumbs(canvasElement, clip) {
+    function paintThumbs(canvasElement, clip, region = clipPaintRegion(clip)) {
         const job = thumbCache.get(clip.source);
         if (!canvasElement || !job || !job.ready) return;
-        const width = Math.max(8, Math.round(timeToX(clip.src_out - clip.src_in))), height = 44;
+        if (!region) return;
+        const key = JSON.stringify([job.url, job.grid.size, clip.src_in, clip.src_out, region]);
+        if (canvasElement.dataset.paintKey === key) return;
+        canvasElement.dataset.paintKey = key;
+        const width = region.width, height = 44;
         canvasElement.width = width; canvasElement.height = height;
+        canvasElement.style.left = `${region.start}px`; canvasElement.style.right = "auto";
+        canvasElement.style.width = `${width}px`;
         const context = canvasElement.getContext("2d");
         const span = clip.src_out - clip.src_in, srcDur = job.duration;
-        for (let x = 0; x < width; x += job.thumbW) {
-            const srcT = clip.src_in + (x + job.thumbW / 2) / width * span;
+        for (let x = Math.floor(region.start / job.thumbW) * job.thumbW; x < region.start + width; x += job.thumbW) {
+            const srcT = clip.src_in + (x + job.thumbW / 2) / region.fullWidth * span;
             const frame = Math.min(job.cols - 1, Math.max(0, Math.floor(srcT / srcDur * job.cols)));
             const bitmap = job.grid.get(String(frame));
             if (!bitmap) continue;
-            context.drawImage(bitmap, x, 0, job.thumbW, Math.min(job.thumbH, height));
+            context.drawImage(bitmap, x - region.start, 0, job.thumbW, Math.min(job.thumbH, height));
         }
     }
     function repaintThumbs(sourceId) {
         const lanes = [...canvas.querySelectorAll(".h3-lane")];
+        const viewport = paintViewport();
         for (const element of canvas.querySelectorAll(".h3-clip.v canvas[data-thumb]")) {
             if (sourceId && element.dataset.thumb !== sourceId) continue;
             const clipElement = element.closest(".h3-clip");
             const laneIndex = lanes.indexOf(clipElement?.parentElement?.parentElement);
             const clip = (T.state.video_tracks[laneIndex] || []).find(item => item.id === clipElement?.dataset.id);
-            if (clip) paintThumbs(element, clip);
+            if (clip) paintThumbs(element, clip, clipPaintRegion(clip, viewport));
         }
     }
 
@@ -3165,6 +3247,30 @@ export function mountTimelineEditor(node) {
     root.tabIndex = 0;
     // 滚轮：选中了片段或生成段、且指针在时间线视口内 → 缩放时间线；否则交给工作流画布。
     // 无音频/视频时也可缩放（靠 T.segment / 生成段选中）。不恢复顶部缩放滑条。
+    // 缩放节流：滚轮连续触发时每帧只重绘一次（原来每个事件都全量 render，素材多时卡）。
+    let wheelZoomFrame = 0, wheelZoomPoint = null, rulerScrollFrame = 0;
+    const onRulerScroll = () => {
+        if (!rulerScrollFrame) rulerScrollFrame = requestAnimationFrame(() => {
+            rulerScrollFrame = 0;
+            ensureRulerCoverage();
+            paintViewportMedia();
+        });
+    };
+    view.addEventListener("scroll", onRulerScroll, {passive: true});
+    const flushWheelZoom = () => {
+        wheelZoomFrame = 0;
+        const point = wheelZoomPoint;
+        wheelZoomPoint = null;
+        if (!point) return;
+        T.pxs = point.pxs;
+        renderTimelineZoom();
+        // 用画布实际位置计算增量，包含视口边框与工作流画布缩放。
+        view.scrollLeft += headOffset() + timeToX(point.anchor)
+            - (point.clientX - canvas.getBoundingClientRect().left) / viewScale();
+        ensureRulerCoverage();
+        paintViewportMedia();
+        applyLayoutHeight();  // 缩放后按内容收回节点高度，禁止下端空白弹回
+    };
     root.addEventListener("wheel", event => {
         const inside = view.contains(event.target);
         const canZoomTimeline = inside && (T.selected.size > 0 || T.segment >= 0);
@@ -3182,11 +3288,10 @@ export function mountTimelineEditor(node) {
         }
         event.preventDefault();
         event.stopImmediatePropagation();
-        const anchor = locateCanvas(event);
-        T.pxs = Math.max(8, Math.min(240, T.pxs * (event.deltaY < 0 ? 1.15 : 1 / 1.15)));
-        render();
-        view.scrollLeft = headOffset() + timeToX(anchor) - (event.clientX - view.getBoundingClientRect().left) / viewScale();
-        applyLayoutHeight();  // 缩放后按内容收回节点高度，禁止下端空白弹回
+        // 本帧始终用已绘制的状态取首个锚点，目标倍率累计到下一帧才生效。
+        if (!wheelZoomPoint) wheelZoomPoint = {anchor: locateCanvas(event), clientX: event.clientX, pxs: T.pxs};
+        wheelZoomPoint.pxs = Math.max(8, Math.min(240, wheelZoomPoint.pxs * (event.deltaY < 0 ? 1.15 : 1 / 1.15)));
+        if (!wheelZoomFrame) wheelZoomFrame = requestAnimationFrame(flushWheelZoom);
     }, { capture: true, passive: false });
 
     const restoreEditor = value => {
@@ -3214,6 +3319,7 @@ export function mountTimelineEditor(node) {
             root.querySelectorAll("[data-unit]").forEach(item=>item.classList.toggle("on",item.dataset.unit===T.unit));syncToggleA11y();
             $("[data-count]").value=recipe?.count||(iv.length||DEFAULT_SEG_COUNT);
             try { applyPromptOnlySegments(); } catch {}
+            lastIntervals = snapshotIntervals();
             render();
             try { updateMaterialOutputs(node, T.state); } catch {}
             applyLayoutHeight();
@@ -3491,6 +3597,7 @@ export function mountTimelineEditor(node) {
                 fillTimelineWidth();
             syncViewHeight();  // 操作框高度只由素材轨数决定，不随节点宽度/拖拽变化
             renderOverlays();
+            paintViewportMedia();
             contentWidgetH = measureContentH();
             const h = currentWidgetH();
             clipRoot(h);
@@ -3601,6 +3708,10 @@ export function mountTimelineEditor(node) {
         document.removeEventListener("pointerdown", onEditorPointerDown, true);
         if (activeEditorRoot === root) activeEditorRoot = null;
         previewDisposed = true;
+        view.removeEventListener("scroll", onRulerScroll);
+        if (rulerScrollFrame) cancelAnimationFrame(rulerScrollFrame);
+        if (wheelZoomFrame) cancelAnimationFrame(wheelZoomFrame);
+        wheelZoomPoint = null;
         if (previewSeekTimer) cancelAnimationFrame(previewSeekTimer);
         previewSeekRevision++;
         clearInterval(planTimer);

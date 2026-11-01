@@ -16,6 +16,29 @@ import uuid
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+def _enable_dpi_awareness():
+    """让系统选择框按真实 DPI 渲染，避免 125%/150% 缩放下被位图拉伸变糊。
+
+    弹框运行在独立子进程里（python_embeded 默认 DPI unaware），所以只需在这里开启，
+    不影响 ComfyUI 主进程。三级兜底，任何一级失败都不影响弹框功能。
+    """
+    try:
+        if ctypes.WinDLL("user32").SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):  # PER_MONITOR_AWARE_V2
+            return True
+    except Exception:
+        pass
+    try:
+        if ctypes.WinDLL("shcore").SetProcessDpiAwareness(2) == 0:  # PER_MONITOR_AWARE
+            return True
+    except Exception:
+        pass
+    try:
+        ctypes.WinDLL("user32").SetProcessDPIAware()
+        return True
+    except Exception:
+        return False
+
+
 class DialogError(RuntimeError):
     pass
 
@@ -313,6 +336,7 @@ class _NativeDialog:
 
 
 def _worker():
+    _enable_dpi_awareness()
     native = None
     try:
         native = _NativeDialog(json.loads(sys.stdin.read()))
