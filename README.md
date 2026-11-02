@@ -1,4 +1,4 @@
-# AD-分段循环 · AD-Segmented-Loop
+# AD-分段循环 · ComfyUI-AD-Segmented-Loop
 
 用于 ComfyUI 的素材时间线与分段循环插件，串起素材准备、逐段生成、预览对比与结果保存。
 
@@ -28,7 +28,7 @@
 
 ## 安装与使用
 
-1. 从[最新发布页](https://github.com/tibidefengzi/AD-Segmented-Loop/releases/latest)下载插件 ZIP，将其中的 `AD-Segmented-Loop` 文件夹放入 `ComfyUI/custom_nodes`，保持只有一份启用的插件。
+1. 从[最新发布页](https://github.com/tibidefengzi/ComfyUI-AD-Segmented-Loop/releases/latest)下载插件 ZIP，将其中的 `AD-Segmented-Loop` 文件夹放入 `ComfyUI/custom_nodes`，保持只有一份启用的插件。
 2. 用运行 ComfyUI 的 Python 安装依赖：
    ```bash
    python -m pip install -r custom_nodes/AD-Segmented-Loop/requirements.txt
