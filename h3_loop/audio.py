@@ -226,7 +226,7 @@ def prepare_entries(raw_entries):
             item["source_start"] = float(raw["source_start"])
         entries.append(item)
     if not entries:
-        raise ValueError("音频队列为空，请批量导入文件或载入 Audio Oasis 已保存的分段")
+        raise ValueError("音频队列为空：请先导入音频/视频素材，或在时间线上添加音频片段。")
     return entries
 
 

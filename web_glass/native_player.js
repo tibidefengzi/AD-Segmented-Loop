@@ -1,6 +1,19 @@
-import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261031-fullscreen-v27";
-import { retainedHistoryRounds, previewHistoryGroups } from "./preview_history.js?v=20261101-history-v46";
-import { interruptOwnedPrompt } from "./queue_runner.js?v=20261031-integrity-v36";
+import {resultAliases,sameResult,mergeResult,redrawKey,identityFields} from "./preview_identity.js?v=20261102-group-v64";
+import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261102-group-v64";
+import { retainedHistoryRounds, previewHistoryGroups } from "./preview_history.js?v=20261102-group-v64";
+import { interruptOwnedPrompt } from "./queue_runner.js?v=20261102-group-v64";
+// 0.4.53：分段预览播放框与「AD-最终保存」一致（原生播放条），仅额外保留上一帧/下一帧。
+const frameStyles=document.createElement("style");
+frameStyles.textContent=`
+.ad-h3-video.aiden-h3 .ad-h3-screen>.ad-h3-player-controls.ad-h3-native-controls-hidden{display:none!important}
+.ad-h3-video.aiden-h3 .ad-h3-screen video{width:100%;height:100%;object-fit:contain;background:#08090c}
+.ad-h3-video.aiden-h3 .ad-h3-screen audio{width:88%}
+.ad-h3-video.aiden-h3 .ad-h3-frame-step{position:absolute;top:8px;right:8px;bottom:auto;z-index:8;display:flex;gap:6px}
+.ad-h3-video.aiden-h3 .ad-h3-frame-step button{min-height:26px;height:26px;padding:0 10px;font-size:12px;border-radius:6px;border:1px solid #4a658a;background:#1b283ce6;color:#e8f0fb;cursor:pointer}
+.ad-h3-video.aiden-h3 .ad-h3-frame-step button:hover{background:#2d405b}
+.ad-h3-video.aiden-h3.ad-h3-audio-mode .ad-h3-frame-step,.ad-h3-preview-layout.is-comparing .ad-h3-frame-step,.ad-h3-video.aiden-h3 .ad-h3-frame-step[hidden]{display:none!important}
+`;
+document.head.append(frameStyles);
 // 所有入口共用进入/退出切换；状态以浏览器fullscreenElement为准（包括Esc退出）。
 export async function togglePlayerFullscreen(target) {
     const doc = target.ownerDocument || document;
@@ -21,8 +34,14 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const layout = root.querySelector(".ad-h3-preview-layout");
     const transport = root.querySelector(".ad-h3-player-controls");
     root.querySelector(".ad-h3-screen").append(transport);
-    audioView.controls = false;
+    audioView.controls = true;
     audioView.muted = true;
+    video.controls = true;
+    transport.classList.add("ad-h3-native-controls-hidden");
+    const frameStep = document.createElement("div");
+    frameStep.className = "ad-h3-frame-step";
+    for (const button of transport.querySelectorAll("[data-frame]")) frameStep.append(button);
+    root.querySelector(".ad-h3-screen").append(frameStep);
     const segments = root.querySelector(".ad-h3-segments"), segmentsB = root.querySelector(".ad-h3-segments-b"), merges = root.querySelector(".ad-h3-merges");
     // 分段生成/合并生成放在“视频”分类内（缩略图只显示视频），预览仍使用上方大窗口。
     const stripsBlock = root.querySelector(".ad-h3-strips");
@@ -581,7 +600,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const mediaCards = {image: new Map(), audio: new Map(), video: new Map()};
     // 每页最多绘制200条；完整历史按最近10组保留，显示限额不截断历史。
     const MEDIA_DISPLAY_LIMIT = 200;
-    const mediaCardKey = (kind, record) => `${kind}|${record?.origin || "media"}|${record?.file || ""}`;
+    const mediaCardKey = (kind, record) => `${kind}|${record?.role||"A"}|${record?.origin || "media"}|${record?.file || ""}`;
     const trimMediaRecords = kind => {
         enforceHistoryRetention();
     };
@@ -663,7 +682,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (number <= 0) return;
         const key = mergeIndexKey(record);
         if (replace || !mergeIndex.has(key)) mergeIndex.set(key, {
-            file:record.file, origin:record.origin || "media", kind:"video", segment_index:number,
+            ...identityFields(record), file:record.file, origin:record.origin || "media", kind:"video", segment_index:number,
             role:record.role === "B" ? "B" : "A", label:record.label,
             redraw:!!record.redraw, redraw_base:Number(record.redraw_base)||0,
             redraw_count:Number(record.redraw_count)||0, serial:Number(record.serial)||0,
@@ -693,7 +712,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         for (const kind of ["image", "audio", "video"]) {
             for (const record of mediaRecords[kind]) {
                 if (!record?.file) continue;
-                history.push({file: record.file, origin: record.origin || "media",
+                history.push({...identityFields(record), file: record.file, origin: record.origin || "media",
                     label: recordLabel(record, 0), kind: record.kind || kind,
                     role: record.role === "B" ? "B" : "A",
                     segment_index: Number(record.segment_index) || 0,
@@ -799,10 +818,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         node.properties ||= {};
         const saved = node.properties.ad_h3_redraw_counts;
         const counts = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+        for (const key of Object.keys(counts)) if (key.split(":").length===3) {
+            counts[key+":legacy"]=Math.max(Number(counts[key+":legacy"])||0,Number(counts[key])||0);delete counts[key];
+        }
         for (const kind of ["image", "audio", "video"]) {
             for (const entry of mediaRecords[kind]) {
                 if (!entry.redraw) continue;
-                const key = `${kind}:${recordRoundNo(entry)}:${Number(entry.redraw_base) || Number(entry.segment_index) || 0}`;
+                const key = redrawKey(kind,entry);
                 counts[key] = Math.max(0, Number(counts[key]) || 0, Number(entry.redraw_count) || 0);
             }
         }
@@ -939,7 +961,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 : "重抽当前段；点下方预览可指定要重抽的段（运行中请先停止）";
         }
         if (record) {
-            node._adH3ReviewStatus?.(resolved ? `已选第 ${resolved} 段：点「分段循环」从下一段续跑；「本段抽卡」重抽该段`
+            node._adH3ReviewStatus?.(resolved ? `已选第 ${recordRoundNo(record)||"旧版"} 组第 ${resolved} 段：「分段循环」从该组下一段续跑；「本段抽卡」仍归原组`
                                               : "该预览缺少段号，本段抽卡将重抽当前段");
         }
     }
@@ -1039,7 +1061,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (!window.confirm("只清空本轮生成进度和选用记录？（预览内容、素材、分段、提示词与已生成文件都保留）")) return;
         try { if(await node._adH3Act?.("clear", {skipConfirm:true})===false)return; } catch { return; }
         previewPinned = false;
-        if (node._adH3ReviewStatus) node._adH3ReviewStatus("已清空本轮进度，预览内容与文件保留。");
+        if (node._adH3ReviewStatus) node._adH3ReviewStatus("已重置本轮进度；预览内容与已生成文件保留。");
         node.setDirtyCanvas?.(true, true);
     });
     const clearMediaButton = root.querySelector("[data-clear-media-preview]");
@@ -1121,6 +1143,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             if (latestSessionState?.draft_trial) {
                 node._adH3Hint?.("本段抽卡尚未结束，完成后再继续原循环。",false); return;
             }
+            // 普通开始：当前段仍在运行/排队时不再提交，避免同段生成两次（2026-11-02 用户反馈）。
+            if (!batchResume && sessionIsRunning()) {
+                node._adH3Hint?.("当前段正在运行，请等待完成或先点「停止」再开始。", true);
+                return;
+            }
             // 点「停止」时如果分段循环正在运行：抽卡只是预览备选，点「开始」续接原来的分段循环位置。
             if (batchResume || latestSessionState?.execution_round?.batch && latestSessionState.status !== "completed") {
                 // 抽卡还在生成（预览结果尚未到达）时点开始：提示稍后再点，不抢跑。
@@ -1136,7 +1163,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             // 分段循环已完成：点「开始」直接清空本轮进度（保留素材/分段/提示词/已生成文件）并重新开始第 1 段。
             if (latestSessionState && latestSessionState.status === "completed") {
                 redrawPending = null; redrawReview = null; batchResume = false;
-                node._adH3Hint?.("本轮已完成，正在清空进度并重新开始…", false);
+                node._adH3Hint?.("本轮已完成，正在重置本轮进度并重新开始（文件与预览保留）…", false);
                 if (typeof node._adH3Act === "function") {
                     Promise.resolve(node._adH3Act("clear", {skipConfirm:true}))
                         .then(result => {
@@ -1146,18 +1173,22 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     return;
                 }
             }
-            // 兼容旧会话：当前段有效但尚未自动通过时，点「开始」先自动通过再继续；新会话生成即通过。
+            // 兼容旧会话：当前段有效但尚未自动接受时，点「开始」先接受再继续；新会话生成即通过。
             if (latestSessionState && (latestSessionState.status === "review" || latestSessionState.status === "paused" && latestSessionState.segments?.[latestSessionState.cursor]?.valid)) {
                 const currentRow = latestSessionState.segments?.[latestSessionState.cursor];
                 if (currentRow?.valid && typeof node._adH3Act === "function") {
-                    node._adH3Hint?.("正在自动通过上一段并继续…", false);
-                    Promise.resolve(node._adH3Act("approve"))
+                    // 停止后点开始：一律用当前全部设置重跑当前段（改种子/提示词/参数/参考都生效），
+                    // 不再把停止前的旧结果当成已接受而跳过。待审核状态才按“接受继续”处理。
+                    const resumeCommand = latestSessionState.status === "paused" ? "redo" : "approve";
+                    node._adH3Hint?.(latestSessionState.status === "paused"
+                        ? "已停止：正在用当前设置重新生成当前段…" : "正在继续已生成的上一段…", false);
+                    Promise.resolve(node._adH3Act(resumeCommand))
                         .catch(error => {
-                            node._adH3Hint?.("自动通过当前段失败：" + (error?.message || String(error)), true);
+                            node._adH3Hint?.("继续上一段失败：" + (error?.message || String(error)), true);
                         });
                     return;
                 }
-                node._adH3Hint?.("当前段已有结果，点「开始」或「分段循环」继续下一段。", false);
+                node._adH3Hint?.("当前段已有结果：点「开始」会接受该结果并继续下一段。", false);
                 return;
             }
             if (typeof node._adH3Act === "function") { void node._adH3Act("start"); return; }
@@ -1192,6 +1223,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 node._adH3Hint?.("分段循环运行中：请先点「停止」，流程待命后再点「本段抽卡」", true);
                 return;
             }
+            // 抽卡防连点：15 秒内重复点击不重复排队。
+            if (node._adH3RedoPending && Date.now() - (node._adH3RedoAt || 0) < 15000) {
+                node._adH3Hint?.("本段抽卡正在进行，请等结果出来再抽。", true);
+                return;
+            }
+            node._adH3RedoPending = true; node._adH3RedoAt = Date.now();
             const targetIndex = redoTarget && Number(redoTarget.segment_index) > 0
                 ? Number(redoTarget.segment_index) - 1 : null;
             const pendingIndex = targetIndex !== null ? targetIndex + 1
@@ -1202,27 +1239,27 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 : pendingIndex;
             const request=++redrawRequest;
             node._adH3ActionCancelled=false;
-            redrawPending = {index: pendingIndex, base: Number(base), exact: targetIndex !== null};
+            redrawPending = {index: pendingIndex, base: Number(base), exact: targetIndex !== null, round_no:redoTarget ? recordRoundNo(redoTarget) : activeRoundNo()};
             redrawReview = null;
             previewPinned = false;  // 抽卡结果要自动显示
             if (typeof node._adH3Act === "function") {
                 node._adH3Hint?.(`正在本段抽卡（第 ${base} 段，新结果将作为该段当前选用）…`, false);
-                Promise.resolve(node._adH3Act("redo_preview", targetIndex === null ? undefined : {index: targetIndex}))
+                Promise.resolve(node._adH3Act("redo_preview", targetIndex === null ? undefined : {index: targetIndex,preview:{...redoTarget},group_previews:[...Object.values(mediaRecords).flat(),...stripStore.segment].filter(r=>recordRoundNo(r)===recordRoundNo(redoTarget))}))
                     .then(result => { if(request!==redrawRequest)return; if (result === false && !node._adH3ActionCancelled) {
-                        redrawPending = null;
-                        node._adH3Hint?.("本段抽卡未完成："+(node._adH3LastActionError||"任务未加入队列、已停止或执行失败，请核对运行记录后重试"),true);
+                        redrawPending = null; node._adH3RedoPending = false;
+                        node._adH3Hint?.("本段抽卡未完成："+(node._adH3LastActionError||"本次任务没有成功加入队列或执行失败。请查看 ComfyUI 运行记录后重试。"),true);
                     } })
                     .catch(error => { if(request!==redrawRequest)return; redrawPending = null; node._adH3Hint?.("本段抽卡未成功加入队列："+(error?.message||String(error)),true); });
             } else if (node._adH3ReviewStatus) node._adH3ReviewStatus("请先连接「当前段上下文」再使用", true);
             return;
         }
-        if (command === "approve" && sessionIsRunning()) {node._adH3Hint?.("当前任务尚未结束，请完成后再操作。",true);return;}
-        if (command === "approve" || command === "clear") {redrawRequest++;redrawPending=null;redrawReview=null;batchResume=false;}
+        if (command === "approve" && sessionIsRunning()) {node._adH3Hint?.("当前任务尚未结束，请等待完成或先点「停止」。",true);return;}
+        if (command === "approve" || command === "clear" || command === "new_group") {redrawRequest++;redrawPending=null;redrawReview=null;batchResume=false;}
         if (command === "merge") { const menu=root.querySelector("[data-merge-menu]"); if(menu) menu.hidden=!menu.hidden; return; }
         if (typeof node._adH3Act === "function") void node._adH3Act(command, command === "pause" ? { skipConfirm: true } : undefined);
         else if (node._adH3ReviewStatus) node._adH3ReviewStatus("请先连接「当前段上下文」再使用", true);
     });
-    const keyOf = record => `${record.origin || "session"}/${record.file}`;
+    const keyOf = record => `${record.role||"A"}|${record.origin || "session"}/${record.file}`;
     function playlistVideos() {
         return stripStore.segment.filter(record => inferMediaKind(record.file,record.kind)==="video"
             && !hiddenStrips.has(stripKey("segment",record)))
@@ -1270,6 +1307,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         imageView.hidden = kind !== "image";
         audioView.hidden = kind !== "audio";
         transport.style.display = isVideo || kind === "audio" ? "" : "none";
+        const frameStepBox = root.querySelector(".ad-h3-frame-step");
+        if (frameStepBox) frameStepBox.hidden = !isVideo;
         root.classList.toggle("ad-h3-audio-mode", kind === "audio");
         updateTime();
     }
@@ -1284,7 +1323,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             mediaEl.className = "ad-h3-lightbox-video";
             mediaEl.controls = true; mediaEl.autoplay = true; mediaEl.playsInline = true; mediaEl.loop = false;
             mediaEl.src = src;
-            mediaEl.addEventListener("error", () => { hint.textContent = "视频无法播放，请重新生成预览"; });
+            mediaEl.addEventListener("error", () => { hint.textContent = "视频暂时无法播放：请重试播放或下载文件检查；仍无法播放再考虑重新生成。"; });
         } else {
             mediaEl.className = "ad-h3-lightbox-img";
             mediaEl.src = src;
@@ -1371,8 +1410,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 armVideoWatchdog();
                 return;
             }
-            title.textContent = `${active.label || "预览"} · 视频加载失败（文件可能已清理或服务繁忙），请刷新页面后重试`;
-            node._adH3Hint?.("预览视频加载失败：文件可能已被清理或后端繁忙，请 Ctrl+F5 刷新后再试。", true);
+            title.textContent = `${active.label || "预览"} · 预览视频加载失败：可能是预览服务暂时繁忙或文件路径不可用。请先确认没有正在运行的任务，再刷新页面重试`;
+            node._adH3Hint?.("预览视频加载失败：请确认任务已结束且文件仍在，再刷新页面重试；工作流未保存时不要刷新。", true);
         }, 4000);
     };
     video.addEventListener("loadedmetadata", () => { videoRetriedOnce = false; if (videoWatchdog) { clearTimeout(videoWatchdog); videoWatchdog = 0; } });
@@ -1441,7 +1480,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     audioView.onloadedmetadata = audioView.ontimeupdate = updateTime;
     audioView.onplay = () => { play.textContent = "暂停"; };
     audioView.onpause = audioView.onended = () => { play.textContent = "播放"; };
-    video.onerror = () => { title.textContent = `${active?.label || "预览"} · 文件无法播放，请重新生成预览`; };
+    video.onerror = () => { title.textContent = `${active?.label || "预览"} · 文件暂时无法播放：请重试播放或下载文件检查；仍无法播放再考虑重新生成。`; };
     play.onclick = () => {
         if (!active) return;
         const media = playingMedia();
@@ -1544,8 +1583,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     setRedoTarget({...record, kind: itemKind}, button);
                     const current = activeRoundNo(), cardRound = recordRoundNo(record);
                     if (current > 0 && cardRound > 0 && cardRound !== current) {
-                        // 历史轮卡片：续跑/抽卡只作用于当前轮，提示一下避免误解。
-                        node._adH3Hint?.(`这是第 ${cardRound} 轮的结果；点「分段循环」或「本段抽卡」会作用于当前第 ${current} 轮的第 ${recordSegmentNo(record)} 段`, true);
+                        node._adH3Hint?.(`已选第 ${cardRound} 组第 ${recordSegmentNo(record)} 段；「分段循环」从该组下一段续跑，「本段抽卡」仍归第 ${cardRound} 组`, false);
                     }
                 }
             };
@@ -1572,16 +1610,14 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     // 各类卡片 X 都清除该条预览的全部显示记录；不弹确认、不删除文件或进度。
     function clearRecordPreview(record, stripKind = null) {
         const origin = record.origin || (stripKind ? "session" : "media");
-        const same = item => item?.file === record.file && (item.origin || (stripKind ? "session" : "media")) === origin;
+        const same = item => sameResult(item,{...record,origin,role:item?.role});
         const kind = inferMediaKind(record.file, record.kind);
         const all = stripKind ? (stripRecords[stripKind] || []).filter(item => !hiddenStrips.has(stripKey(stripKind,item))) : mediaRecords[kind];
         const position = all.findIndex(same);
         const remaining = all.filter(item => !same(item));
-        const removedActive = !!active && active.file === record.file && (active.origin || "media") === origin;
+        const removedActive = same(active);
         const canonical = {...record, origin};
-        hiddenStrips.add(stripKey("segment",canonical));
-        hiddenStrips.add(stripKey("segmentB",canonical));
-        hiddenStrips.add(stripKey("merged",canonical));
+        for(const alias of resultAliases(canonical))for(const kind of ["segment","segmentB","merged"])hiddenStrips.add(`${kind}:${alias}`);
         persistHiddenStrips();
         for (const mediaKind of ["image","audio","video"]) {
             mediaRecords[mediaKind] = mediaRecords[mediaKind].filter(item => !same(item));
@@ -1590,7 +1626,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
         if (same(redoTarget)) setRedoTarget(null,null);
         if (same(processingRecord)) processingRecord = null;
-        if (mergeSelection.delete(keyOf(canonical))) paintMergeSelection();
+        for(const [key,item] of mergeSelection)if(same(item))mergeSelection.delete(key);
+        paintMergeSelection();
         stripStore.segment = stripStore.segment.filter(item => !same(item));
         stripStore.merged = stripStore.merged.filter(item => !same(item));
         for (const [key,item] of mergeIndex) if (same(item)) {
@@ -1778,6 +1815,70 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             void mergeSelectedVideos(sourceButton.dataset.mergeSource);
         });
     }
+    const resultMetadata=new Map();
+    function hiddenResult(record) {
+        return resultAliases(record).some(alias=>["segment","segmentB","merged"].some(kind=>hiddenStrips.has(`${kind}:${alias}`)));
+    }
+    function canonicalResult(raw,kind) {
+        let record={...raw,kind:raw.kind||kind};
+        for(const alias of resultAliases(record)) {
+            const meta=resultMetadata.get(alias);if(meta&&(meta.role||"A")===(record.role||"A"))record={...meta,...record,result_aliases:[...new Set([...resultAliases(meta),...resultAliases(record)])]};
+        }
+        const matches=mediaRecords[kind].filter(item=>sameResult(item,record));
+        if(!matches.length)return record;
+        let merged=matches.slice(1).reduce((value,item)=>mergeResult(value,item),matches[0]);
+        merged=mergeResult(merged,record);
+        merged.label=recordLabel(merged,0);
+        const first=mediaRecords[kind].indexOf(matches[0]);
+        mediaRecords[kind]=mediaRecords[kind].filter(item=>!matches.includes(item));mediaRecords[kind].splice(first,0,merged);
+        const update=value=>sameResult(value,merged)?{...value,...merged}:value;
+        processingRecord=update(processingRecord);redoTarget=update(redoTarget);resumeTarget=update(resumeTarget);active=update(active);
+        for(const key of Object.keys(lastShown))lastShown[key]=update(lastShown[key]);
+        const selection=[...mergeSelection.values()].map(update);mergeSelection.clear();for(const item of selection)mergeSelection.set(keyOf(item),item);
+        for(const [key,item] of mergeIndex)if(sameResult(item,merged))mergeIndex.set(key,{...item,...merged});
+        return merged;
+    }
+    let versionSignature = "";
+    function reconcileSessionRecords(state) {
+        if (!state?.id || !Array.isArray(state?.segments)) return false;
+        const signature = `${state.id}|${state.round_no || 0}|${state.reset_id||"legacy"}|${state.epoch||0}|` + state.segments.map(row => (row.versions || []).length).join(",");
+        if (signature === versionSignature) return false;
+        versionSignature = signature;
+        const changed = new Set();
+        for (const [rowIndex, row] of state.segments.entries()) {
+            for (const version of row.versions || []) {
+                if (!version?.file) continue;
+                const kind = version.media_kind || inferMediaKind(version.file, "video");
+                const segmentIndex = Number(version.segment_index) || rowIndex + 1;
+                const legacyPreview=String(version.trial_file||version.file).match(/segment_\d+_(preview_[0-9a-f]+\.(?:png|wav))$/);
+                let record={origin:"session",file:`${state.id}/${version.file}`,kind,session_id:state.id,
+                    segment_key:row.segment_key||"",segment_index:segmentIndex,round_no:Number(version.round_no)||Number(state.round_no)||0,
+                    version_id:version.id,trial_request:version.trial_request,trial_session:version.trial_session,trial_file:version.trial_file,
+                    preview_origin:version.preview_origin||(legacyPreview?"media":undefined),preview_file:version.preview_file||legacyPreview?.[1],
+                    reset_id:version.reset_id||"legacy",official_redraw_count:Number(version.redraw_count)||0,
+                    redraw:!!version.preview_only,redraw_base:version.preview_only?segmentIndex:0,redraw_count:Number(version.redraw_count)||0,round_id:"",serial:0};
+                for(const alias of resultAliases(record))resultMetadata.set(alias,record);
+                record=canonicalResult(record,kind);
+                if(hiddenResult(record)){
+                    mediaRecords[kind]=mediaRecords[kind].filter(item=>!sameResult(item,record));
+                    for(const [key,item] of mergeIndex)if(sameResult(item,record))mergeIndex.delete(key);
+                    for(const alias of resultAliases(record))for(const strip of ["segment","segmentB","merged"])hiddenStrips.add(`${strip}:${alias}`);
+                    persistHiddenStrips();changed.add(kind);continue;
+                }
+                if(record.redraw&&!record.redraw_count)record.redraw_count=(Number(rememberRedrawCounts()[redrawKey(kind,record)])||0)+1;
+                if(!record.serial&&!record.redraw)record.serial=Math.max(0,...mediaRecords[kind].map(item=>Number(item.serial)||0))+1;
+                record.label=recordLabel(record,0);
+                const index=mediaRecords[kind].findIndex(item=>sameResult(item,record));
+                if(index<0)mediaRecords[kind].push(record);else mediaRecords[kind][index]=record;
+                changed.add(kind);
+            }
+        }
+        if (!changed.size) return false;
+        enforceHistoryRetention();
+        for (const kind of changed) renderMedia(kind);
+        syncStripFromMedia();persistMedia();persistMergeIndex();
+        return true;
+    }
     function updateState(state) {
         if (disposed || !state?.id) return;
         const previousRound = activeRoundNo();
@@ -1801,6 +1902,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             syncStripFromMedia();
             for (const kind of ["image","audio","video"]) renderMedia(kind);
         }
+        reconcileSessionRecords(state);
         let merged = numberMergedHistory(Array.isArray(node.properties.ad_h3_merged_previews) ? node.properties.ad_h3_merged_previews : []);
         node.properties.ad_h3_merged_previews = merged;
         if (state.merged && !merged.some(item => item.session === state.id && item.file === state.merged)) {
@@ -1852,12 +1954,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             || !pending.exact || !Number(record.segment_index)))) return false;
         const base = Number(pending.base) || Number(record.segment_index) || pending.index;
         const counts = rememberRedrawCounts();
-        const key = `${kind}:${recordRoundNo(item)}:${base}`;
+        item.reset_id=record.reset_id||item.reset_id||latestSessionState?.reset_id||"legacy";
+        const key = redrawKey(kind,item,base);
         const repeated = previous?.redraw && recordRoundNo(previous) === recordRoundNo(item)
             && Number(previous.redraw_base) === base && Number(previous.redraw_count) > 0;
         item.redraw = true;
         item.redraw_base = base;
-        item.redraw_count = repeated ? Number(previous.redraw_count) : (Number(counts[key]) || 0) + 1;
+        item.redraw_count = Number(record.official_redraw_count)|| (repeated ? Number(previous.redraw_count) : (Number(counts[key]) || 0) + 1);
         counts[key] = Math.max(Number(counts[key]) || 0, item.redraw_count);
         item.serial = 0;  // 抽卡结果不占用正常生成的整数序号
         item.label = recordLabel(item, 0);
@@ -1867,27 +1970,32 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         return true;
     }
     function receive(record) {
+        if(record?.task_id&&node.properties?.ad_task_id&&record.task_id!==node.properties.ad_task_id)return;
         // 后端已按保存路径写盘；这里只把结果显示出来并提示保存结果/错误。
         try {
             if (record?.auto_save_error) node._adH3ReviewStatus?.(`保存失败：${record.auto_save_error}`, true);
             else if (record?.auto_saved) node._adH3ReviewStatus?.(`已保存：${record.auto_saved}`);
         } catch (_error) {}
         if (!record?.file) return;
+        if(record.version_id&&record.preview_only&&Number(record.redraw_count)>0)record={...record,official_redraw_count:Number(record.redraw_count)};
+        record=canonicalResult(record,record.kind||"video");
+        if(hiddenResult(record))return;
         // 轮次标记：新结果属于「当前执行轮」，编号 R{轮}-{段} 与折叠分组都靠它。
         rememberRound(latestSessionState);
         record.round_id = record.round_id || activeRoundId();
-        record.round_no = Number(record.round_no) || activeRoundNo();
+        record.round_no = record.round_no != null ? Number(record.round_no) : activeRoundNo();
         node._adH3StandaloneReady = true;
         const kind = record.kind || "video";
         const label = kind === "image" ? "本次图像" : kind === "audio" ? "本次音频" : "本次生成片段";
         if (kind === "image" || kind === "audio") {
             const nextSerial = () => Math.max(0, ...mediaRecords[kind].map(entry => Number(entry.serial) || 0)) + 1;
-            const existing = mediaRecords[kind].find(entry => entry.file === record.file && entry.origin === record.origin);
+            const existing = mediaRecords[kind].find(entry => sameResult(entry,record));
             const item = {...record, label, serial: existing?.serial || nextSerial()};
-            const index = mediaRecords[kind].findIndex(entry => entry.file === record.file && entry.origin === record.origin);
+            const index = mediaRecords[kind].findIndex(entry => sameResult(entry,record));
             if (index >= 0) mediaRecords[kind][index] = item; else mediaRecords[kind].push(item);
             // 本段抽卡结果：编号为「原编号-第几次」（黄色），并记录待继续的段号。
             if (markRedrawRecord(item, kind, record, existing)) placeRedrawRecord(kind, item);
+            node._adH3RedoPending = false;
             trimMediaRecords(kind);
             persistMedia();
             renderMedia(kind);
@@ -1900,11 +2008,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             return;
         }
         const videoSerial = Math.max(0, ...mediaRecords.video.map(entry => Number(entry.serial) || 0)) + 1;
-        const existingVideo = mediaRecords.video.find(entry => entry.file === record.file && entry.origin === record.origin);
+        const existingVideo = mediaRecords.video.find(entry => sameResult(entry,record));
         const item = {...record, label, kind: "video", serial: existingVideo?.serial || videoSerial};
-        const index = mediaRecords.video.findIndex(entry => entry.file === record.file && entry.origin === record.origin);
+        const index = mediaRecords.video.findIndex(entry => sameResult(entry,record));
         if (index >= 0) mediaRecords.video[index] = item; else mediaRecords.video.push(item);
         if (markRedrawRecord(item, "video", record, existingVideo)) placeRedrawRecord("video", item);
+        node._adH3RedoPending = false;
         rememberMergeRecord(item);persistMergeIndex();
         trimMediaRecords("video");
         persistMedia(); renderMedia("video"); syncStripFromMedia();
@@ -1926,6 +2035,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         } catch { /* 无效的旧界面状态不影响生成。 */ }
     }
     function restoreSavedMedia() {
+        resultMetadata.clear();versionSignature="";
         expandedHistoryRounds.clear();
         for (const round of node.properties?.ad_h3_expanded_rounds || []) expandedHistoryRounds.add(Number(round)||0);
         showHistoryRounds = !!node.properties?.ad_h3_show_history;
@@ -1987,7 +2097,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             .map(record => {const {url,thumb_b64,thumb_mime,...clean}=record;return {...clean};}),
         selectedSegment: () => (redoTarget && Number(redoTarget.segment_index) > 0 ? Number(redoTarget.segment_index) : 0),
         resumeTarget: () => resumeTarget ? {...resumeTarget} : null,
+        groupRecords: target => [...Object.values(mediaRecords).flat(),...stripStore.segment].filter(record=>
+            recordRoundNo(record)===recordRoundNo(target) && (record.role==="B"?"B":"A")===(target?.role==="B"?"B":"A")),
         consumeResumeTarget(){resumeTarget = null;},
+        resetGroupSelection(){resumeTarget=null;redoTarget=null;redrawPending=null;redrawReview=null;batchResume=false;previewPinned=false;redrawRequest++;},
         clearPin(){ previewPinned = false; }, get revision(){return revision;},
         dispose(){disposed=true; document.removeEventListener("fullscreenchange",onFullscreenChange); window.removeEventListener("keydown",onPreviewEscape,true); setPlaylistEnabled(false); setIdle(true); video.pause(); video.removeAttribute("src"); video.load(); cards.clear();}};
 }

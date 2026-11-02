@@ -221,14 +221,20 @@ def merge_final(records, directory="", prefix="最终合并", normalize=False):
         raise ValueError("图片按张保存；合并请选择同一分类的视频或音频")
     kind = sources[0]['kind']
     paths = [assets.resolve_source(r) for r in sources]
-    # 使用中立MKV承载视频流，保留帧率/奇数尺寸；音频统一无损PCM容器。
-    target = ROOT/'media'/('final_merge_'+uuid.uuid4().hex+('.mkv' if kind=='video' else '.wav'))
+    # 视频合并默认输出 MP4（浏览器/下载更通用）；容器不支持时回退 MKV。音频统一无损 PCM 容器。
+    target = ROOT/'media'/('final_merge_'+uuid.uuid4().hex+('.mp4' if kind=='video' else '.wav'))
     target.parent.mkdir(parents=True,exist_ok=True)
     keys = ('width','height','fps','codec','pix_fmt','sample_rate','channels') if kind=='video' else ('sample_rate','channels')
     def signature(r): return tuple(r.get(k) for k in keys)
     same = all(signature(r)==signature(sources[0]) for r in sources)
+    # 规格统一须先征得同意；像素格式兼容转换不代表同意缩放或改变帧率。
     if not same and not normalize:
         raise MergeSpecificationError("所选成果的尺寸、帧率、音轨或编码不同。是否按第一条成果的规格统一后合并？")
+    compat_pix = {'yuv420p','yuvj420p','nv12','nv21'}
+    odd_size=kind=='video' and (int(sources[0]['width'])%2 or int(sources[0]['height'])%2)
+    pixel_format='yuv444p' if odd_size else 'yuv420p'
+    if kind=='video' and not odd_size and str(sources[0].get('pix_fmt') or '').lower() not in compat_pix:
+        same=False
     if same:
         with tempfile.NamedTemporaryFile(mode='w',suffix='.txt',dir=ROOT/'media',encoding='utf-8',delete=False) as listing:
             list_path=Path(listing.name)
@@ -238,6 +244,9 @@ def merge_final(records, directory="", prefix="最终合并", normalize=False):
             arguments=['-v','error','-nostdin','-n','-f','concat','-safe','0','-i',str(list_path),'-map','0','-c','copy']
             if kind=='audio': arguments=['-v','error','-nostdin','-n','-f','concat','-safe','0','-i',str(list_path),'-vn','-c:a','pcm_f32le']
             result=assets._exec(arguments+[str(target)])
+            if result.returncode and kind=='video' and target.suffix=='.mp4':
+                # 少数源编码/奇数尺寸无法装进 MP4：回退 MKV，保证合并成功。
+                target=target.with_suffix('.mkv'); result=assets._exec(arguments+[str(target)])
             if result.returncode: raise ValueError('最终合并失败：'+result.stderr.decode('utf-8','replace')[-600:])
         finally:
             list_path.unlink(missing_ok=True)  # 仅删除本函数刚创建的可重建concat清单。
@@ -252,7 +261,7 @@ def merge_final(records, directory="", prefix="最终合并", normalize=False):
             if not duration: raise ValueError('无法读取成果时长')
             if kind=='video':
                 rate=Fraction(str(first['fps'])).limit_denominator(100000)
-                filters.append(f"[{i}:v]scale={first['width']}:{first['height']}:force_original_aspect_ratio=decrease,pad={first['width']}:{first['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate.numerator}/{rate.denominator},format=yuv444p,setpts=PTS-STARTPTS[v{i}]")
+                filters.append(f"[{i}:v]format={pixel_format},scale={first['width']}:{first['height']}:force_original_aspect_ratio=decrease,pad={first['width']}:{first['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate.numerator}/{rate.denominator},format={pixel_format},setpts=PTS-STARTPTS[v{i}]")
                 inputs.append(f'[v{i}]')
             if audio_enabled:
                 rate=int(first.get('sample_rate') or 48000)
@@ -264,8 +273,11 @@ def merge_final(records, directory="", prefix="最终合并", normalize=False):
         outputs=('[vout]' if kind=='video' else '')+('[aout]' if audio_enabled else '')
         filters.append(''.join(inputs)+f"concat=n={len(sources)}:v={int(kind=='video')}:a={int(audio_enabled)}"+outputs)
         arguments+=['-filter_complex',';'.join(filters)]
-        if kind=='video': arguments+=['-map','[vout]','-c:v','libx264','-crf','0','-pix_fmt','yuv444p']
-        if audio_enabled: arguments+=['-map','[aout]','-c:a','pcm_f32le']
+        if kind=='video': arguments+=['-map','[vout]','-c:v','libx264','-crf','18','-preset','veryfast','-pix_fmt',pixel_format]
+        if audio_enabled:
+            arguments+=['-map','[aout]','-c:a','pcm_f32le'] if kind=='audio' else ['-map','[aout]','-c:a','aac','-b:a','192k']
         result=assets._exec(arguments+[str(target)])
+        if result.returncode and kind=='video' and target.suffix=='.mp4':
+            target=target.with_suffix('.mkv'); result=assets._exec(arguments+[str(target)])
         if result.returncode: raise ValueError('最终合并失败：'+result.stderr.decode('utf-8','replace')[-600:])
     return publish_final(target,kind,{'label':'合并成果','kind':kind,'items':sources},directory,prefix)

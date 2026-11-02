@@ -84,7 +84,8 @@ const CSS = `
 .ad-glass .h3-clip.v{background:#3d5e8b!important;border-color:#7a95ba!important}.ad-glass .h3-clip.a{background:#285955!important;border-color:#538e88!important}
 .ad-glass .h3-clip.selected,.ad-glass .h3-generation-clip.selected{border-color:#accdff!important;box-shadow:0 0 0 1px #99bff2!important}
 .ad-glass .h3-generation-clip{background:#324e73!important;border-color:#496e9b!important;color:#dfebfa!important}
-.ad-glass .h3-smart-row{flex-wrap:wrap!important;gap:8px;font-size:12px;padding:8px;border:1px solid #4b5b74;border-radius:9px;background:#2e3b4e}
+.ad-glass .h3-smart-row{flex-wrap:nowrap!important;overflow-x:auto;gap:8px;font-size:12px;padding:8px;border:1px solid #4b5b74;border-radius:9px;background:#2e3b4e}
+.ad-glass .h3-smart-row>*{flex-shrink:0}
 .ad-glass .h3-smart-row select,.ad-glass .h3-smart-row input{background:#38475d;color:#f0f4fa;border-color:#536682;font-size:12px}
 .ad-glass .h3-smart-row input[type=checkbox]{width:14px;height:14px;min-height:14px}.ad-glass .h3-smart-info{color:#e0b871;font-size:11px;white-space:normal}
 .ad-glass .h3-smartcut{background:#d2a54f}.ad-glass .h3-smartcut:before{background:#d2a54f}

@@ -93,6 +93,13 @@ def guarded(function):
     return wrapper
 
 
+@routes.post('/aiden_h3/task/bind')
+@guarded
+async def bind_workflow_task(request):
+    from .workflow_tasks import bind_task
+    return web.json_response(await asyncio.to_thread(bind_task,await request.json()))
+
+
 @routes.post("/aiden_h3/storage/cleanup")
 @guarded
 async def clear_storage_cache(request):
@@ -106,6 +113,26 @@ async def clear_storage_cache(request):
     result = await asyncio.to_thread(cleanup.clean_cache, confirmed)
     if result["blocked"]:
         return web.json_response({"error": "有任务进行中或进度无法核对，已保留缓存"}, status=409)
+    result["usage"] = await asyncio.to_thread(cleanup.usage)
+    return web.json_response(result)
+
+
+@routes.post("/aiden_h3/storage/versions/cleanup")
+@guarded
+async def clean_old_versions(request):
+    """删除非选用旧版本的成片/尾帧/音频与超限组快照；需要二次确认。"""
+    data = await request.json()
+    confirmed = data.get("confirmed") is True
+    if _storage_busy():
+        return web.json_response({"error": "当前有任务运行或排队，请完成后再清理旧版本"}, status=409)
+    try:
+        keep = min(max(int(data.get("keep_recent", 3)), 0), 20)
+    except (TypeError, ValueError):
+        keep = 3
+    if confirmed:
+        from .assets import PREPARED_MEDIA
+        PREPARED_MEDIA.clear()
+    result = await asyncio.to_thread(cleanup.clean_versions, confirmed, keep)
     result["usage"] = await asyncio.to_thread(cleanup.usage)
     return web.json_response(result)
 
@@ -145,7 +172,7 @@ async def upload(request):
             while chunk := await field.read_chunk(8 * 1024 * 1024):
                 size += len(chunk)
                 if size > 1024 * 1024 * 1024:
-                    raise ValueError("单个素材文件超过 1 GB，请先分段")
+                    raise ValueError("单个素材文件超过 1 GB，请先压缩或拆分文件后再导入")
                 await asyncio.to_thread(reservation.grow, len(chunk))
                 def write_chunk(block=chunk):
                     handle.write(block)
@@ -227,7 +254,8 @@ async def _import_one(path, target_input=False):
     return source
 
 
-MEDIA_INFO_CACHE = {}
+MEDIA_INFO_CACHE = OrderedDict()
+MEDIA_INFO_CACHE_LIMIT = 64
 
 
 @routes.post("/aiden_h3/open_folder")
@@ -252,6 +280,33 @@ async def open_folder(request):
     except Exception as error:
         raise ValueError(f"无法打开文件夹：{error}")
     return web.json_response({"path": str(folder), "mode": mode})
+
+
+def _same_content(left, right):
+    try:
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        return _content_hash(left) == _content_hash(right)
+    except OSError:
+        return False
+
+
+def _library_target(media, source):
+    """素材库同名文件内容不同时不覆盖也不误用旧文件；另存为 原名-内容哈希前缀。"""
+    media.mkdir(parents=True, exist_ok=True)
+    target = media / source.name
+    if not target.exists() or _same_content(target, source):
+        return target
+    stem, suffix = source.stem, source.suffix
+    digest = _content_hash(source)[:8]
+    candidate = media / f"{stem}-{digest}{suffix}"
+    if not candidate.exists() or _same_content(candidate, source):
+        return candidate
+    for index in range(2, 1000):
+        candidate = media / f"{stem}-{digest}-{index}{suffix}"
+        if not candidate.exists() or _same_content(candidate, source):
+            return candidate
+    raise ValueError(f"无法为同名素材生成唯一文件名：{source.name}")
 
 
 @routes.post("/aiden_h3/load_library_dir")
@@ -279,12 +334,12 @@ async def load_library_dir(request):
                     if mode == "generated":
                         target_dir = input_library / folder_name
                         target_dir.mkdir(parents=True, exist_ok=True)
-                        target = target_dir / item.name
+                        target = await asyncio.to_thread(_library_target, target_dir, item)
                         if not target.exists():
                             await asyncio.to_thread(cleanup.copy_import, item, target)
                         sources.append({"id": _uuid.uuid4().hex, "kind": kind, "origin": "input",
                                         "file": f"{layout.INPUT_LIBRARY}/{folder_name}/{target.name}",
-                                        "name": item.name,
+                                        "name": target.name,
                                         "duration": None if kind == "image" else await asyncio.to_thread(probe_duration, target)})
                     else:
                         sources.append({"id": _uuid.uuid4().hex, "kind": kind, "origin": "input",
@@ -351,7 +406,8 @@ async def library_load(request):
             generated = layout.resolve_output_file(raw)
             if generated is None:
                 raise ValueError(f"生成物不存在：{raw}")
-            target = input_library / layout.KIND_DIRS[kind] / generated.name
+            target_dir = input_library / layout.KIND_DIRS[kind]
+            target = await asyncio.to_thread(_library_target, target_dir, generated)
             if not target.is_file():
                 size = generated.stat().st_size
                 content_hash = await asyncio.to_thread(_content_hash, generated)
@@ -364,7 +420,7 @@ async def library_load(request):
             duration = None if kind == "image" else await asyncio.to_thread(probe_duration, target)
             sources.append({"id": target.stem, "kind": kind, "origin": "input",
                             "file": target.relative_to(source_base).as_posix(),
-                            "name": generated.name, "duration": duration})
+                            "name": target.name, "duration": duration})
         else:
             path = layout.resolve_input_file(raw)
             if path is None:
@@ -571,7 +627,7 @@ async def manifest(request):
     data = await request.json()
     track = data.get("track", "")
     if not track or "/" in track or "\\" in track:
-        raise ValueError("请选择已保存的 Audio Oasis 分段清单")
+        raise ValueError("该旧接口需要 Audio Oasis 分段目录名；当前界面未提供 Audio Oasis 入口。")
     path = contained(Path(folder_paths.get_input_directory()) / "audio_oasis", track + "/manifest.json")
     with path.open(encoding="utf-8") as handle:
         saved = json.load(handle)
@@ -648,14 +704,18 @@ def sync_graph_now(data):
         except Exception:
             session_raw = None
     session_id = identifier(session_raw or f"AD-H3-{node_id}")
+    from .workflow_tasks import prompt_task
+    task = prompt_task(prompt,node_id,data.get('workflow'))
     try:
         existing = STORE.read(session_id)
-        if existing.get("execution_round"):
+        if task and existing.get('workflow_task_id') not in {None,task}:
+            raise ValueError('此进度属于其它工作流的任务，已拒绝；请重新打开本工作流的保存版本后再试。')
+        if existing.get("execution_round") and existing.get("status") in {"queued","running","merging"}:
             return existing
     except FileNotFoundError:
         pass
     if not link:
-        raise ValueError("独立模式请用「分段循环」逐段执行；连分段清单后才能用开始/分段循环。")
+        raise ValueError("当前是独立模式（未连接素材清单）：请连接「素材准备」的「分段清单」输出后再用「开始」；独立模式可用「分段循环」。")
     queue_node = prompt[link[0]]
     if queue_node["class_type"] != "AidenH3AudioQueue" or link[1] != 0:
         raise ValueError("当前段的 queue 需要连接 H3 多段音频队列")
@@ -663,7 +723,7 @@ def sync_graph_now(data):
     from .timeline import timeline_plan
     plan = timeline_plan(raw_state)
     entries = plan["entries"]
-    if not entries:raise ValueError("请设置每段长度和分段数，或在时间线上切分视频/音频后再生成。")
+    if not entries:raise ValueError("没有可生成的分段：请先导入图片/视频/音频；纯图片模式按图片数量分段，音视频可设置每段长度或分段数。")
     from .spec import FPS
     from .timeline import loop_settings
     fps = float(FPS)
@@ -680,7 +740,14 @@ def sync_graph_now(data):
     signature, template = template_for(prompt, node_id, {"workflow": data.get("workflow", {})})
     template["client_id"] = data.get("client_id")
     signatures = segment_signatures(prompt, node_id, entries, fps)
-    state = STORE.sync(session_id, entries, signatures, template)
+    state = STORE.sync(session_id, entries, signatures, template, keep_completed=True)
+    if task:
+        with STORE.lock(session_id):
+            owned=STORE._load(session_id)
+            if owned.get('workflow_task_id') not in {None,task}:
+                raise ValueError('此进度属于其它工作流的任务，已拒绝；请重新打开本工作流的保存版本后再试。')
+            if owned.get('workflow_task_id')!=task:
+                owned['workflow_task_id']=task;state=STORE._save(owned)
     if data.get("auto_accept"):
         state = _enable_auto_accept(session_id)
     return state
@@ -703,7 +770,7 @@ async def save_to_desktop(request):
     roots={"input":[input_root,input_root/layout.INPUT_LIBRARY,input_root/layout.LEGACY_INPUT_LIBRARY],"output":[output_root],
            "media":[Path(ROOT)/"media",input_root/layout.INPUT_LIBRARY,input_root/layout.LEGACY_INPUT_LIBRARY],"session":[STORE.root]}
     if origin not in roots:
-        raise ValueError("未知素材来源")
+        raise ValueError("无法识别的素材来源，请重新导入或重新选择素材。")
     candidates=[contained(root,name) for root in roots[origin]]
     source = next((path for path in candidates if path.is_file()), None)
     if source is None:
@@ -827,10 +894,18 @@ async def action(request):
         existing = STORE.read(session_id)
     except FileNotFoundError:
         existing = {}
+    if existing and data.get("prompt") and data.get("segment_node") is not None:
+        from .workflow_tasks import prompt_task
+        task=prompt_task(data["prompt"],data["segment_node"],data.get("workflow"))
+        if task and existing.get("workflow_task_id") not in {None,task}:
+            raise ValueError("当前进度属于其它工作流的任务，已拒绝混用；请重新打开本工作流后再试。")
+    if command == "new_group" and not existing:
+        state = await sync_from_graph(data)
+        return web.json_response(public_state(state))
     if data.get("auto_accept") and existing and not existing.get("auto_accept"):
         existing = _enable_auto_accept(session_id)
     if command == "redo_preview" and not data.get("prompt") and existing.get("execution_round"):
-        raise ValueError("本段抽卡需要当前编辑内容，请从分段预览按钮操作")
+        raise ValueError("本段抽卡需要当前编辑内容，请从「分段预览」的「本段抽卡」按钮操作。")
     if command == "redo_preview" and data.get("prompt"):
         if not existing:
             existing = await sync_from_graph(data)
@@ -849,7 +924,7 @@ async def action(request):
     if command in {"resume_round", "resume_after"}:
         # 分段循环续跑：用当前最新编辑重新冻结本轮，保留前面结果，从指定段继续。
         if not data.get("prompt") or data.get("segment_node") is None:
-            raise ValueError("缺少当前编辑内容，无法继续本轮；请从分段预览的分段循环重试")
+            raise ValueError("缺少当前编辑内容，无法继续本轮；请从「分段预览」点「分段循环」重试。")
         if not existing:
             raise ValueError("尚未开始本轮，无法续跑")
         if existing.get("status") in {"queued", "running", "merging"}:
@@ -857,7 +932,7 @@ async def action(request):
         anchor = 0
         if command == "resume_round":
             if existing.get("status") != "error":
-                raise ValueError("当前不是报错状态，无需从报错段继续")
+                raise ValueError("当前不是报错状态，不需要从报错段继续；直接点「开始」即可。")
         else:
             try:
                 anchor = int(data.get("index") or 0)
@@ -866,24 +941,30 @@ async def action(request):
             if anchor <= 0:
                 raise ValueError("请先在「分段生成」里选中要从其后续跑的预览卡")
         if command == "resume_after":
-            # 保留进度与清空重置都能选卡续跑，恢复本轮素材，不把下一轮草稿带进来。
+            # 保留已通过前缀，后续段采用最新编辑；选中原末段只标完成。
             with STORE.lock(session_id):
                 original = STORE._load(session_id)
                 candidate = copy.deepcopy(original)
+                preview=data.get("preview") or {}
+                group=int(preview.get("round_no") or 0) if "round_no" in preview else int(candidate.get("round_no",1))
+                if group!=int(candidate.get("round_no",1)):
+                    from .group_history import restore
+                    candidate=restore(STORE,candidate,group,data.get("group_previews") or [preview])
                 anchor = rounds.resolve_resume_anchor(candidate, data.get("preview"), anchor)
                 rounds.accept_through(candidate, anchor)
-                reference = original.get("execution_round") or original.get("resume_round")
-                snapshot = rounds.read_snapshot({**original, "execution_round": reference}) if reference else None
-                source = (snapshot or {}).get("prompt") or (original.get("template") or {}).get("prompt") or data["prompt"]
-                materials = (snapshot or {}).get("materials") or rounds.capture_materials(source, str(data["segment_node"]))
-                rounds.validate_assets({"assets": materials.get("assets", [])})
-                prepared = rounds.apply_materials(data["prompt"], str(data["segment_node"]), materials, source)
+                from .storage import contained
+                for row in candidate["segments"][:anchor]:
+                    version=next(v for v in row["versions"] if v["id"]==row["selected"])
+                    if not contained(STORE.directory(session_id),version["file"]).is_file():
+                        raise ValueError("该组已通过的前段结果文件缺失，本次没有切换组或推进进度。请先恢复或重做该组前段。")
                 candidate.update(auto_accept=True, auto=False, pause_after=False, active=None, error="")
-                if reference:
-                    candidate["execution_round"] = copy.deepcopy(reference)
+                candidate.pop("execution_round", None)
                 STORE._save(candidate)
+                if candidate["status"] == "completed":
+                    return web.json_response(public_state(candidate))
                 try:
-                    state = rounds.freeze(candidate, prepared, str(data["segment_node"]), data.get("workflow"), True, materials=materials)
+                    state = sync_graph_now(data)
+                    state = rounds.freeze(state, data["prompt"], str(data["segment_node"]), data.get("workflow"), True)
                 except Exception:
                     STORE._save(original)
                     raise
@@ -897,14 +978,14 @@ async def action(request):
             STORE._save(current)
         state = await sync_from_graph(data)
         if state["id"] != session_id:
-            raise ValueError("进度名称与工作流不一致")
+            raise ValueError("当前页面提交的进度与后台不一致，本次操作已取消；请保存工作流后重新打开再试。")
         state = await asyncio.to_thread(rounds.freeze, state, data["prompt"],
                                         str(data["segment_node"]), data.get("workflow"), True)
         return web.json_response(public_state(state))
-    if command not in {"pause", "stop", "clear", "select", "merge", "settings"} and data.get("prompt"):
+    if command not in {"pause", "stop", "clear", "new_group", "select", "merge", "settings"} and data.get("prompt"):
         state = await sync_from_graph(data)
         if state["id"] != session_id:
-            raise ValueError("进度名称与工作流不一致")
+            raise ValueError("当前页面提交的进度与后台不一致，本次操作已取消；请保存工作流后重新打开再试。")
     if command == "merge":
         state = await asyncio.to_thread(merge_session, session_id)
     elif command == "stop":
@@ -971,7 +1052,7 @@ def _resolve_media_path(origin: str, name: str):
              "media": [Path(ROOT) / "media", input_root / layout.INPUT_LIBRARY, input_root / layout.LEGACY_INPUT_LIBRARY],
              "session": [STORE.root]}
     if origin not in roots:
-        raise ValueError("未知素材来源")
+        raise ValueError("无法识别的素材来源，请重新导入或重新选择素材。")
     source = next((path for path in (contained(root, name) for root in roots[origin]) if path.is_file()), None)
     if source is None:
         raise ValueError(f"找不到素材文件：{name}")
@@ -1039,6 +1120,7 @@ async def media_info(request):
     key = f"{path.resolve()}|{path.stat().st_mtime_ns}"
     cached = MEDIA_INFO_CACHE.get(key)
     if cached:
+        MEDIA_INFO_CACHE.move_to_end(key)
         return web.json_response(cached)
     info = {"fps": 24.0, "frames": 0, "duration": 0.0}
     try:
@@ -1059,6 +1141,9 @@ async def media_info(request):
     except Exception:
         pass
     MEDIA_INFO_CACHE[key] = info
+    MEDIA_INFO_CACHE.move_to_end(key)
+    while len(MEDIA_INFO_CACHE) > MEDIA_INFO_CACHE_LIMIT:
+        MEDIA_INFO_CACHE.popitem(last=False)
     return web.json_response(info)
 
 
@@ -1195,7 +1280,7 @@ async def media(request):
     elif origin == "session":
         root = STORE.root
     else:
-        raise ValueError("未知素材来源")
+        raise ValueError("无法识别的素材来源，请重新导入或重新选择素材。")
     path = contained(root, request.match_info["file"])
     if path.suffix.lower() not in AUDIO_EXTS | VIDEO_EXTS | IMAGE_EXTS:
         raise ValueError("仅提供音频、视频与图片素材")
@@ -1214,7 +1299,7 @@ if STORE.root.is_dir():
         try:
             existing = STORE.read(progress.parent.name)
             if existing["status"] in {"queued", "running", "merging"}:
-                STORE.fail(existing["id"], "已恢复进度：上次任务未完成，请开始/恢复当前段")
+                STORE.fail(existing["id"], "上次任务没有正常结束，该进度已标记为可继续；点「开始」会从当前段继续。")
         except (OSError, ValueError, KeyError):
             pass
 

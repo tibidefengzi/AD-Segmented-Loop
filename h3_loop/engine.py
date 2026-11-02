@@ -246,7 +246,7 @@ async def enqueue(session_id):
         server.node_replace_manager.apply_replacements(prompt)
         valid = await execution.validate_prompt(prompt_id, prompt, template["targets"])
         if not valid[0]:
-            raise ValueError("工作流接线校验未通过：" + json.dumps(valid[3], ensure_ascii=False))
+            raise ValueError("工作流接线校验未通过（常见原因：缺少模型/加载器、节点必填输入为空或连线不完整）。可在 ComfyUI 控制台查看详细校验信息：" + json.dumps(valid[3], ensure_ascii=False))
         number = server.number
         server.number += 1
         extra = {"extra_pnginfo": template.get("extra_pnginfo", {}),"create_time":int(time.time()*1000)}
@@ -291,9 +291,9 @@ async def watch_prompt(session_id, token, prompt_id):
             if missing_history < (6 if current else 120):
                 continue
             if (state.get("active") or {}).get("token") == token:
-                STORE.fail(session_id, "任务已取消或队列被清空，可恢复当前段")
+                STORE.fail(session_id, "没有等到本次任务的执行结果（可能已被取消、队列被清空或服务重启）。点「开始」会从当前段继续。")
             else:
-                STORE.fail(session_id, "任务结束后没有收到执行记录，请检查队列后恢复或合并")
+                STORE.fail(session_id, "任务结束但没有收到执行记录（可能被取消或服务重启）。请点「开始」从当前段继续。")
             if state.get("preview_parent"):
                 from .rounds import finish_trial
                 finish_trial(session_id, success=False)
@@ -343,6 +343,11 @@ async def watch_prompt(session_id, token, prompt_id):
         return
 
 
+def _discard_merge_intermediates(directory, merge_id):
+    """合并中间目录只服务本次合并，成功/失败都可回收，避免会话目录无限增长。"""
+    shutil.rmtree(Path(directory) / ("finishing_" + str(merge_id)), ignore_errors=True)
+
+
 def merge_session(session_id):
     from .finishing import concat_picture, export_manifest, merge_options, prepare_merge, restore_audio, selected_versions, validate_inputs
     with STORE.lock(session_id):
@@ -359,9 +364,9 @@ def merge_session(session_id):
         validate_inputs(paths, versions)
         state["status"] = "merging"
         STORE._save(state)
+    directory = STORE.directory(session_id)
+    merge_id = uuid.uuid4().hex
     try:
-        directory = STORE.directory(session_id)
-        merge_id = uuid.uuid4().hex
         paths = prepare_merge(paths, versions, directory, directory/("finishing_"+merge_id), options)
         out = directory / ("merged_" + merge_id + ".mp4")
         picture = directory / ("picture_" + merge_id + ".mp4")
@@ -388,3 +393,6 @@ def merge_session(session_id):
     except Exception as exc:
         STORE.fail(session_id, exc)
         raise
+    finally:
+        # finishing_<id> 是本次合并的可重建中间产物：成功或失败都回收，避免会话目录无限增长。
+        _discard_merge_intermediates(directory, merge_id)

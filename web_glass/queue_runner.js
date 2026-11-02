@@ -10,27 +10,31 @@ export async function interruptOwnedPrompt(api, owner) {
     if (owner._adH3PromptId === promptId) delete owner._adH3PromptId;
 }
 export async function executeQueueOnce(app, api, segmentId, {isStopped=()=>false, timeoutMs=3600000, pause=ms=>new Promise(resolve=>setTimeout(resolve,ms)), serialized=null, owner=null, waitForCompletion=true}={}) {
-    if (capturing) throw new Error("另一项任务正在提交，请稍后再试");
     if(isStopped()) return {stopped:true};
     let promptId;
-    const original=api.queuePrompt;
-    capturing=true;
-    api.queuePrompt=async function(...args) {
-        const result=await original.apply(this,args);
-        if(args[1]?.output?.[String(segmentId)]) {
-            promptId=result.prompt_id;
-            if (owner) owner._adH3PromptId=promptId;
-        }
-        return result;
-    };
-    try {
-        // 分段循环开始时已序列化本轮队列副本；切到其它工作流标签后继续使用它，
-        // 不能再调用 app.queuePrompt（那会改用当前激活画布）。
-        if (serialized) await api.queuePrompt(0, serialized);
-        else await app.queuePrompt(0,1);
+    if (serialized) {
+        // 直接使用这一次调用的返回值，不拦截共享API上的其它工作流提交。
+        const result=await api.queuePrompt(0,serialized);
+        promptId=result?.prompt_id;
+        if(owner&&promptId)owner._adH3PromptId=promptId;
+    } else {
+        if(capturing)throw new Error("另一项任务正在提交，请稍后再试");
+        const original=api.queuePrompt,graph=app.graph,state=graph?.state;
+        const task=graph?.extra?.ad_segmented_task?.id;
+        let enabled=true;
+        capturing=true;
+        api.queuePrompt=async function(...args) {
+            const submission=args[1],submittedTask=submission?.workflow?.extra?.ad_segmented_task?.id
+                ||submission?.output?.[String(segmentId)]?._meta?.ad_task_id;
+            const matches=!!submission?.output?.[String(segmentId)]&&(task?submittedTask===task:app.graph===graph&&graph?.state===state);
+            const result=await original.apply(this,args);
+            if(enabled&&matches&&!promptId){promptId=result?.prompt_id;if(owner&&promptId)owner._adH3PromptId=promptId;}
+            return result;
+        };
+        try{await app.queuePrompt(0,1);}
+        finally{enabled=false;api.queuePrompt=original;capturing=false;}
     }
-    finally { api.queuePrompt=original;capturing=false; }
-    if(!promptId) throw new Error("工作流未成功进入队列，请检查节点连线和输入参数");
+    if(!promptId) throw new Error("工作流未能进入队列：请先确认没有任务正在运行、节点输入完整；详细原因见 ComfyUI 运行记录。");
     if(isStopped()) { if(owner) await interruptOwnedPrompt(api,owner); return {stopped:true,promptId}; }
     if(!waitForCompletion) return {promptId};
     const deadline=Date.now()+timeoutMs;
@@ -49,5 +53,5 @@ export async function executeQueueOnce(app, api, segmentId, {isStopped=()=>false
         }
         await pause(400);
     }
-    throw new Error("等待生成超时，当前段未完成；请核对活动任务");
+    throw new Error("等待生成超时（默认 60 分钟）：当前段未完成。请先在 ComfyUI 队列查看活动任务，必要时点「停止」后重试。");
 }

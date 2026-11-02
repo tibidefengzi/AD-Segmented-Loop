@@ -1,4 +1,4 @@
-"""本轮素材与编辑草稿隔离；生成设置按当前提交生效，试跑保持独立会话。"""
+"""每次提交的执行副本：已提交段稳定，下一段读取当前素材和设置。"""
 from __future__ import annotations
 
 import copy
@@ -200,12 +200,11 @@ def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None):
     with STORE.lock(sid):
         current = STORE._load(sid)
         previous = read_snapshot(current)
-        if materials is None and previous:
-            materials = previous.get("materials") or capture_materials(previous["prompt"], node_id)
+        # 普通提交不继承旧组素材；显式materials仅保留为兼容适配工具。
         if materials is not None:
             validate_assets({"assets": materials.get("assets", [])})
             prompt = apply_materials(prompt, node_id, materials, (previous or {}).get("prompt"))
-        # 每次生成参数仍使用最新提交；素材绑定沿用本轮，普通素材编辑留给下一轮。
+        # 本次提交中的素材、连线、参数固定，下一次提交会重新读取。
         token = uuid.uuid4().hex
         graph = component(prompt, node_id)
         # 快照内固定会话名，后续画布更换清单/连线不会改变当前轮归属。
@@ -307,6 +306,10 @@ def prepare(data):
     bound = {}
     for item in bindings:
         try:
+            declared=session_for(prompt,str(item['segment_node'])) if str(item['segment_node']) in prompt else None
+            task=((data.get('workflow') or {}).get('extra') or {}).get('ad_segmented_task')
+            if task and declared!=item['session_id']:
+                continue  # 不用其它工作流遗留的轮次绑定覆盖当前任务命名空间。
             if STORE.read(identifier(item["session_id"])).get("execution_round"):
                 bound[str(item["segment_node"])] = item["session_id"]
         except FileNotFoundError:
@@ -327,19 +330,20 @@ def prepare(data):
             state = STORE.read(sid)
         except FileNotFoundError:
             state = None
+        from .workflow_tasks import prompt_task
+        task = prompt_task(prompt, node_id, data.get("workflow"))
+        if task and (state or {}).get("workflow_task_id") not in {None, task}:
+            raise ValueError("当前进度属于其它工作流的任务，已拒绝混用；请重新打开本工作流后再试。")
         trial = (state or {}).get("draft_trial")
         if trial:
             state = STORE.read(trial["session_id"])
         else:
             if node_id not in prompt:
                 continue  # 已拆掉连线：本轮不生成这一段。
-            previous = read_snapshot(state) if state else None
-            materials = None
-            if previous:
-                materials = previous.get("materials") or capture_materials(previous["prompt"], node_id)
-                validate_assets({"assets": materials.get("assets", previous.get("assets", []))})
-                draft = apply_materials(draft, node_id, materials, previous["prompt"])
-            # 更新参数快照前先恢复本轮素材，防止下一轮素材草稿改写当前段表或参考口。
+            active = (state or {}).get("active") or {}
+            if (state or {}).get("status") in {"queued","running"} and active.get("prompt_id"):
+                raise ValueError("当前段仍在执行：请等待本段完成，或先点「停止」再提交，避免修改已提交的当前段。")
+            # 下一段重新读取画布，不把旧组素材重新覆盖到最新编辑。
             with STORE.lock(sid):
                 try:
                     current = STORE._load(sid)
@@ -362,7 +366,7 @@ def prepare(data):
             else:
                 draft.setdefault(node_id, {}).setdefault("inputs", {})["session_id"] = sid
             state = sync_graph_now({**data, "prompt": draft, "segment_node": node_id})
-            state = freeze(state, draft, node_id, data.get("workflow"), materials=materials)
+            state = freeze(state, draft, node_id, data.get("workflow"))
         snapshot = read_snapshot(state)
         if not snapshot:
             continue
@@ -398,6 +402,21 @@ def start_trial(data):
         if parent["status"] in {"queued", "running", "merging"} or parent.get("draft_trial"):
             raise ValueError("请先停止分段循环，并等待本段抽卡结束")
         target = int(data.get("index", parent["cursor"]))
+        preview = data.get("preview")
+        trial_round = int(parent.get("round_no", 1) or 1)
+        origin_state=parent
+        if isinstance(preview, dict) and preview.get("file"):
+            # 抽卡归属来自被点选卡片；素材/生成设置仍取当前编辑，不恢复旧组执行。
+            if "round_no" in preview:
+                trial_round = int(preview["round_no"] or 0)
+                if not 0 <= trial_round <= max(int(parent.get("group_seq",1)),int(parent.get("round_no", 1) or 1)):
+                    raise ValueError("所选卡片组号无效，请重新选择原预览")
+            if trial_round and trial_round!=int(parent.get("round_no",1)):
+                from .group_history import lookup,archive
+                origin_state=lookup(STORE,parent,trial_round,data.get("group_previews") or [preview])
+                archive(STORE,origin_state)
+                parent.setdefault('group_snapshots',{}).update(origin_state.get('group_snapshots') or {})
+            target = resolve_resume_anchor(origin_state, preview, target + 1) - 1
         if target < 0 or target >= len(parent["segments"]) and not data.get("draft_target"):
             raise ValueError("无效段号")
         child_id = "trial_" + uuid.uuid4().hex
@@ -418,16 +437,24 @@ def start_trial(data):
         request = uuid.uuid4().hex
         # 前段尾帧只读原轮选用版本；将元数据拷入独立会话，文件仍由原轮保管。
         for index in range(target):
-            row = parent["segments"][index] if index < len(parent["segments"]) else None
+            row = origin_state["segments"][index] if index < len(origin_state["segments"]) else None
             if row is None:
                 continue
             child["segments"][index].update(versions=copy.deepcopy(row["versions"]),
                                             selected=row["selected"], valid=row["valid"], accepted=row["accepted"])
-        child.update(cursor=target, auto=False, status="ready",
-                     # 抽卡属于父会话的同一轮：trial 子会话继承父轮号，结果为 R{轮}-{段}-{次}。
-                     round_no=int(parent.get("round_no", 1) or 1),
+        reset_id = origin_state.get("reset_id", "legacy")
+        prior = origin_state["segments"][target].get("versions", []) if target < len(origin_state["segments"]) else []
+        prior = [v for v in prior if v.get("preview_only") and not v.get("archived") and v.get("reset_id", "legacy") == reset_id]
+        redraw_count = max([len(prior), *(int(v.get("redraw_count") or 0) for v in prior)]) + 1
+        child.update(cursor=target, auto=False, status="ready", reset_id=reset_id,
+                     # 保留被抽卡片的组号，即使父会话已清空进入下一组。
+                     round_no=trial_round,
                      preview_parent={"session_id": sid, "epoch": parent["epoch"], "request_id": request,
-                                     "index": target, "segment_key": parent["segments"][target]["segment_key"] if target < len(parent["segments"]) else None})
+                                     "index": target, "redraw_count": redraw_count,
+                                     "segment_key": parent["segments"][target]["segment_key"] if target < len(parent["segments"]) else None})
+        if origin_state is not parent:
+            child["preview_parent"]["group_file"]=(parent.get('group_snapshots') or {}).get(str(trial_round))
+            child["preview_parent"]["segment_key"]=origin_state['segments'][target]['segment_key']
         STORE._save(child)
         freeze(child, graph, node_id, data.get("workflow"))
         parent["draft_trial"] = {"session_id": child_id, "request_id": request, "target": target}
@@ -447,7 +474,10 @@ def finish_trial(child_id, success=True):
             return  # 已停止/清空的迟到试跑只留在自己的会话中。
         if parent["epoch"] != source["epoch"]:
             return
-        row = parent["segments"][source["index"]] if source.get("segment_key") else None
+        destination=parent
+        if source.get("group_file"):
+            with contained(STORE.directory(sid),source["group_file"]).open(encoding="utf-8") as handle:destination=json.load(handle)
+        row = destination["segments"][source["index"]] if source.get("segment_key") else None
         if row is not None and row["segment_key"] != source["segment_key"]:
             raise ValueError("试跑对应的原段已改变；试跑文件已保留")
         if success:
@@ -478,17 +508,20 @@ def finish_trial(child_id, success=True):
                         if not metadata.exists():
                             with src.with_suffix(".json").open("rb") as incoming, metadata.open("xb") as output:
                                 shutil.copyfileobj(incoming, output)
-                version.update(preview_only=True, trial_request=source["request_id"],
+                version.update(preview_only=True, round_no=child.get("round_no", 0), trial_request=source["request_id"],
+                               redraw_count=source.get("redraw_count", 0),
                                trial_session=child_id, trial_file=trial_file)
                 versions = row["versions"] if row is not None else parent.setdefault("draft_candidates", [])
                 version["draft_index"] = source["index"]
                 if not any(v.get("trial_request") == source["request_id"] for v in versions):
                     versions.append(version)
-                if parent.get("auto_accept") and row is not None:
+                if parent.get("auto_accept") and row is not None and child.get("round_no")==destination.get("round_no"):
                     # 新界面生成即通过：最新抽卡结果直接成为该段当前选用/通过版本，不改变游标。
                     row["selected"] = version["id"]
                     row["valid"] = True
                     row["accepted"] = True
+        if destination is not parent:
+            atomic_json(contained(STORE.directory(sid),source["group_file"]),destination)
         parent.pop("draft_trial", None)
         STORE._save(parent)
 
@@ -506,7 +539,10 @@ def cancel_trial(sid, request_id=None):
 
 
 def prompt_handler(data):
-    if data.pop("ad_round_prepared", False):
+    # /round/prepare 已经处理过的提交会带标记（工作流前端在提交副本的 extra 中写入）；
+    # 这里跳过二次 prepare，避免每次排队重复 sync/freeze、重复写轮次快照。
+    prepared_extra = (((data.get("extra_data") or {}).get("extra_pnginfo") or {}).get("workflow") or {}).get("extra") or {}
+    if data.pop("ad_round_prepared", False) or prepared_extra.get("ad_round_prepared"):
         return data
     if not any(n.get("class_type") == "AidenH3Segment" for n in (data.get("prompt") or {}).values()):
         return data

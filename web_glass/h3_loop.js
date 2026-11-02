@@ -1,18 +1,20 @@
 // CACHEBUST ref-link-preserve 20261025-053810
 // cachebust 20261025-0440 segment-dedupe-materials
 // CACHEBUST 2026-10-25-restore-v027-approved-043100
-import "./ad_theme.js?v=20261027-v039-share";
+// CACHEBUST 20261102-group-v64：统一 web_glass 模块版本号，模块去重并避免沿用旧缓存
+import "./ad_theme.js?v=20261102-group-v64";
+import {ensureWorkflowTask,currentTaskId} from "./workflow_task.js?v=20261102-group-v64";
 // final_output.js由ComfyUI作为扩展入口自动加载，不重复注册。
-import { installGlassTheme } from "./glass_ui.js?v=20261031-fullscreen-center-v27";
-import { executeQueueOnce, interruptOwnedPrompt } from "./queue_runner.js?v=20261031-integrity-v36";
+import { installGlassTheme } from "./glass_ui.js?v=20261102-group-v64";
+import { executeQueueOnce, interruptOwnedPrompt } from "./queue_runner.js?v=20261102-group-v64";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js?v=20261101-five-fixes-v44";
-import { mountNativePlayer } from "./native_player.js?v=20261101-history-v46";
-import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261031-fullscreen-v27";
-import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261031-round-v29";
+import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js?v=20261102-group-v64";
+import { mountNativePlayer } from "./native_player.js?v=20261102-group-v64";
+import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261102-group-v64";
+import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261102-group-v64";
 
-import { installRoundQueue } from "./round_queue.js?v=20261031-round-v29";
+import { installRoundQueue } from "./round_queue.js?v=20261102-group-v64";
 installRoundQueue(api, app);
 installProgressEvents(api);
 
@@ -135,7 +137,7 @@ styles.textContent = `
 `;
 document.head.appendChild(styles);
 
-const label = {ready:"待生成",queued:"已排队",running:"生成中",review:"已生成",paused:"已暂停",completed:"全部完成",merging:"正在合并",error:"运行中断"};
+const label = {ready:"待生成",queued:"已排队",running:"生成中",review:"已完成待继续",paused:"已停止",completed:"全部完成",merging:"正在合并",error:"出错了"};
 const natural = new Intl.Collator(undefined, {numeric:true, sensitivity:"base"});
 const esc = value => String(value).replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 const mediaUrl = (origin, file) => api.apiURL(`/aiden_h3/media/${origin}/${file.split("/").map(encodeURIComponent).join("/")}`);
@@ -273,18 +275,19 @@ function hideWidget(node, name) {
 }
 
 function upstreamSegment(viewer) {
+    const graph=viewer.graph;if(!graph)return null;
     // 新布局：直接连「当前段上下文」；旧布局兼容 视频→记录分段结果→context
     const bound=viewer.properties?.ad_execution_round;
-    const saved=bound?.id && app.graph.getNodeById(Number(bound.segment_node));
+    const saved=bound?.id && graph.getNodeById(Number(bound.segment_node));
     if(saved?.comfyClass==="AidenH3Segment")return saved;
-    const direct=app.graph.links[viewer.inputs?.find(input=>input.name==="context")?.link];
-    const directNode=direct && app.graph.getNodeById(direct.origin_id);
+    const direct=graph.links?.get?.(viewer.inputs?.find(input=>input.name==="context")?.link)||graph.links?.[viewer.inputs?.find(input=>input.name==="context")?.link];
+    const directNode=direct && graph.getNodeById(direct.origin_id);
     if(directNode?.comfyClass==="AidenH3Segment") return directNode;
-    const link=app.graph.links[viewer.inputs?.find(input=>input.name==="video")?.link];
-    const commit=link && app.graph.getNodeById(link.origin_id);
+    const link=graph.links?.get?.(viewer.inputs?.find(input=>input.name==="video")?.link)||graph.links?.[viewer.inputs?.find(input=>input.name==="video")?.link];
+    const commit=link && graph.getNodeById(link.origin_id);
     if(commit?.comfyClass!=="AidenH3Commit")return null;
-    const context=app.graph.links[commit.inputs?.find(input=>input.name==="context")?.link];
-    const segment=context && app.graph.getNodeById(context.origin_id);
+    const context=graph.links?.get?.(commit.inputs?.find(input=>input.name==="context")?.link)||graph.links?.[commit.inputs?.find(input=>input.name==="context")?.link];
+    const segment=context && graph.getNodeById(context.origin_id);
     return segment?.comfyClass==="AidenH3Segment" ? segment : null;
 }
 
@@ -323,15 +326,16 @@ function mountReview(node) {
     node._adH3FollowCurrent = () => lastState && followRunningSegment(node, {...lastState, status: "queued"});
     const say=(text,error=false)=>{message.textContent=text;message.classList.toggle("error",error);try{node._adH3Hint?.(text,error);}catch{}};
     function sessionId(segment){
+        if(segment?.properties?.ad_task_session)return segment.properties.ad_task_session;
         const frozen = segment?.properties?.ad_execution_round;
         if (frozen?.session_id && frozen.id) return frozen.session_id;
         const direct=segment?.widgets?.find(widget=>widget.name==="session_id")?.value;
         if(direct) return direct;
         // 新布局：当前段不再带 session_id 控件，从上游素材清单库的状态里取
         try{
-            const app=window.app||window.comfyAPI?.app?.app;
-            const link=app?.graph?.links?.[segment?.inputs?.find(input=>input.name==="queue")?.link];
-            const queueNode=link&&app.graph.getNodeById(link.origin_id);
+            const graph=segment?.graph;
+            const link=graph?.links?.get?.(segment?.inputs?.find(input=>input.name==="queue")?.link)||graph?.links?.[segment?.inputs?.find(input=>input.name==="queue")?.link];
+            const queueNode=link&&graph.getNodeById(link.origin_id);
             const widget=queueNode?.widgets?.find(item=>item.name==="queue_state");
             const raw=typeof widget?.getValue==="function"?widget.getValue():widget?.value;
             const state=typeof raw==="string"?JSON.parse(raw):raw;
@@ -349,12 +353,13 @@ function mountReview(node) {
         const link = graph?.links?.get?.(input?.link) || graph?.links?.[input?.link];
         updateSessionProgress(node, segment, link && graph?.getNodeById?.(link.origin_id), state);
         node._adH3Preview?.updateState(state);
-        status.textContent=`第 ${state.cursor+1}/${state.segments.length} 段 · ${label[state.status]||state.status}`;
+        const shownIndex=Math.min(Math.max(Number(state.cursor)||0,0),Math.max(0,state.segments.length-1));
+        status.textContent=`第 ${shownIndex+1}/${state.segments.length} 段 · ${label[state.status]||state.status}`;
         if(state.error)say(state.error,true);
         const running=["queued","running","merging"].includes(state.status);
         const row=state.segments[state.cursor];
         const canMerge=state.segments.every(item=>item.valid&&item.accepted);
-        const enabled={start:!running&&!row.valid,
+        const enabled={start:!running&&!row?.valid,
             redo:!running,auto:!running,merge:!running&&canMerge,clear:!running,
             run_segment:!running,run_pending:!running};
         for(const button of root.querySelectorAll("[data-command]"))button.disabled=busy||!enabled[button.dataset.command];
@@ -366,7 +371,7 @@ function mountReview(node) {
             const version=row.versions.find(version=>version.id===row.selected);
             const text=row.valid?(row.accepted?"已生成":"生成中"):(row.versions.length?"待更新":"未生成");
             const source=version?`<a href="${esc(mediaUrl("session",`${state.id}/${version.file}`))}" target="_blank" rel="noopener">播放</a>`:"";
-            const options=row.versions.map((version,j)=>`<option value="${esc(version.id)}" ${version.id===row.selected?"selected":""}>版本 ${j+1}</option>`).join("");
+            const options=row.versions.filter(version=>!version.archived).map((version,j)=>`<option value="${esc(version.id)}" ${version.id===row.selected?"selected":""}>版本 ${j+1}</option>`).join("");
             cumulative+=version?.sync_error_ms||0;
             const sync=version?`<div class="h3-scores">${version.frames} 帧 · 本段偏差 ${(version.sync_error_ms||0).toFixed(3)} ms · 累计 ${cumulative.toFixed(3)} ms${version.reanchor?" · 原始参考重锚定":""}${version.reference_transition?" · 参考集已切换，请检查场景衔接":""}</div>`:"";
             return `<div class="h3-review-row ${i===state.cursor?"h3-current":""}"><span>第 ${i+1} 段 · ${text}</span>${source}${row.versions.length?`<select data-version="${i}" aria-label="第 ${i+1} 段版本">${!row.selected?'<option value="">选择版本</option>':""}${options}</select>`:""}${row.versions.length>1?`<button data-compare="${i}">A/B 对比</button>`:""}${sync}</div>`;
@@ -400,7 +405,7 @@ function mountReview(node) {
             node._adH3BatchStop=true;node._adH3StopEpoch=(Number(node._adH3StopEpoch)||0)+1;
             try { await interruptOwnedPrompt(api,node); } catch(error) { say(error.message,true); }
         }
-        if(node._adH3AffectedRunning && command!=="stop" && !(command==="redo_preview" && extra.draft_target)) {say("正在运行所选段，请等待完成或先点停止。",true);return false;}
+        if(node._adH3AffectedRunning && command!=="stop" && !(command==="redo_preview" && extra.draft_target)) {say("「运行此段」还在进行，请等待完成或先点「停止」。",true);return false;}
         if(busy && command !== "stop") {node._adH3LastActionError="上一项操作尚未结束，请稍后重试。";say(node._adH3LastActionError,true);return false;}
         const segment=upstreamSegment(node);
         if(!segment){say("请先连接当前段上下文。",true);return false;}
@@ -408,7 +413,7 @@ function mountReview(node) {
         if(command==="approve" && !segment.inputs?.find(input=>input.name==="queue")?.link){
             // 独立模式没有分段清单/会话：仅本地标记本次结果通过，不推进分段
             node._adH3StandaloneReady=false;
-            say("独立模式：本次结果已标记通过。");
+            say("独立模式没有会话进度，本次结果无法标记为已通过（仅保留预览）。");
             void refresh();
             return true;
         }
@@ -421,15 +426,38 @@ function mountReview(node) {
             const serialized=await app.graphToPrompt();
             if(operation!==actionRevision)return false;
             let result=null;
+            let effective=command;
             try{
-                result=await request("/aiden_h3/action",{command,session_id:sessionId(segment),segment_node:String(segment.id),
+                // 停止后改了种子：点开始应使用新种子重跑当前段，而不是接受旧结果继续。
+                if(command==="start" && lastState?.status==="paused"){
+                    const row=lastState.segments?.[lastState.cursor];
+                    const version=(row?.versions||[]).find(v=>v.id===row?.selected);
+                    if(row?.valid && row?.selected && version?.seeds){
+                        const norm=obj=>Object.fromEntries(Object.entries(obj||{}).filter(([,v])=>v&&typeof v==="object")
+                            .map(([k,v])=>[k,Object.fromEntries(Object.entries(v).map(([a,b])=>[a,String(b)]))]));
+                        const now={};
+                        for(const [nid,nd] of Object.entries(serialized.output||{})){
+                            const inputs=nd?.inputs||{},seeds={};
+                            for(const k of ["seed","noise_seed"])if(k in inputs)seeds[k]=inputs[k];
+                            if(Object.keys(seeds).length)now[nid]=seeds;
+                        }
+                        if(JSON.stringify(norm(now))!==JSON.stringify(norm(version.seeds))){
+                            effective="redo";say("检测到种子已修改，正在用新种子重跑当前段…");
+                        }else{
+                            effective="approve";
+                        }
+                    }
+                }
+                result=await request("/aiden_h3/action",{command:effective,session_id:sessionId(segment),segment_node:String(segment.id),
                     prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,confirmed:command==="clear",auto_accept:true,...extra});
                 if(operation!==actionRevision)return false;
-                if (command === "clear") {
+                if (command === "clear" || command === "new_group") {
                     if(segment.properties) delete segment.properties.ad_execution_round;
                     if(node.properties) delete node.properties.ad_execution_round;
+                    if(command === "new_group")node._adH3Preview?.resetGroupSelection?.();
                 }
                 previewId=result?.preview_hold?.request_id||"";
+                command=effective;
                 draw(result);
             }catch(error){
                 // 独立模式没有会话记录：重做/开始时直接重新排队当前轮
@@ -437,8 +465,8 @@ function mountReview(node) {
                 if(queueLinked || !["redo","redo_preview","start"].includes(command)) throw error;
             }
             const messages={stop:"已停止：当前生成已中断，分段循环待命；可点任意预览后「本段抽卡」，抽完点「开始」续接分段循环。",
-                clear:"已清空本轮进度，已有文件保留。",redo:"已重置当前段，正在重新抽卡…",redo_preview:"正在本段抽卡（新结果将直接作为该段当前选用）…",
-                start:"已开始生成当前段…",approve:"已自动通过当前段。",auto:"已开始分段循环。",merge:"合并操作已完成。",
+                new_group:"已新建一组，旧成果保留；点开始或分段循环生成。",clear:"已重置本轮进度；组号、预览与已生成文件保留。",redo:"已重置当前段，正在重新抽卡…",redo_preview:"正在本段抽卡（新结果将直接作为该段当前选用）…",
+                start:"已开始生成当前段…",approve:"已接受当前段。",auto:"已开始分段循环。",merge:"合并操作已完成。",
                 run_segment:"已切换到指定段：点「开始」只生成这一段，通过后自动回到原进度位置。",
                 run_pending:"已定位到待生成/待更新段：点「开始」只生成这一段，通过后自动回到原进度位置。"};
             say(command==="redo_preview" && result?.preview_hold?.select_on_success
@@ -459,22 +487,29 @@ function mountReview(node) {
                 if(result?.draft_trial) throw new Error("试跑已结束，等待结果登记，请稍后再继续");
                 say("本段抽卡完成：新结果已作为该段当前选用；点「开始」继续原循环。");
             }else if(command==="redo"||command==="start"){
-                if(typeof node._adH3Run==="function") {
-                    if(await node._adH3Run()===false)throw new Error("工作流未成功加入队列，请检查节点连线和输入参数");
-                }else if(app.queuePrompt) await app.queuePrompt(0,1);
-                else throw new Error("找不到工作流排队入口");
+                // 含“记录分段结果”的工作流由后台 action start 直接排队；此时前端不能再排一次，
+                // 否则第二次提交会被 round/prepare 拒绝并显示红色报错（后台其实已在生成）。
+                if(!result?.execution?.prompt_id){
+                    if(typeof node._adH3Run==="function") {
+                        if(await node._adH3Run()===false)throw new Error("工作流未能加入队列：请先确认当前段没有在运行，并检查节点输入是否完整；详细原因见 ComfyUI 运行记录。");
+                    }else if(app.queuePrompt) await app.queuePrompt(0,1);
+                    else throw new Error("找不到工作流排队入口");
+                }
             }
             if(command==="approve" && result){
                 const cursor=Number(result.cursor)||0;
                 const total=(result.segments||[]).length;
                 const approved=approvedIndex;
-                if(result.status==="review")say(`已自动通过第 ${approved} 段；第 ${cursor+1} 段已有生成结果。`);
+                if(result.status==="review")say(`已接受第 ${approved} 段；第 ${cursor+1} 段已有生成结果。`);
                 else if(result.status!=="completed" && cursor<total){
-                    say(`已自动通过第 ${approved} 段，正在生成第 ${cursor + 1} 段…`);
-                    if(typeof node._adH3Run==="function") node._adH3Run();
-                    else try{ if(app.queuePrompt) await app.queuePrompt(0,1); }catch{}
+                    say(`已接受第 ${approved} 段，正在生成第 ${cursor + 1} 段…`);
+                    // 后台已按执行快照排队时不再让前端重复提交，避免双提交报错。
+                    if(!result?.execution?.prompt_id){
+                        if(typeof node._adH3Run==="function") node._adH3Run();
+                        else try{ if(app.queuePrompt) await app.queuePrompt(0,1); }catch{}
+                    }
                 }else{
-                    say("已全部自动通过，全部轮次已完成。");
+                    say("全部段已接受完成。");
                 }
             }
         return result || true;
@@ -508,7 +543,7 @@ function mountReview(node) {
         const stopped=()=>!!node._adH3BatchStop;
         // 后台继续运行：循环只依赖启动时序列化的队列副本和已捕获的节点，不依赖当前激活画布。
         // 切到其它工作流标签后旧图 DOM/连线可能不可用，界面刷新失败不能中断生成。
-        const safeDraw = state => { try { draw(state); } catch {} };
+        const safeDraw = state => { try { if(node.graph?.getNodeById?.(node.id)===node)draw(state); } catch {} };
         const queueLinked=!!segment.inputs?.find(item=>item.name==="queue")?.link || !!segment.properties?.ad_execution_round?.id;
         if(!queueLinked) {
             const widget=segment.widgets?.find(item=>item.name==="正向提示词");
@@ -523,7 +558,7 @@ function mountReview(node) {
                 if(index) index.value=i;
                 say("正在生成第 "+(i+1)+"/"+count+" 段…");
                 let submission=serialized;
-                if(app.graph===node.graph && segment.graph===node.graph) submission=await app.graphToPrompt();
+                if(app.graph===node.graph && segment.graph===node.graph && app.graph.getNodeById?.(segment.id)===segment) submission=await app.graphToPrompt();
                 // 切页仍更新自己的提交副本，不触碰另一张画布。
                 submission=structuredClone(submission);
                 if(submission.output?.[String(segment.id)]) submission.output[String(segment.id)].inputs["段索引"]=i;
@@ -533,8 +568,9 @@ function mountReview(node) {
             say("独立模式分段循环完成，共 "+count+" 段。");return;
         }
         const serialized=await app.graphToPrompt();
-        // 本轮提交副本固定：后续段即使切到别的标签也用它，而不是当前激活工作流。
-        const roundSubmission=serialized;
+        // 切页后保留本任务最近提交副本；回到原图时再读取最新编辑。
+        let roundSubmission=serialized;
+        const batchTask=serialized.workflow?.extra?.ad_segmented_task?.id;
         // 分段循环续跑：报错后按最新编辑重冻结并从报错段继续；清空重置后从选中预览卡之后继续。
         let currentState=null;
         try {
@@ -545,7 +581,7 @@ function mountReview(node) {
         const selectedSegment=resumeSelection ? Number(selectedPreview?.segment_index || (typeof node._adH3Preview?.resumeTarget !== "function" ? node._adH3Preview?.selectedSegment?.() : 0) || 0) : 0;
         let state;
         if(currentState && selectedSegment > 0){
-            state=await request("/aiden_h3/action",{command:"resume_after",session_id:currentState.id,index:selectedSegment,preview:selectedPreview,segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,frontend_queue:true,auto_accept:true});
+            state=await request("/aiden_h3/action",{command:"resume_after",session_id:currentState.id,index:selectedSegment,preview:selectedPreview,group_previews:node._adH3Preview?.groupRecords?.(selectedPreview),segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,frontend_queue:true,auto_accept:true});
             node._adH3Preview?.consumeResumeTarget?.();
             safeDraw(state);
             say(state.status==="completed" ? "所选为本轮最后一段，本轮已完成，没有后续段。" : "已从选中的第 "+state.cursor+" 段之后继续；本轮素材与前段结果保留。");
@@ -556,18 +592,19 @@ function mountReview(node) {
         } else {
             state=await request("/aiden_h3/sync",{segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,round_session:sessionId(segment),freeze_round:true,auto_accept:true});
         }
-        const finish=async()=>{
-            if (state.segments.some(row=>row.entry?.batch_source)) {
-                try {
-                    state=await request("/aiden_h3/action",{command:"clear",session_id:state.id,confirmed:true});
-                    safeDraw(state);
-                    say("原文件批处理完成，结果已分别保存；本轮已自动清空，点开始继续新一轮。");
-                } catch (error) {
-                    say("原文件批处理完成，结果已分别保存；自动清空失败："+error.message,true);
-                }
-                return;
+        const finish=async({restart=false}={})=>{
+            const batch=state.segments.some(row=>row.entry?.batch_source);
+            try {
+                state=await request("/aiden_h3/action",{command:"clear",session_id:state.id,confirmed:true});
+                safeDraw(state);
+                say(batch
+                    ? "原文件批处理完成（若保存失败，预览卡片会提示）；本轮已自动清空并重置，点「开始」继续新一轮。"
+                    : "整轮分段循环已完成，已自动清空重置；点「开始」或「分段循环」开始新一轮。");
+                return restart ? state : null;
+            } catch (error) {
+                say((batch ? "原文件批处理完成；" : "整轮分段循环已完成；") + "自动清空失败：" + error.message, true);
+                return null;
             }
-            say("全部轮次已完成，分段循环完成。");
         };
         const waitIdle=async()=>{
             for(let attempt=0;attempt<3600;attempt++){
@@ -579,11 +616,18 @@ function mountReview(node) {
                 if(!response.ok) throw new Error(state.error||"读取进度失败");
                 safeDraw(state);
             }
-            throw new Error("等待当前任务完成超时，请先点停止检查");
+            throw new Error("等待当前任务完成超时（可能仍在长时间生成或队列阻塞）：请先点「停止」，再到 ComfyUI 队列与运行记录确认状态。");
         };
         if(!(await waitIdle())) return;
         if(state.status==="error") throw new Error(state.error||"当前任务失败，请检查后重试");
-        if(state.status==="completed"){await finish();return;}
+        // 选中末段的续跑已经结束；不能进入普通“已完成后再次开始”的重开分支。
+        if(selectedSegment>0&&state.status==="completed")return;
+        if(state.status==="completed"){
+            // 点「分段循环」时若上一轮已完成：先自动重置，再从第1段开始新一轮。
+            const cleared=await finish({restart:true});
+            if(!cleared) return;
+            state=cleared;
+        }
         for(let guard=0;guard<state.segments.length+2;guard++) {
             if(stopped()) return;
             if(state.status==="completed"){await finish();return;}
@@ -596,7 +640,7 @@ function mountReview(node) {
                 say("正在生成第 "+(state.cursor+1)+"/"+state.segments.length+" 段…");
                 // A 方案：同一画布内每段重新读取当前连线/参数，改线从下一段立即生效；切到别的工作流时仍用启动副本。
                 let submission=roundSubmission;
-                try { if(app.graph===node.graph && segment.graph===node.graph && app.graph.getNodeById?.(segment.id)) submission=await app.graphToPrompt(); } catch {}
+                try { if(app.graph===node.graph && segment.graph===node.graph && app.graph.getNodeById?.(segment.id)===segment && (!batchTask||currentTaskId(app.graph)===batchTask)) {submission=await app.graphToPrompt();roundSubmission=structuredClone(submission);} } catch {}
                 const result=await executeQueueOnce(app,api,segment.id,{isStopped:stopped,serialized:submission,owner:node});
                 if(result.stopped) return;
                 // 生成即通过：等待后台自动登记有效/通过并把游标前移，无需再点同意批准。
@@ -616,18 +660,18 @@ function mountReview(node) {
                 continue;
             }
             if(!row.accepted){
-                // 旧会话兼容：仅对待审核的有效结果自动通过一次；新会话生成即通过，不会走到这里。
+                // 旧会话兼容：仅对待审核的有效结果自动接受一次；新会话生成即通过，不会走到这里。
                 state=await request("/aiden_h3/action",{command:"approve",session_id:state.id});safeDraw(state);
                 if(state.status==="completed"){await finish();return;}
                 if(Number(state.cursor)===beforeCursor)
-                    throw new Error(`自动通过后进度没有前进（仍停在第 ${beforeCursor+1} 段），请检查后台进度或点停止后重试`);
+                    throw new Error(`进度没有自动前进（仍停在第 ${beforeCursor+1} 段）：请点「停止」后确认当前段状态，必要时重做该段。`);
                 continue;
             }
             break;
         }
     }
     node._adH3Batch=async options=>{
-        if(node._adH3AffectedRunning){say("正在运行所选段，请等待完成或先点停止。",true);return;}
+        if(node._adH3AffectedRunning){say("「运行此段」还在进行，请等待完成或先点「停止」。",true);return;}
         if(node._adH3BatchRunning){say("分段循环正在进行，请先停止当前任务。",true);return;}
         node._adH3BatchRunning=true;
         try{await batchRun(options);}
@@ -657,7 +701,7 @@ function mountReview(node) {
             // Yield the sequential driver without interrupting its current ComfyUI task.
             for (let attempt = 0; node._adH3BatchRunning; attempt++) {
                 if (explicitlyStopped()) return false;
-                if (attempt >= 7200) throw new Error("等待分段循环让出任务超时，请先点停止检查");
+                if (attempt >= 7200) throw new Error("等待分段循环让出任务超时：请先点「停止」，再到 ComfyUI 队列确认任务状态。");
                 await new Promise(resolve => setTimeout(resolve, 250));
             }
             for (let attempt = 0; attempt < 7200; attempt++) {
@@ -668,7 +712,7 @@ function mountReview(node) {
                 if (!response.ok) throw new Error(state.error || "读取进度失败");
                 draw(state);
                 if (!["queued", "running", "merging"].includes(state.status)) break;
-                if (attempt === 7199) throw new Error("等待当前任务完成超时，请先点停止检查");
+                if (attempt === 7199) throw new Error("等待当前任务完成超时（可能仍在长时间生成或队列阻塞）：请先点「停止」，再到 ComfyUI 队列与运行记录确认状态。");
                 say("等待当前任务结束后运行所选段…");
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
@@ -732,13 +776,13 @@ function mountReview(node) {
                         if (stopped()) return;
                         await new Promise(resolve => setTimeout(resolve, 250));
                     }
-                    if (!state.segments?.[state.cursor]?.valid) throw new Error("本次任务没有有效结果，当前段未能完成");
+                    if (!state.segments?.[state.cursor]?.valid) throw new Error("本次任务没有产生有效结果，当前段未完成；请重跑该段或查看 ComfyUI 运行记录。");
                 }
                 if (stopped()) return false;
                 state = await request("/aiden_h3/action", {command: "approve", session_id: state.id, frontend_queue: true});
                 draw(state);
             }
-            if (state.affected_run) throw new Error("所选段尚未全部完成，请检查当前进度");
+            if (state.affected_run) throw new Error("所选段还没有全部完成：请先查看当前段状态，完成后再继续。");
             succeeded = true;
             say("指定的段已运行完成，已回到原运行位置。");
             return true;
@@ -763,7 +807,11 @@ function mountReview(node) {
         return state;
     };
     async function refresh(force=true){
-        if(disposed || refreshing || (!force && document.hidden))return;
+        const pollRevision=actionRevision;
+        if(app.configuringGraph)return;
+        try{if(node.graph===app.graph)await ensureWorkflowTask(node.graph);}catch(error){if(!disposed)say(error.message,true);return;}
+        const pollTask=currentTaskId(node.graph);
+        if(disposed || refreshing || pollRevision!==actionRevision || (!force && document.hidden))return;
         const interval=lastState && ["queued","running","merging"].includes(lastState.status)?2000:10000;
         if(!force && Date.now()-lastPolled<interval)return;
         const segment=upstreamSegment(node);const current=sessionId(segment);
@@ -771,10 +819,9 @@ function mountReview(node) {
         if(!current)return;
         if(current!==lastSession){lastETag="";lastSession=current;lastState=null;lastRendered="";list.textContent="";compare.querySelectorAll("video").forEach(video=>video.pause());compare.replaceChildren();compare.hidden=true;}
         refreshing=true;lastPolled=Date.now();
-        const pollRevision=actionRevision;
         try{
             const response=await api.fetchApi(`/aiden_h3/session/${encodeURIComponent(current)}`, {cache:"no-store",headers:lastETag ? {"If-None-Match":lastETag} : {}});
-            if(disposed || pollRevision!==actionRevision){lastPolled=0;return;}
+            if(disposed || pollRevision!==actionRevision || pollTask!==currentTaskId(node.graph) || current!==sessionId(segment)){lastPolled=0;return;}
             if(response.status===304){
                 const payload=`${current}|${lastETag}|${busy}`;
                 if(lastState && payload!==lastPayload){lastPayload=payload;draw(lastState);}
@@ -791,7 +838,7 @@ function mountReview(node) {
                 return;
             }
             const state=await response.json();if(!response.ok)throw new Error(state.error);
-            if(disposed || current!==lastSession || pollRevision!==actionRevision)return;
+            if(disposed || current!==lastSession || pollRevision!==actionRevision || pollTask!==currentTaskId(node.graph) || current!==sessionId(segment))return;
             if(Number(state.updated_at||0)<Number(lastState?.updated_at||0))return;
             if(connectionFailed){say("");connectionFailed=false;}
             lastETag=response.headers?.get?.("ETag") || "";
@@ -1475,6 +1522,11 @@ function setupNode(node) {
     if(node.comfyClass==="AidenH3Segment"){
         const token=node.widgets?.find(widget=>widget.name==="run_token");
         node._adH3RunAffected = options => runSelectedSegments(node, options);
+        node._adH3NewGroup = () => {
+            const viewer=(node.graph?._nodes||[]).find(candidate =>
+                candidate.comfyClass === "AidenH3VideoPreview" && upstreamSegment(candidate) === node);
+            return viewer?._adH3Act?.("new_group") ?? Promise.resolve(false);
+        };
         // Keep 执行标识 visible (user requested); do not hide run_token.
         const session=node.widgets?.find(widget=>widget.name==="session_id");
         if(session && (session.value==="h3-session" || session.value==="AD-H3-session" || session.value==="")){

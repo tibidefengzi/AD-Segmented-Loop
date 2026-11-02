@@ -189,8 +189,12 @@ def _allowed_relative(relative: str) -> bool:
             return bool(re.fullmatch(r'trial_[0-9a-f]+', parts[1]))
         return bool(re.fullmatch(r'(picture_|soundtrack_)[A-Za-z0-9_.-]+\.(mp4|m4a|wav|log)', name)
                     or re.fullmatch(r'progress\.json\.[0-9a-f]+\.tmp', name))
-    if len(parts) == 4 and parts[0] == 'sessions' and parts[2] == 'rounds':
-        return bool(re.fullmatch(r'[0-9a-f]{32}\.json', parts[3]))
+    if len(parts) == 4 and parts[0] == 'sessions':
+        if parts[2] == 'rounds':
+            return bool(re.fullmatch(r'[0-9a-f]{32}\.json', parts[3]))
+        if parts[2].startswith('finishing_'):
+            # 合并中间产物：正常合并结束会主动删除；崩溃/中断残留按可重建缓存清理。
+            return bool(re.fullmatch(r'finished_\d+\.mp4', parts[3]))
     return False
 
 def _is_allowed_cache_file(path):
@@ -302,6 +306,152 @@ def clean_trial_progress(min_age=_TRIAL_MIN_AGE):
     return {'removed_files': removed, 'freed_bytes': freed}
 
 
+def _session_dirs():
+    for root in _roots():
+        sessions = root / 'sessions'
+        if not sessions.is_dir():
+            continue
+        try:
+            for entry in sessions.iterdir():
+                if entry.is_dir() and not entry.is_symlink():
+                    yield entry
+        except OSError:
+            continue
+
+
+def _session_progress(session_dir):
+    try:
+        return json.loads((session_dir / 'progress.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+
+
+def _keep_version_ids(row, keep_recent):
+    keep = set()
+    if row.get('selected'):
+        keep.add(str(row['selected']))
+    ordered = sorted(row.get('versions') or [], key=lambda version: float(version.get('created_at') or 0), reverse=True)
+    extra = 0
+    for version in ordered:
+        if str(version.get('id')) == str(row.get('selected')):
+            continue
+        if extra >= keep_recent:
+            break
+        keep.add(str(version.get('id')))
+        extra += 1
+    return keep
+
+
+def version_plan(keep_recent=3, min_age=0.0, group_limit=10):
+    """列出可回收的旧版本文件与超限组快照；只统计，不删除。"""
+    now = time.time()
+    files, groups, seen = [], [], set()
+    versions = 0
+    for session in _session_dirs():
+        state = _session_progress(session)
+        if not state or state.get('status') in {'queued', 'running', 'merging'}:
+            continue
+        rows = list(state.get('segments') or []) + list(state.get('retired_segments') or [])
+        for row in rows:
+            keep = _keep_version_ids(row, keep_recent)
+            for version in row.get('versions') or []:
+                if str(version.get('id')) in keep:
+                    continue
+                versions += 1
+                for key in ('file', 'tail_file', 'audio_file'):
+                    name = version.get(key)
+                    if not name:
+                        continue
+                    path = session / str(name)
+                    try:
+                        info = path.stat()
+                    except OSError:
+                        continue
+                    if min_age and now - info.st_mtime < min_age:
+                        continue
+                    marker = str(path)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    files.append({'path': marker, 'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns})
+        snapshots = state.get('group_snapshots') or {}
+        if len(snapshots) > group_limit:
+            ordered = sorted(((int(number), str(name)) for number, name in snapshots.items()
+                              if str(number).isdigit()), reverse=True)
+            for _number, name in ordered[group_limit:]:
+                path = session / name
+                try:
+                    info = path.stat()
+                except OSError:
+                    continue
+                marker = str(path)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                groups.append({'path': marker, 'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns})
+    return {'files': files, 'groups': groups, 'versions': versions,
+            'bytes': sum(item['bytes'] for item in files) + sum(item['bytes'] for item in groups)}
+
+
+def _version_cache_bytes():
+    try:
+        return version_plan()['bytes']
+    except Exception:
+        return 0
+
+
+def _prune_group_snapshots(group_limit=10):
+    # 清理接口只在没有任务运行时调用，直接原子重写该会话进度，避免依赖内存中的 STORE 根目录。
+    from .storage import atomic_json
+    for session in list(_session_dirs()):
+        state = _session_progress(session)
+        if not state:
+            continue
+        snapshots = state.get('group_snapshots') or {}
+        if len(snapshots) <= group_limit:
+            continue
+        ordered = sorted(((int(number), str(name)) for number, name in snapshots.items()
+                          if str(number).isdigit()), reverse=True)
+        for number, name in ordered[group_limit:]:
+            try:
+                (session / name).unlink()
+            except OSError:
+                pass
+            snapshots.pop(str(number), None)
+        state['group_snapshots'] = snapshots
+        try:
+            atomic_json(session / 'progress.json', state)
+        except OSError:
+            continue
+
+
+def clean_versions(confirmed, keep_recent=3, min_age=0.0, group_limit=10):
+    """删除非选用旧版本的成片/尾帧/音频与超限组快照；只保留选用版本和每段最近 N 个版本。"""
+    plan = version_plan(keep_recent, min_age, group_limit)
+    summary = {'dry_run': not confirmed, 'versions': plan['versions'],
+               'files': len(plan['files']) + len(plan['groups']),
+               'bytes': plan['bytes'], 'groups': len(plan['groups'])}
+    if not confirmed:
+        return summary
+    removed = freed = 0
+    for item in plan['files'] + plan['groups']:
+        path = Path(item['path'])
+        try:
+            info = path.stat()
+            if info.st_mtime_ns != item['mtime_ns']:
+                continue
+            path.unlink()
+            removed += 1
+            freed += item['bytes']
+        except OSError:
+            continue
+    _prune_group_snapshots(group_limit)
+    if removed:
+        _invalidate_usage()
+    summary.update(dry_run=False, removed_files=removed, freed_bytes=freed)
+    return summary
+
+
 def usage(include_cache=True, use_cache=True):
     limit = int(default_limit_gb()*1024**3)
     roots = tuple(str(root) for root in _roots())
@@ -333,6 +483,7 @@ def usage(include_cache=True, use_cache=True):
         'over_limit':used>=limit,'enforce':enforce_limit(),'import_bytes':import_bytes,'import_files':import_files,
         'media_bytes':media_bytes,'media_files':media_files,'sessions_bytes':sessions_bytes,'sessions_files':sessions_files,
         'frame_cache_bytes':frame_bytes,'cache_bytes':plan_cache()['bytes'] if include_cache else 0,
+        'version_cache_bytes':_version_cache_bytes() if include_cache else 0,
         'pending_bytes':_RESERVED,'auto_clean':os.environ.get('AIDEN_H3_AUTO_CLEAN','safe')}
     if use_cache:
         with _LOCK:

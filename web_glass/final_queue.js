@@ -21,7 +21,7 @@ export function finalSubmission(plan, cursor, token) {
     if (!record) throw new Error("没有剩余加工项");
     const output = structuredClone(plan.prompt);
     output[plan.source_id].inputs.record = JSON.stringify(record);
-    output[plan.final_id].inputs.source_record = JSON.stringify({...record, final_job_token: token});
+    output[plan.final_id].inputs.source_record = JSON.stringify({...record, final_job_token: token,final_task_id:plan.task_id||record.final_task_id});
     // 避开round_queue：这里既无H3节点，也不携带原轮次绑定。
     return {output, workflow:{nodes:[],links:[],groups:[],extra:{},version:0.4}};
 }

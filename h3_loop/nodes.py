@@ -835,8 +835,41 @@ def _decode_audio(source):
     return data["waveform"][0].cpu().numpy(), int(data["sample_rate"])
 
 
+def _video_original_audio(entry, state=None):
+    """源音频回退：没有音频轨素材时输出当前段关联视频轨素材的裁后原声。
+
+    2026-11-02 用户确认 B 方案：源音频优先音频轨素材；没有音频轨时回退视频自带原声，
+    视频本身无音轨仍返回 None（不能凭空造声音）。源素材口按既有规则不受轨道静音影响。
+    """
+    source = entry.get("source_video") or entry.get("video_source")
+    if not source:
+        return None
+    try:
+        path = assets.resolve_source(_original_source(source))
+        if not assets.has_audio_stream(path):
+            return None
+    except Exception:
+        return None
+    retained = source.get("retained_range")
+    if not retained and state and source.get("id"):
+        from .timeline import retained_source_range
+        retained = retained_source_range(state, source["id"])
+    if retained:
+        first, last = float(retained[0]), float(retained[1])
+    else:
+        first = float(source.get("src_in") or 0)
+        last = float(source.get("src_out") or source.get("duration") or 0)
+    if last - first <= 1e-6:
+        return None
+    from .audio import load_audio_range
+    return load_audio_range(path, first, last)
+
+
 def _original_audio(entry, state=None, index=0):
-    """源音频输出关联素材的裁后目标；整段复用，不按生成段截断或混入视频声。"""
+    """源音频输出关联素材的裁后目标；整段复用，不按生成段截断。
+
+    优先顺序：循环主音频 → 当前段关联的音频轨素材 → 视频轨素材自带原声（0.4.51 起）。
+    """
     from .audio import load_audio
     from .timeline import retained_source_range
     if state:
@@ -853,14 +886,14 @@ def _original_audio(entry, state=None, index=0):
                     from .audio import load_audio_range
                     first, last = retained_source_range(state, clip["source"], clip)
                     return load_audio_range(assets.resolve_source(_original_source(sources[clip["source"]])), first, last)
-        return None
+        return _video_original_audio(entry, state)
     pieces = []
     for track in (entry.get("timeline_audio") or {}).get("tracks", []):
         pieces.extend(track or [])
     if pieces:
         from .audio import load_audio, resolve_entry
         return load_audio(resolve_entry(pieces[0]))
-    return None
+    return _video_original_audio(entry, None)
 
 
 def _source_video(source, state):
@@ -939,6 +972,7 @@ class AidenH3Segment:
             round_index = round_index % count if count else 0
             preview = {
                 "session_id": "AD-H3-standalone", "index": round_index, "total": count,
+                "workflow_task_id": (prompt.get(str(unique_id),{}).get('_meta') or {}).get('ad_task_id') if isinstance(prompt,dict) else None,
                 "segments": [{"index": i, "status": "ready"} for i in range(count)],
                 "standalone": True,
             }
@@ -965,7 +999,8 @@ class AidenH3Segment:
             for size, count in zip(sizes, wanted):
                 total += min(size, count) if isinstance(count, int) and count >= 0 else size
             return fixed + tuple([None] * total) + (None,)
-        session_id = str(kwargs.get("session_id") or state.get("session_id") or (f"AD-H3-{unique_id}" if unique_id is not None else "AD-H3-session"))
+        declared_session = ((prompt.get(str(unique_id)) or {}).get('inputs') or {}).get('session_id') if isinstance(prompt,dict) else None
+        session_id = str(kwargs.get("session_id") or declared_session or state.get("session_id") or (f"AD-H3-{unique_id}" if unique_id is not None else "AD-H3-session"))
         fps = float(FPS)
         validate_fps(fps)
         aspect_ratio = str(aspect_ratio or DEFAULT_ASPECT)
@@ -979,7 +1014,18 @@ class AidenH3Segment:
         graph_prompt = prompt if isinstance(prompt, dict) else {}
         signature, template = template_for(graph_prompt, unique_id, extra_pnginfo)
         signatures = segment_signatures(graph_prompt, unique_id, entries, fps, None)
-        STORE.sync(session_id, entries, signatures, template)
+        task_id=(graph_prompt.get(str(unique_id),{}).get('_meta') or {}).get('ad_task_id')
+        if task_id:
+            try:
+                owner=STORE.read(session_id).get('workflow_task_id')
+                if owner and owner!=task_id:raise ValueError("当前进度属于其它工作流的任务，已拒绝混用；请重新打开本工作流后再试。")
+            except FileNotFoundError:
+                pass
+        STORE.sync(session_id, entries, signatures, template, keep_completed=True)
+        if task_id:
+            with STORE.lock(session_id):
+                owned=STORE._load(session_id)
+                if not owned.get('workflow_task_id'):owned['workflow_task_id']=task_id;STORE._save(owned)
         run_token = STORE.ensure_run_token(session_id, kwargs.get("run_token", ""))
         session = STORE.begin(session_id, run_token)
         from comfy_execution.utils import get_executing_context
@@ -1036,6 +1082,9 @@ class AidenH3Segment:
         prompts = state.get("prompts") or []
         state_prompt = str(prompts[index % len(prompts)]) if prompts else ""
         context = {"session_id": session_id, "token": run_token, "index": index,
+                   "round_no": int(session.get("round_no", 1) or 0),
+                   "round_id": (session.get("execution_round") or {}).get("id", ""),
+                   "workflow_task_id": session.get('workflow_task_id') or (graph_prompt.get(str(unique_id),{}).get('_meta') or {}).get('ad_task_id'),
                    "segment_key": session["active"].get("segment_key"),
                    "entry_snapshot": session["active"].get("entry_snapshot"),
                    "epoch": int(session.get("epoch", 0)),
@@ -1070,7 +1119,7 @@ class AidenH3Segment:
                 wave, rate = _decode_audio(batch_source)
                 raw_audio = {"waveform": torch.from_numpy(wave).unsqueeze(0), "sample_rate": rate}
                 if need(10): round_audio = raw_audio
-                if need(13) and batch_source["kind"] == "audio": original_audio = raw_audio
+                if need(13) and batch_source["kind"] in {"audio", "video"}: original_audio = raw_audio
         try:
             from .prompts import select_prompt
             try:
@@ -1286,7 +1335,7 @@ class AidenH3Commit:
         name = f"segment_{context['index'] + 1:04d}_{token}.mp4"
         path = directory / name
         if path.exists():
-            raise ValueError("本次任务结果已保存，请使用预览侧继续或重做")
+            raise ValueError("本次任务的结果已经保存过，无需重复提交；可在「分段预览」继续查看。")
         try:
             from .media import normalize_video
             current=STORE.read(session_id)
@@ -1384,6 +1433,7 @@ class AidenH3VideoPreview:
         directory = ROOT / "media"
         directory.mkdir(parents=True, exist_ok=True)
         record = None
+        registered_name = None
         loop_context = context if isinstance(context, dict) and context.get("token") else None
         details = {}
         previous_record = getattr(media, "_ad_h3_preview_record", None)
@@ -1391,7 +1441,7 @@ class AidenH3VideoPreview:
             # 在编码/尾帧落盘前拦截真实旧结果；登记时仍再次检查，防止处理中被重置。
             current_epoch = STORE.read(loop_context["session_id"]).get("epoch", 0)
             if loop_context.get("epoch") is not None and int(loop_context["epoch"]) != int(current_epoch):
-                raise ValueError("生成结果属于已被清空重置的进度；文件保留，不纳入当前进度")
+                raise ValueError("本次生成结果未纳入进度：生成期间进度被停止或清空重置。该结果尚未写入会话目录，请从当前段重新开始。")
         if hasattr(media, "save_to") or previous_record:
             if loop_context and not previous_record:
                 from .media import normalize_video
@@ -1457,6 +1507,8 @@ class AidenH3VideoPreview:
         if loop_context and record is None:
             raise ValueError("当前段没有可记录的媒体结果，请检查预览输入连线")
         if record and loop_context:
+            record["round_no"] = loop_context.get("round_no", 0)
+            record["round_id"] = loop_context.get("round_id", "")
             record["session_id"] = loop_context.get("preview_parent_session") or loop_context["session_id"]
             if loop_context.get("segment_key"):
                 record["segment_key"] = loop_context["segment_key"]
@@ -1468,6 +1520,10 @@ class AidenH3VideoPreview:
             except (TypeError, ValueError):
                 pass
         if record and archive:
+            task=(context or {}).get('workflow_task_id') if isinstance(context,dict) else None
+            if not task and isinstance(extra_pnginfo,dict):
+                task=((extra_pnginfo.get('workflow') or {}).get('extra') or {}).get('ad_segmented_task',{}).get('id')
+            if task:record['task_id']=task
             if record["origin"] == "session":
                 source = STORE.root / record["file"]
             else:
@@ -1499,8 +1555,13 @@ class AidenH3VideoPreview:
                     session_name = f"segment_{loop_context['index']+1:04d}_{source.name}"
                     dedupe.publish(source, session_dir / session_name)
                     STORE.register_result(loop_context["session_id"], session_name,
-                                          {"media_kind": record["kind"], "prompt_text": loop_context.get("prompt_text", "")},
+                                          {"media_kind": record["kind"], "prompt_text": loop_context.get("prompt_text", ""),
+                                           "preview_origin": record["origin"], "preview_file": record["file"]},
                                           context=loop_context)
+                    registered_name = session_name
+        if record and loop_context:
+            from .preview_identity import attach_identity
+            attach_identity(STORE, record, loop_context, registered_name)
         return {"ui": {"h3_preview": [record] if record else []}, "result": (media,)}
 
 
@@ -1569,7 +1630,7 @@ class AidenH3MergedVideo:
         from .storage import contained
         state=STORE.read(session_id)
         if not state.get("merged") or state["status"]!="completed":
-            raise ValueError("请先在视频预览侧完成选择与合并，再读取成片")
+            raise ValueError("请先在「分段预览」完成选择与合并，再读取成片")
         path=contained(STORE.directory(session_id),state["merged"])
         if not path.is_file():raise ValueError("合并视频文件缺失，请重新合并")
         video = VideoFromFile(str(path))

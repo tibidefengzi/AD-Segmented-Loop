@@ -1,16 +1,17 @@
 import {app} from "../../scripts/app.js";
+import {currentTaskId} from "./workflow_task.js?v=20261102-group-v64";
 import {api} from "../../scripts/api.js";
-import {executeQueueOnce,interruptOwnedPrompt} from "./queue_runner.js?v=20261031-integrity-v36";
-import {bindWidgetWidth} from "./dom_layout.js?v=20261031-fullscreen-v27";
-import {previewSources,finalSubmission,finalRecords} from "./final_queue.js?v=20261101-final-v45";
+import {executeQueueOnce,interruptOwnedPrompt} from "./queue_runner.js?v=20261102-group-v64";
+import {bindWidgetWidth} from "./dom_layout.js?v=20261102-group-v64";
+import {previewSources,finalSubmission,finalRecords} from "./final_queue.js?v=20261102-group-v64";
 
 const style = document.createElement("style");
 style.textContent = `
-.ad-final{box-sizing:border-box;width:100%;height:auto!important;min-height:0!important;max-height:none!important;flex:0 0 auto!important;align-self:start;min-width:0;padding:12px;background:#293342;color:#e4ebf5;font:13px/1.5 "Microsoft YaHei",sans-serif;border-radius:8px}
+.ad-final{box-sizing:border-box;width:100%;height:auto!important;min-height:0!important;max-height:none!important;flex:0 0 auto!important;align-self:start;min-width:0;padding:12px;background:#1e2d43;border:1px solid #415675;color:#e4ebf5;font:13px/1.5 "Microsoft YaHei",sans-serif;border-radius:8px}
 .ad-final *{box-sizing:border-box}.ad-final button{font:inherit;cursor:pointer;border:1px solid #52677e;border-radius:5px;background:#347bc3;color:#fff;padding:5px 12px;min-height:30px}.ad-final button:disabled{opacity:.45;cursor:default}
-.ad-final-tools,.ad-final-tabs{display:flex;gap:7px;flex-wrap:wrap;margin:8px 0}.ad-final-tabs button{background:#3b4b61}.ad-final-tabs button.on{background:#347bc3}
-.ad-final-screen{width:100%;aspect-ratio:16/9;background:#08090c;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;border:1px solid #51647a;border-radius:5px}.ad-final-screen img,.ad-final-screen video{width:100%;height:100%;object-fit:contain}.ad-final-screen audio{width:90%}.ad-final-screen [hidden]{display:none}
-.ad-final-status{min-height:22px;overflow-wrap:anywhere;color:#c5d4e7}.ad-final-status.error{color:#ffaaa4}.ad-final-list{display:flex;flex-wrap:wrap;gap:8px;max-height:340px;overflow:auto;padding:4px}.ad-final-card{position:relative;padding:0!important;background:#192432!important;flex:0 0 160px;width:160px;min-height:114px;overflow:hidden;border-color:#53677f!important}.ad-final-card img,.ad-final-card .audio{width:158px;height:89px;object-fit:contain;background:#08090c;display:block}.ad-final-card .audio{font-size:40px;line-height:89px}.ad-final-card span:last-child{display:block;font-size:12px;overflow-wrap:anywhere;padding:2px 4px}.ad-final-card .remove{position:absolute;right:3px;top:2px;background:#151b24bb;border-radius:3px;padding:0 5px;color:#fff}.ad-final-card.selected{outline:2px solid #a8ceff}.ad-final-title{margin-top:8px;color:#c6d6e8}.ad-h3-media-card.merge-selected{outline:2px solid #a8ceff}
+.ad-final-tools,.ad-final-tabs{display:flex;gap:7px;flex-wrap:wrap;margin:8px 0}.ad-final-tabs{gap:6px}.ad-final-tabs button{background:#293a53;border-color:#435c79;color:#ccd7e6;border-radius:6px}.ad-final-tabs button.on{background:#325d8e;border-color:#7a9dc7;color:#f0f6ff}
+.ad-final-screen{width:100%;aspect-ratio:16/9;background:#08090c;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;border:1px solid #42546e;border-radius:5px}.ad-final-screen img,.ad-final-screen video{width:100%;height:100%;object-fit:contain}.ad-final-screen audio{width:90%}.ad-final-screen [hidden]{display:none}
+.ad-final-status{min-height:24px;overflow-wrap:anywhere;color:#ffd166;font-size:15px;font-weight:700;letter-spacing:.2px}.ad-final-status.error{color:#ffaaa4}.ad-final-row{display:flex;gap:8px;align-items:flex-start;width:100%;border:1px solid #3d5a80;border-radius:8px;background:#141b26;padding:4px 8px;min-height:104px;margin-top:6px}.ad-final-row>span{flex:0 0 72px;color:#dbe6f4;font-size:13px;padding-top:6px}.ad-final-list{display:flex;flex-wrap:wrap;gap:6px;max-height:340px;overflow:auto;flex:1;min-height:96px;padding:2px 0}.ad-final-list>span{color:#93a3b8;font-size:12px;padding:6px}.ad-final-card{position:relative;padding:0!important;background:#2d405b!important;flex:0 0 160px;width:160px;min-height:96px;overflow:hidden;border-color:#4a658a!important;border-radius:7px}.ad-final-card img,.ad-final-card .audio{width:158px;height:89px;object-fit:contain;background:#08090c;display:block}.ad-final-card .audio{font-size:40px;line-height:89px}.ad-final-card span:last-child{display:block;font-size:12px;overflow-wrap:anywhere;padding:2px 4px}.ad-final-card .remove{position:absolute;right:3px;top:2px;background:#151b24bb;border-radius:3px;padding:0 5px;color:#fff}.ad-final-card.selected{outline:2px solid #a8ceff}.ad-final-title{margin-top:8px;color:#c6d6e8}.ad-h3-media-card.merge-selected{outline:2px solid #a8ceff}
 `;
 document.head.append(style);
 const mediaUrl = record => `/aiden_h3/media/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`;
@@ -30,7 +31,7 @@ export function mountFinalSave(node) {
     root.innerHTML=`<div class="ad-final-screen"><img hidden><video hidden controls playsinline preload="metadata"></video><audio hidden controls preload="metadata"></audio><span data-idle>在来源预览中选择成果，再点加工所选</span></div>
 <div class="ad-final-tools"><button data-start>加工所选</button><button data-stop>停止</button><button data-resume>继续剩余</button><button data-merge>合并片段</button></div>
 <div class="ad-final-status" aria-live="polite"></div><div class="ad-final-tabs"><button data-kind="image">图片</button><button data-kind="audio">音频</button><button data-kind="video">视频</button></div>
-<div class="ad-final-title">最终成果</div><div class="ad-final-list" data-results></div><div class="ad-final-title">合并成果</div><div class="ad-final-list" data-merges></div>`;
+<div class="ad-final-row"><span>最终成果</span><div class="ad-final-list" data-results></div></div><div class="ad-final-row"><span>合并成果</span><div class="ad-final-list" data-merges></div></div>`;
     const $=selector=>root.querySelector(selector);
     const hidden=getWidget(node,"source_record");
     if (hidden) {hidden.type="hidden";hidden.computeSize=()=>[0,-4];}
@@ -39,11 +40,19 @@ export function mountFinalSave(node) {
     node.properties ||= {};
     let records=node.properties.ad_final_records || [],kind=node.properties.ad_final_tab || "video",selected=new Map(),busy=false,preparing=false,stopped=false,disposed=false;
     let batch=node.properties.ad_final_batch || null,active=null,owner={};
-    const finalCards=new Map();
+    const finalCards=new Map(),pages=new Map();
+    const PAGE_SIZE=200;
     const video=$("video"),image=$("img"),audio=$("audio");video.muted=true;audio.muted=true;
     const dirty=()=>{node.graph?.change?.();node.setDirtyCanvas?.(true,true);};
     const saveState=()=>{node.properties.ad_final_records=records;node.properties.ad_final_batch=batch;node.properties.ad_final_tab=kind;dirty();};
-    const say=(text,error=false)=>{$(".ad-final-status").textContent=text;$(".ad-final-status").classList.toggle("error",error);};
+    const say=(text,error=false)=>{const box=$(".ad-final-status");box.textContent=text;box.classList.toggle("error",error);};
+    // 进度行后面附带已选预览的信息（一直高亮显示，不自动收起）。
+    const selectionSummary=()=>{
+        const chosen=batch?.plan?.records||[];
+        if(!chosen.length)return "";
+        const text=chosen.map(record=>`${record.source_record?.role?record.source_record.role+" · ":""}${label(record)}`).join("、");
+        return `（已选 ${chosen.length} 条：${text}）`;
+    };
     const buttons=()=>{$("[data-start]").disabled=busy||preparing;$("[data-stop]").disabled=!busy;$("[data-resume]").disabled=busy||preparing||!batch||batch.cursor>=batch.plan.records.length;$("[data-merge]").disabled=busy||preparing;};
     const show=record=>{
         active=record;video.pause();audio.pause();
@@ -58,7 +67,9 @@ export function mountFinalSave(node) {
     const render=()=>{
         for(const button of root.querySelectorAll("[data-kind]"))button.classList.toggle("on",button.dataset.kind===kind);
         for(const [selector,merged] of [["[data-results]",false],["[data-merges]",true]]){
-            const target=$(selector),visible=records.filter(record=>record.kind===kind&&!!record.merged===merged),wanted=new Set(visible.map(key));
+            const target=$(selector),all=records.filter(record=>record.kind===kind&&!!record.merged===merged),pageKey=`${kind}:${merged}`;
+            const page=Math.min(pages.get(pageKey)||0,Math.max(0,Math.ceil(all.length/PAGE_SIZE)-1));pages.set(pageKey,page);
+            const visible=all.slice(page*PAGE_SIZE,(page+1)*PAGE_SIZE),wanted=new Set(visible.map(key));
             for(const child of [...target.children])if(!wanted.has(child.dataset.key))child.remove();
             for(const [index,record] of visible.entries()){
                 let card=finalCards.get(key(record));
@@ -73,14 +84,27 @@ export function mountFinalSave(node) {
                 }
                 if(target.children[index]!==card)target.insertBefore(card,target.children[index]||null);
             }
-            if(!target.children.length){const empty=document.createElement("span");empty.textContent=merged?"暂无合并成果":"暂无最终成果";target.append(empty);}
+            if(!visible.length){const empty=document.createElement("span");empty.textContent=merged?"暂无合并成果":"暂无最终成果";target.append(empty);}
+            if(all.length>PAGE_SIZE){
+                const pager=document.createElement("div");pager.className="ad-final-pager";pager.style.cssText="display:flex;align-items:center;gap:8px;flex-basis:100%;padding:4px 0";
+                const previous=document.createElement("button"),next=document.createElement("button"),text=document.createElement("span");
+                previous.textContent="上一页";next.textContent="下一页";previous.disabled=page===0;next.disabled=(page+1)*PAGE_SIZE>=all.length;
+                text.textContent=`第 ${page+1}/${Math.ceil(all.length/PAGE_SIZE)} 页 · ${all.length} 条`;
+                previous.onclick=()=>{pages.set(pageKey,page-1);render();};next.onclick=()=>{pages.set(pageKey,page+1);render();};pager.append(previous,text,next);target.append(pager);
+            }
         }
+        // 仅缓存本页卡片；完整成果与跨页选择仍保存在数据里。
+        for(const [id,card] of finalCards)if(!root.contains(card))finalCards.delete(id);
         paintSelection();buttons();saveState();
+    };
+    const followPage=record=>{
+        const list=records.filter(item=>item.kind===record.kind&&!!item.merged===!!record.merged);
+        pages.set(`${record.kind}:${!!record.merged}`,Math.floor(Math.max(0,list.findIndex(item=>key(item)===key(record)))/PAGE_SIZE));
     };
     const accept=(job,token)=>{
         const result=finalRecords(job,batch.plan.final_id,token);
         for(const record of result)if(!records.some(item=>key(item)===key(record)))records.push(record);
-        kind=result[0].kind;show(result[0]);batch.cursor++;batch.pending=null;batch.status="ready";render();
+        kind=result[0].kind;followPage(result[0]);show(result[0]);batch.cursor++;batch.pending=null;batch.status="ready";render();
     };
     const recover=async()=>{
         const pending=batch?.pending;if(!pending?.promptId)return false;
@@ -107,14 +131,14 @@ export function mountFinalSave(node) {
             while(!stopped&&!disposed&&batch.cursor<batch.plan.records.length){
                 const record=batch.plan.records[batch.cursor],token=crypto.randomUUID();
                 batch.status="running";batch.pending={index:batch.cursor,token,promptId:null};saveState();
-                say(`正在加工 ${label(record)}`);
+                say(`正在加工 ${label(record)}${selectionSummary()}`);
                 owner={};Object.defineProperty(owner,"_adH3PromptId",{configurable:true,get:()=>batch?.pending?.promptId,set:id=>{batch.pending.promptId=id;saveState();}});
                 const result=await executeQueueOnce(app,api,batch.plan.final_id,{serialized:finalSubmission(batch.plan,batch.cursor,token),owner,isStopped:()=>stopped||disposed});
                 if(result.stopped)break;
                 accept(result.job,token);
             }
             batch.status=batch.cursor>=batch.plan.records.length?"completed":"paused";
-            if(!disposed)say(batch.status==="completed"?"所选成果已逐个加工并保存。":`已停止，保留已保存成果。`);
+            if(!disposed)say((batch.status==="completed"?"所选成果已逐个加工并保存。":`已停止，保留已保存成果。`)+selectionSummary());
         }catch(error){if(batch)batch.status=stopped?"paused":"error";if(!disposed)say(stopped?"已停止，保留已保存成果。":error.message,!stopped);}
         finally{busy=false;buttons();saveState();}
     };
@@ -129,6 +153,7 @@ export function mountFinalSave(node) {
             const chosen=preview?._adH3Preview?.processingSelection?.() || [];
             if(!chosen.length)throw Error('请先在来源预览中单击或Ctrl选择成果');
             const plan=await request('/aiden_h3/final/prepare',{prompt:serialized.output,final_id:String(node.id),records:chosen});
+            plan.task_id=currentTaskId(node.graph);
             batch={plan,cursor:0,pending:null,status:"ready"};saveState();void run();
         }catch(error){say(error.message,true);}
         finally{preparing=false;buttons();}
@@ -143,6 +168,7 @@ export function mountFinalSave(node) {
             const remaining=batch.plan.records.slice(batch.cursor);
             if(!remaining.length)return;
             const updated=await request('/aiden_h3/final/prepare',{prompt:serialized.output,final_id:String(node.id),records:remaining});
+            updated.task_id=currentTaskId(node.graph);
             if(updated.source_id!==batch.plan.source_id)throw Error('来源预览已经改变，请重新选择成果并点击加工所选');
             batch.plan={...updated,records:[...batch.plan.records.slice(0,batch.cursor),...updated.records]};saveState();void run();
         }catch(error){say(error.message,true);}
@@ -159,7 +185,7 @@ export function mountFinalSave(node) {
         try{
             let result;
             try{result=await request('/aiden_h3/final/merge',body);}catch(error){if(error.code!=='spec_mismatch'||!window.confirm(error.message))throw error;result=await request('/aiden_h3/final/merge',{...body,normalize:true});}
-            const record={...result.record,merged:true};records.push(record);selected.clear();render();show(record);
+            const record={...result.record,merged:true};records.push(record);selected.clear();followPage(record);render();show(record);
         }catch(error){say(error.message,true);}
         finally{preparing=false;buttons();}
     };
@@ -168,10 +194,10 @@ export function mountFinalSave(node) {
     node.size=[Math.max(760,Number(node.size?.[0])||760),Number(node.size?.[1])||800];
     let resizeFrame=0;
     const observer=new ResizeObserver(()=>{if(!resizeFrame)resizeFrame=requestAnimationFrame(()=>{resizeFrame=0;if(disposed)return;const height=node.computeSize?.()[1];if(height&&Math.abs(node.size[1]-height)>2)node.setSize([node.size[0],height]);});});observer.observe(root);
-    const executed=node.onExecuted;node.onExecuted=function(message){const result=executed?.apply(this,arguments);for(const record of message?.ad_final||[])if(!records.some(item=>key(item)===key(record)))records.push(record);if(message?.ad_final?.length){kind=message.ad_final[0].kind;render();show(message.ad_final[0]);}return result;};
-    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';selected.clear();render();return result;};
-    const removed=node.onRemoved;node.onRemoved=function(){disposed=true;stopped=true;observer.disconnect();if(resizeFrame)cancelAnimationFrame(resizeFrame);video.pause();audio.pause();root.remove();delete node._adFinal;return removed?.apply(this,arguments);};
-    node._adFinal={root,run,selection:()=>[...selected.values()],get batch(){return batch;}};
+    const executed=node.onExecuted;node.onExecuted=function(message){const result=executed?.apply(this,arguments);const incoming=(message?.ad_final||[]).filter(r=>!r.source_record?.final_task_id||!this.properties.ad_task_id||r.source_record.final_task_id===this.properties.ad_task_id);for(const record of incoming)if(!records.some(item=>key(item)===key(record)))records.push(record);if(incoming.length){kind=incoming[0].kind;followPage(incoming[0]);render();show(incoming[0]);}return result;};
+    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);busy=false;preparing=false;finalCards.clear();pages.clear();records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';selected.clear();render();return result;};
+    const removed=node.onRemoved;node.onRemoved=function(){disposed=true;stopped=true;busy=false;preparing=false;observer.disconnect();if(resizeFrame)cancelAnimationFrame(resizeFrame);video.pause();audio.pause();root.remove();delete node._adFinal;return removed?.apply(this,arguments);};
+    node._adFinal={root,run,selection:()=>[...selected.values()],get batch(){return batch;},resetTask(){records=[];batch=null;selected.clear();finalCards.clear();pages.clear();active=null;video.pause();audio.pause();for(const media of [video,audio,image])media.hidden=true;$("[data-idle]").hidden=false;render();}};
     render();if(batch&&batch.status!=="completed")say('上次加工记录已保留，可点击继续剩余。');
 }
 
