@@ -1,4 +1,4 @@
-import {segmentIntervals, clipEnd} from "./timeline_state.js?v=20261102-group-v64";
+import {segmentIntervals, clipEnd} from "./timeline_state.js";
 const FPS = 24;
 const snap = value => Math.round(value * FPS) / FPS;
 

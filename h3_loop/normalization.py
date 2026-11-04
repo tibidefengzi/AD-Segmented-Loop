@@ -137,48 +137,63 @@ def normalize_source(source, progress=lambda fraction: None):
         # A retry has a distinct destination; never overwrite a prior import or partial artifact.
         token = key[:24] + "_" + uuid.uuid4().hex[:12]
         original = source.get("original") or {"origin": source["origin"], "file": source["file"], "name": source.get("name", path.name)}
-        if kind == "image":
-            import numpy as np
-            from PIL import Image, ImageOps
-            with Image.open(path) as image:
-                image = ImageOps.exif_transpose(image).convert("RGBA" if "A" in image.getbands() else "RGB")
-                scaled, canvas = aligned_size(image.width, image.height, 2160)
-                image = image.resize(scaled, Image.Resampling.LANCZOS)
-                pixels = np.asarray(image)
-                dx, dy = canvas[0] - scaled[0], canvas[1] - scaled[1]
-                pixels = np.pad(pixels, ((dy//2, dy-dy//2), (dx//2, dx-dx//2), (0,0)), mode="edge")
-                normalized = Image.fromarray(pixels)
-                filename, previewname = f"{token}.png", f"{token}_preview.png"
-                normalized.save(root / filename)
-                normalized.thumbnail((384,384), Image.Resampling.LANCZOS)
-                normalized.save(root / previewname)
-            details = {"width": canvas[0], "height": canvas[1], "duration": None}
-        else:
-            info = video_info(path)
-            if info["duration"] <= 0:
-                raise ValueError("视频时长无效")
-            scaled, canvas = aligned_size(info["width"], info["height"], 864)
-            # Preserve aspect, then add at most 31 px of padding to the 32-grid.
-            filters = f"fps=24:round=near,scale={scaled[0]}:{scaled[1]}:flags=lanczos,"
-            dx, dy = canvas[0]-scaled[0], canvas[1]-scaled[1]
-            filters += f"pad={canvas[0]}:{canvas[1]}:{dx//2}:{dy//2}:black,setsar=1"
-            filename, previewname = f"{token}.mp4", f"{token}_preview.mp4"
-            target_frames = max(1, math.floor(info["duration"] * 24 + .5))
-            args = ["-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-vf", filters,
-                    "-frames:v", str(target_frames), "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-threads", "0",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-af", f"apad,atrim=duration={target_frames/24:.9f}",
-                    "-t", f"{target_frames/24:.9f}", "-movflags", "+faststart", str(root / filename)]
-            _transcode(args, info["duration"], lambda p: progress(p * .8))
-            result = video_info(root / filename)
-            if result["fps"] != 24 or result["width"] % 32 or result["height"] % 32:
-                raise ValueError("规范化结果未通过帧率与尺寸检查")
-            _transcode(["-i", str(root / filename), "-map", "0:v:0", "-map", "0:a:0?", "-c:a", "copy", "-vf", "scale=480:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "27", "-threads", "0", "-g", "24", "-pix_fmt", "yuv420p",
-                        "-movflags", "+faststart", str(root / previewname)], result["duration"], lambda p: progress(.8 + p * .19))
-            details = {**result, "fps": 24}
-        saved = {"kind": kind, "origin": origin, "file": normalized_relative(origin, filename), **details,
-                 "original": original, "normalization": POLICY,
-                 "preview": {"origin": origin, "file": normalized_relative(origin, previewname)}}
-        atomic_json(manifest, saved)
+        created = []
+        try:
+            if kind == "image":
+                import numpy as np
+                from PIL import Image, ImageOps
+                with Image.open(path) as image:
+                    image = ImageOps.exif_transpose(image).convert("RGBA" if "A" in image.getbands() else "RGB")
+                    scaled, canvas = aligned_size(image.width, image.height, 2160)
+                    image = image.resize(scaled, Image.Resampling.LANCZOS)
+                    pixels = np.asarray(image)
+                    dx, dy = canvas[0] - scaled[0], canvas[1] - scaled[1]
+                    pixels = np.pad(pixels, ((dy//2, dy-dy//2), (dx//2, dx-dx//2), (0,0)), mode="edge")
+                    normalized = Image.fromarray(pixels)
+                    filename, previewname = f"{token}.png", f"{token}_preview.png"
+                    created.extend([root / filename, root / previewname])
+                    normalized.save(root / filename)
+                    normalized.thumbnail((384,384), Image.Resampling.LANCZOS)
+                    normalized.save(root / previewname)
+                details = {"width": canvas[0], "height": canvas[1], "duration": None}
+            else:
+                info = video_info(path)
+                if info["duration"] <= 0:
+                    raise ValueError("视频时长无效")
+                scaled, canvas = aligned_size(info["width"], info["height"], 864)
+                # Preserve aspect, then add at most 31 px of padding to the 32-grid.
+                filters = f"fps=24:round=near,scale={scaled[0]}:{scaled[1]}:flags=lanczos,"
+                dx, dy = canvas[0]-scaled[0], canvas[1]-scaled[1]
+                filters += f"pad={canvas[0]}:{canvas[1]}:{dx//2}:{dy//2}:black,setsar=1"
+                filename, previewname = f"{token}.mp4", f"{token}_preview.mp4"
+                created.extend([root / filename, root / previewname])
+                target_frames = max(1, math.floor(info["duration"] * 24 + .5))
+                args = ["-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-vf", filters,
+                        "-frames:v", str(target_frames), "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-threads", "0",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-af", f"apad,atrim=duration={target_frames/24:.9f}",
+                        "-t", f"{target_frames/24:.9f}", "-movflags", "+faststart", str(root / filename)]
+                _transcode(args, info["duration"], lambda p: progress(p * .8))
+                result = video_info(root / filename)
+                if result["fps"] != 24 or result["width"] % 32 or result["height"] % 32:
+                    raise ValueError("规范化结果未通过帧率与尺寸检查")
+                _transcode(["-i", str(root / filename), "-map", "0:v:0", "-map", "0:a:0?", "-c:a", "copy", "-vf", "scale=480:480:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "27", "-threads", "0", "-g", "24", "-pix_fmt", "yuv420p",
+                            "-movflags", "+faststart", str(root / previewname)], result["duration"], lambda p: progress(.8 + p * .19))
+                details = {**result, "fps": 24}
+            saved = {"kind": kind, "origin": origin, "file": normalized_relative(origin, filename), **details,
+                     "original": original, "normalization": POLICY,
+                     "preview": {"origin": origin, "file": normalized_relative(origin, previewname)}}
+            created.append(manifest)
+            atomic_json(manifest, saved)
+        except Exception:
+            # 转码/保存失败：删除本次新建的输出、预览与 JSON，避免孤儿文件占用额度。
+            if created:
+                print(f"AD-Segmented-Loop: 素材规范化失败，已清理未完成文件：{[str(item) for item in created]}")
+            for item in created:
+                try:
+                    Path(item).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
         progress(1)
         return {**source, **saved}

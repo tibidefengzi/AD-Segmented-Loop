@@ -1,21 +1,22 @@
 import {app} from "../../scripts/app.js";
-import {currentTaskId} from "./workflow_task.js?v=20261102-group-v64";
+import {currentTaskId} from "./workflow_task.js";
 import {api} from "../../scripts/api.js";
-import {executeQueueOnce,interruptOwnedPrompt} from "./queue_runner.js?v=20261102-group-v64";
-import {bindWidgetWidth} from "./dom_layout.js?v=20261102-group-v64";
-import {previewSources,finalSubmission,finalRecords} from "./final_queue.js?v=20261102-group-v64";
+import {executeQueueOnce,interruptOwnedPrompt} from "./queue_runner.js";
+import {bindWidgetWidth} from "./dom_layout.js";
+import {previewSources,finalSubmission,finalRecords} from "./final_queue.js";
 
 const style = document.createElement("style");
 style.textContent = `
-.ad-final{box-sizing:border-box;width:100%;height:auto!important;min-height:0!important;max-height:none!important;flex:0 0 auto!important;align-self:start;min-width:0;padding:12px;background:#1e2d43;border:1px solid #415675;color:#e4ebf5;font:13px/1.5 "Microsoft YaHei",sans-serif;border-radius:8px}
-.ad-final *{box-sizing:border-box}.ad-final button{font:inherit;cursor:pointer;border:1px solid #52677e;border-radius:5px;background:#347bc3;color:#fff;padding:5px 12px;min-height:30px}.ad-final button:disabled{opacity:.45;cursor:default}
-.ad-final-tools,.ad-final-tabs{display:flex;gap:7px;flex-wrap:wrap;margin:8px 0}.ad-final-tabs{gap:6px}.ad-final-tabs button{background:#293a53;border-color:#435c79;color:#ccd7e6;border-radius:6px}.ad-final-tabs button.on{background:#325d8e;border-color:#7a9dc7;color:#f0f6ff}
-.ad-final-screen{width:100%;aspect-ratio:16/9;background:#08090c;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;border:1px solid #42546e;border-radius:5px}.ad-final-screen img,.ad-final-screen video{width:100%;height:100%;object-fit:contain}.ad-final-screen audio{width:90%}.ad-final-screen [hidden]{display:none}
-.ad-final-status{min-height:24px;overflow-wrap:anywhere;color:#ffd166;font-size:15px;font-weight:700;letter-spacing:.2px}.ad-final-status.error{color:#ffaaa4}.ad-final-row{display:flex;gap:8px;align-items:flex-start;width:100%;border:1px solid #3d5a80;border-radius:8px;background:#141b26;padding:4px 8px;min-height:104px;margin-top:6px}.ad-final-row>span{flex:0 0 72px;color:#dbe6f4;font-size:13px;padding-top:6px}.ad-final-list{display:flex;flex-wrap:wrap;gap:6px;max-height:340px;overflow:auto;flex:1;min-height:96px;padding:2px 0}.ad-final-list>span{color:#93a3b8;font-size:12px;padding:6px}.ad-final-card{position:relative;padding:0!important;background:#2d405b!important;flex:0 0 160px;width:160px;min-height:96px;overflow:hidden;border-color:#4a658a!important;border-radius:7px}.ad-final-card img,.ad-final-card .audio{width:158px;height:89px;object-fit:contain;background:#08090c;display:block}.ad-final-card .audio{font-size:40px;line-height:89px}.ad-final-card span:last-child{display:block;font-size:12px;overflow-wrap:anywhere;padding:2px 4px}.ad-final-card .remove{position:absolute;right:3px;top:2px;background:#151b24bb;border-radius:3px;padding:0 5px;color:#fff}.ad-final-card.selected{outline:2px solid #a8ceff}.ad-final-title{margin-top:8px;color:#c6d6e8}.ad-h3-media-card.merge-selected{outline:2px solid #a8ceff}
+.ad-final{box-sizing:border-box;width:100%;height:auto!important;min-height:0!important;max-height:none!important;flex:0 0 auto!important;align-self:start;min-width:0;padding:12px;background:transparent;border:1px solid #43536b;color:var(--ad-text,#e6e9ef);font:13px/1.5 var(--ad-font,"Microsoft YaHei",sans-serif);border-radius:12px}
+.ad-final *{box-sizing:border-box}.ad-final button{font:inherit;cursor:pointer;border:1px solid var(--ad-accent-border,#4d7ed8);border-radius:var(--ad-radius-sm,5px);background:var(--ad-accent,#3769c7);color:#fff;padding:5px 12px;min-height:30px}.ad-final button:hover{background:var(--ad-accent-hover,#2f5cb2)}.ad-final button:disabled{opacity:.45;cursor:default}
+.ad-final-tools,.ad-final-tabs{display:flex;gap:7px;flex-wrap:wrap;margin:8px 0}.ad-final-tabs{gap:6px}.ad-final-tabs button{background:var(--ad-surface-deep,#1e1e1e);border-color:var(--ad-border,#454545);color:var(--ad-text-dim,#aab3c2);border-radius:var(--ad-radius-sm,5px)}.ad-final-tabs button.on{background:var(--ad-accent,#3769c7);border-color:var(--ad-accent-border,#4d7ed8);color:#fff}
+.ad-final-screen{width:100%;aspect-ratio:16/9;background:var(--ad-screen,#0d0d0d);position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;border:1px solid var(--ad-border-soft,#3a3a3a);border-radius:var(--ad-radius-sm,5px)}.ad-final-screen img,.ad-final-screen video{width:100%;height:100%;object-fit:contain}.ad-final-screen audio{width:90%}.ad-final-screen [hidden]{display:none}
+.ad-final-status{min-height:24px;overflow-wrap:anywhere;color:var(--ad-warn,#e8c26a);font-size:15px;font-weight:700;letter-spacing:.2px}.ad-final-status.error{color:var(--ad-danger-text,#ffb4b9)}.ad-final-row{display:flex;gap:8px;align-items:flex-start;width:100%;border:1px solid var(--ad-border-soft,#3a3a3a);border-radius:8px;background:var(--ad-surface,#252525);padding:4px 8px;min-height:104px;margin-top:6px}.ad-final-row>span{flex:0 0 72px;color:var(--ad-text-dim,#aab3c2);font-size:13px;padding-top:6px}.ad-final-list{display:flex;flex-wrap:wrap;gap:6px;max-height:340px;overflow:auto;flex:1;min-height:96px;padding:2px 0}.ad-final-list>span{color:var(--ad-text-mute,#8b95a3);font-size:12px;padding:6px}.ad-final-card{position:relative;padding:0!important;background:var(--ad-surface-deep,#1e1e1e)!important;flex:0 0 160px;width:160px;min-height:96px;overflow:hidden;border-color:var(--ad-border,#454545)!important;border-radius:7px}.ad-final-card img,.ad-final-card .audio{width:158px;height:89px;object-fit:contain;background:var(--ad-screen,#0d0d0d);display:block}.ad-final-card .audio{font-size:40px;line-height:89px}.ad-final-card span:last-child{display:block;font-size:12px;overflow-wrap:anywhere;padding:2px 4px}.ad-final-card .remove{position:absolute;right:3px;top:2px;background:#151b24bb;border-radius:3px;padding:0 5px;color:#fff}.ad-final-card.selected{outline:2px solid var(--ad-accent-soft,#92b7ff)}.ad-final-title{margin-top:8px;color:var(--ad-text-dim,#aab3c2)}.ad-h3-media-card.merge-selected{outline:2px solid var(--ad-accent-soft,#92b7ff)}
 `;
 document.head.append(style);
-const mediaUrl = record => `/aiden_h3/media/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`;
-const thumbnailUrl = record => `/aiden_h3/thumbnail/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`;
+// 媒体地址统一走 ComfyUI 的 api.apiURL，origin/file 逐段编码（部署在子路径时也能正确访问）。
+const mediaUrl = record => api.apiURL(`/aiden_h3/media/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
+const thumbnailUrl = record => api.apiURL(`/aiden_h3/thumbnail/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
 const label = record => record.label || record.file?.split("/").at(-1) || "成果";
 const getWidget = (node,name) => node.widgets?.find(widget => widget.name === name);
 async function request(path,body) {
@@ -27,6 +28,9 @@ async function request(path,body) {
 
 export function mountFinalSave(node) {
     if (node._adFinal) return;
+    // 与三个主节点统一外观：节点底色/边框/标签色和 AD-分段预览 保持一致。
+    node.color="#414957";node.bgcolor="#2b303b";node.boxcolor="#6b8ec6";
+    node.constructor.title_text_color="#eef3fa";
     const root=document.createElement("div"); root.className="ad-final";
     root.innerHTML=`<div class="ad-final-screen"><img hidden><video hidden controls playsinline preload="metadata"></video><audio hidden controls preload="metadata"></audio><span data-idle>在来源预览中选择成果，再点加工所选</span></div>
 <div class="ad-final-tools"><button data-start>加工所选</button><button data-stop>停止</button><button data-resume>继续剩余</button><button data-merge>合并片段</button></div>
@@ -40,6 +44,8 @@ export function mountFinalSave(node) {
     node.properties ||= {};
     let records=node.properties.ad_final_records || [],kind=node.properties.ad_final_tab || "video",selected=new Map(),busy=false,preparing=false,stopped=false,disposed=false;
     let batch=node.properties.ad_final_batch || null,active=null,owner={};
+    // 仅当渲染数据真正变化时才保存并标脏工作流，避免每次 render 都把工作流标记为已修改。
+    let renderedStateKey="";
     const finalCards=new Map(),pages=new Map();
     const PAGE_SIZE=200;
     const video=$("video"),image=$("img"),audio=$("audio");video.muted=true;audio.muted=true;
@@ -95,7 +101,10 @@ export function mountFinalSave(node) {
         }
         // 仅缓存本页卡片；完整成果与跨页选择仍保存在数据里。
         for(const [id,card] of finalCards)if(!root.contains(card))finalCards.delete(id);
-        paintSelection();buttons();saveState();
+        paintSelection();buttons();
+        // 数据（记录/批次游标/分类）真正变化时才写属性并标脏工作流。
+        const nextStateKey=JSON.stringify([kind,records.map(key),batch?.cursor??-1,batch?.status||""]);
+        if(nextStateKey!==renderedStateKey){renderedStateKey=nextStateKey;saveState();}
     };
     const followPage=record=>{
         const list=records.filter(item=>item.kind===record.kind&&!!item.merged===!!record.merged);
@@ -193,10 +202,12 @@ export function mountFinalSave(node) {
     widget.computeSize=()=>[Math.max(300,Number(node.size?.[0])||760),root.offsetHeight+12];bindWidgetWidth(node,widget);
     node.size=[Math.max(760,Number(node.size?.[0])||760),Number(node.size?.[1])||800];
     let resizeFrame=0;
-    const observer=new ResizeObserver(()=>{if(!resizeFrame)resizeFrame=requestAnimationFrame(()=>{resizeFrame=0;if(disposed)return;const height=node.computeSize?.()[1];if(height&&Math.abs(node.size[1]-height)>2)node.setSize([node.size[0],height]);});});observer.observe(root);
+    // 高度统一由 scheduleLayout 合并计算（ResizeObserver 只负责调度，不直接 setSize），避免多次回调反复改高度。
+    const scheduleLayout=()=>{if(resizeFrame)return;resizeFrame=requestAnimationFrame(()=>{resizeFrame=0;if(disposed||!root.isConnected)return;const height=node.computeSize?.()[1];if(height&&Math.abs(node.size[1]-height)>2)node.setSize([node.size[0],height]);node.setDirtyCanvas?.(true,true);});};
+    const observer=new ResizeObserver(scheduleLayout);observer.observe(root);
     const executed=node.onExecuted;node.onExecuted=function(message){const result=executed?.apply(this,arguments);const incoming=(message?.ad_final||[]).filter(r=>!r.source_record?.final_task_id||!this.properties.ad_task_id||r.source_record.final_task_id===this.properties.ad_task_id);for(const record of incoming)if(!records.some(item=>key(item)===key(record)))records.push(record);if(incoming.length){kind=incoming[0].kind;followPage(incoming[0]);render();show(incoming[0]);}return result;};
-    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);busy=false;preparing=false;finalCards.clear();pages.clear();records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';selected.clear();render();return result;};
-    const removed=node.onRemoved;node.onRemoved=function(){disposed=true;stopped=true;busy=false;preparing=false;observer.disconnect();if(resizeFrame)cancelAnimationFrame(resizeFrame);video.pause();audio.pause();root.remove();delete node._adFinal;return removed?.apply(this,arguments);};
+    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);busy=false;preparing=false;finalCards.clear();pages.clear();records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';selected.clear();renderedStateKey=JSON.stringify([kind,records.map(key),batch?.cursor??-1,batch?.status||""]);render();return result;};
+    const removed=node.onRemoved;node.onRemoved=function(){disposed=true;stopped=true;busy=false;preparing=false;observer.disconnect();if(resizeFrame)cancelAnimationFrame(resizeFrame);for(const media of [video,audio]){media.pause();if(media.hasAttribute("src")){media.removeAttribute("src");media.load();}}for(const image of root.querySelectorAll("img"))image.removeAttribute("src");finalCards.clear();root.remove();delete node._adFinal;return removed?.apply(this,arguments);};
     node._adFinal={root,run,selection:()=>[...selected.values()],get batch(){return batch;},resetTask(){records=[];batch=null;selected.clear();finalCards.clear();pages.clear();active=null;video.pause();audio.pause();for(const media of [video,audio,image])media.hidden=true;$("[data-idle]").hidden=false;render();}};
     render();if(batch&&batch.status!=="completed")say('上次加工记录已保留，可点击继续剩余。');
 }

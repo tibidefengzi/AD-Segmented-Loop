@@ -1,18 +1,18 @@
-import {createGroupMove} from "./selection_move.js?v=20261102-group-v64";
+import {createGroupMove} from "./selection_move.js";
 // CACHEBUST ref-link-preserve 20261025-053810
 // cachebust 20261025-0440 segment-materials
 // CACHEBUST 2026-10-25-cursor-timeline
 // AD-H3 素材清单库：剪映式时间线编辑器（图片 / 视频 / 音频统一管理，片段切分驱动循环）。
-import "./ad_theme.js?v=20261102-group-v64";
-import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js?v=20261102-group-v64";
+import "./ad_theme.js";
+import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, followsImageCount, clearImageSources, repairSourceInstances, retainedSourceBounds, trackDisabled, activeClips, selectionPlaybackRange } from "./timeline_state.js?v=20261102-group-v64";
-import { mountStoragePanel } from "./storage_panel.js?v=20261102-group-v64";
-import {generationClips, commitGeneration, changeGeneration, deleteGeneration} from "./generation_edit.js?v=20261102-group-v64";
-import { bindWidgetWidth, timelineOrigin, markWidthBreakpoint, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261102-group-v64";
-import { PreviewCache } from "./timeline_performance.js?v=20261102-group-v64";
-import { setMaterialProgress } from "./run_progress.js?v=20261102-group-v64";
+import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, followsImageCount, clearImageSources, repairSourceInstances, retainedSourceBounds, trackDisabled, activeClips, selectionPlaybackRange } from "./timeline_state.js";
+import { mountStoragePanel } from "./storage_panel.js";
+import {generationClips, commitGeneration, changeGeneration, deleteGeneration} from "./generation_edit.js";
+import { bindWidgetWidth, timelineOrigin, markWidthBreakpoint, MIN_NODE_WIDTH } from "./dom_layout.js";
+import { PreviewCache } from "./timeline_performance.js";
+import { setMaterialProgress } from "./run_progress.js";
 
 const FPS = 24, FRAME = 1 / FPS;
 const PORT_LIMITS = { image: 9, video: 3, audio: 3 };  // H3 参考输出口数量（图片 9，视频/音频各 3）
@@ -265,7 +265,33 @@ function migrateLegacy(config) {
     return { ...empty, sources, audio_tracks: lanes, split_points: grid.slice(0, -1) };
 }
 
+// 载入存档的基础校验：片段的时间/源范围必须有限非负；异常条目丢弃并计数，交给调用方提示（不白屏）。
+let lastLoadDropped = 0;
+const validLoadedClip = clip => !!clip && ["tl_start", "src_in", "src_out"].every(field => {
+    const value = Number(clip[field]);
+    return Number.isFinite(value) && value >= 0;
+});
+function sanitizeLoadedClips(state) {
+    let dropped = 0;
+    for (const key of ["video_tracks", "audio_tracks"]) {
+        if (!Array.isArray(state[key])) continue;
+        state[key] = state[key].map(lane => (Array.isArray(lane) ? lane : []).filter(clip => {
+            if (validLoadedClip(clip)) return true;
+            dropped += 1;
+            return false;
+        }));
+    }
+    if (Array.isArray(state.generation_clips))
+        state.generation_clips = state.generation_clips.filter(clip => {
+            if (validLoadedClip(clip)) return true;
+            dropped += 1;
+            return false;
+        });
+    return dropped;
+}
+
 function loadStateValue(raw) {
+    lastLoadDropped = 0;
     let config;
     try { config = JSON.parse(raw || "{}"); } catch { config = {}; }
     let state;
@@ -273,6 +299,7 @@ function loadStateValue(raw) {
     else if (config.version === 1 || config.version === 2 || config.tracks || config.entries) { const migrated = migrateLegacy(config); state = cutTimelineAt(migrated, migrated.split_points); }
     else state = emptyTimeline();
     state = stripToneSources(state);
+    lastLoadDropped = sanitizeLoadedClips(state);
     state.muted_tracks ||= {};
     state.disabled_tracks ||= {};
     const sourceMap = new Map((state.sources || []).map(source => [source.id, source]));
@@ -411,7 +438,8 @@ export function updateSegmentMaterialOutputs(node, state) {
         }
         if (specs.length) linkSnap.set(output.name, specs);
     }
-    const slots = [...fixed, ...refSlots, {name: "mask_frames", label: "遮罩专用", localized_name: "遮罩专用", type: "IMAGE", h3_key: "name:mask_frames"}];
+    const slots = [...fixed, ...refSlots,
+        {name: "mask_frames", label: "遮罩专用", localized_name: "遮罩专用", type: "IMAGE", h3_key: "name:mask_frames"}];
     const alias = { "宽度": "width", "高度": "height", width: "width", height: "height" };
     for (const output of (node.outputs || [])) {
         const raw = output.name;
@@ -543,7 +571,8 @@ export function mountTimelineEditor(node) {
             applyLayoutHeight();
         }, delay);
     };
-    const restoreHistory = (from,to) => {const saved=from.pop(),groupMove=typeof saved==="object"&&saved.groupMove,state=JSON.stringify(T.state);to.push(groupMove?{state,groupMove:true}:state);T.state=JSON.parse(groupMove?saved.state:saved);afterEdit(!!groupMove,true,!!groupMove);};
+    // 撤销/重做后必须同步动态参考口与 ref_counts：outputs 传 true（afterEdit 内调用 updateMaterialOutputs → 刷新当前段参考口）。
+    const restoreHistory = (from,to) => {const saved=from.pop(),groupMove=typeof saved==="object"&&saved.groupMove,state=JSON.stringify(T.state);to.push(groupMove?{state,groupMove:true}:state);T.state=JSON.parse(groupMove?saved.state:saved);afterEdit(true,true,!!groupMove);};
     const doUndo = () => { if (!undoStack.length) return; restoreHistory(undoStack,redoStack);hint("已撤销上一步操作。"); };
     const doRedo = () => { if (!redoStack.length) return; restoreHistory(redoStack,undoStack);hint("已重做上一步操作。"); };
     const syncHistory = () => { root.querySelector("[data-undo]").disabled = !undoStack.length; root.querySelector("[data-redo]").disabled = !redoStack.length; };
@@ -567,7 +596,7 @@ export function mountTimelineEditor(node) {
     <span class="h3-path-label" data-path-load>素材路径：</span>
     <button data-library="input" title="重新加载 ComfyUI/input/AD-Segmented-Loop-input 下的图片/音频/视频">重新加载</button>
     <button data-library="generated" title="生成加载 ComfyUI/output/AD-Segmented-Loop 下的图片/音频/视频">生成加载</button>
-    <input data-path-input type="text" placeholder="粘贴完整路径后回车导入（如 E:\素材\a.mp4）" aria-label="素材文件路径">
+    <input data-path-input type="text" placeholder="粘贴完整路径后回车导入" aria-label="素材文件路径">
   </div>
 </div>
 <div class="h3-player" data-player>
@@ -618,6 +647,7 @@ export function mountTimelineEditor(node) {
   <button data-smart-apply class="primary">应用切分</button>
   <button data-smart-clear>清空候选</button>
   <button data-smart-add class="primary" title="在白色游标位置添加黄色候选切分线；应用切分后生效">添加切分线</button>
+  <span class="h3-smart-info" data-smart-info></span>
 </div>
 <div class="h3-view" data-view>
   <div class="h3-canvas" data-canvas>
@@ -719,13 +749,15 @@ export function mountTimelineEditor(node) {
         });
     }
     const hint = (text, error = false) => {
-        if (typeof text === "string" && (text.startsWith("从白线") || text.startsWith("无音视频："))) {
-            const el = $("[data-hint]");
+        const el = $("[data-hint]");
+        // 播放类提示（从白线/所选片段开始播放）不能被选中摘要隐藏：用户需要看到本次播放起点。
+        const playbackHint = typeof text === "string" && (text.startsWith("从白线") || text.startsWith("从所选片段"));
+        if (typeof text === "string" && text.startsWith("无音视频：")) {
             if (el) { el.textContent = ""; el.classList.remove("error"); }
             return;
         }
-        const el = $("[data-hint]"); el.textContent = text; el.classList.toggle("error", error);
-        el.hidden = !error && !!$("[data-selection-summary]").textContent;
+        el.textContent = text; el.classList.toggle("error", error);
+        el.hidden = !error && !playbackHint && !!$("[data-selection-summary]").textContent;
     };
     const showPlayerPlaceholder = (text) => {
         if (!playerPh) return;
@@ -1044,9 +1076,15 @@ export function mountTimelineEditor(node) {
                     element.style.left = `${timeToX(clip.tl_start)}px`;
                     element.style.width = `${Math.max(6, timeToX(clip.src_out - clip.src_in))}px`;
                     element.classList.toggle("selected", T.selected.has(clip.id));
-                    element.innerHTML = `<div class="label">${source?.name || "?"}</div>` +
-                        `<canvas width="1" height="1" ${isVideo ? `data-thumb="${clip.source}"` : ""}></canvas>` +
-                        `<div class="edge l"></div><div class="edge r"></div>`;
+                    // 素材名来自外部文件名：用 textContent 建 label，禁止拼进 innerHTML（防 XSS 注入）。
+                    const label = document.createElement("div");
+                    label.className = "label"; label.textContent = source?.name || "?";
+                    const thumb = document.createElement("canvas");
+                    thumb.width = 1; thumb.height = 1;
+                    if (isVideo) thumb.dataset.thumb = clip.source;
+                    const leftEdge = document.createElement("div"); leftEdge.className = "edge l";
+                    const rightEdge = document.createElement("div"); rightEdge.className = "edge r";
+                    element.append(label, thumb, leftEdge, rightEdge);
                     element.ondblclick = () => splitClipAt(clip, T.playhead);
                     body.append(element);
                 }
@@ -1137,9 +1175,14 @@ export function mountTimelineEditor(node) {
             tick.style.left = `${offset + timeToX(Number(tick.dataset.time))}px`;
         // 不再画灰蓝段罩：跑哪一段由选中的素材框决定
         for (const stale of canvas.querySelectorAll(":scope > .h3-segshade, :scope > .h3-segline, .h3-smartcut")) stale.remove();
-        const candidateIds = new Set(activeClips(T.state,null,T.selected).map(clip=>clip.id));
+        // 候选线与「应用切分」共用同一可应用判定（candidateCuts）：片段被移动/裁剪/切分后，
+        // 旧候选不再显示在无效位置，也避免出现「有候选线但提示没有可应用切点」。
+        const applicableCandidates = new Set();
+        if (T.smartCuts?.length)
+            for (const clip of activeClips(T.state,null,T.selected))
+                for (const frame of candidateCuts(clip)) applicableCandidates.add(frame);
         for (const frame of T.smartCuts || []) {
-            if (!T.smartOwners?.[frame]?.some(id=>candidateIds.has(id))) continue;
+            if (!applicableCandidates.has(frame)) continue;
             const marker = document.createElement("div");
             marker.className = "h3-smartcut";
             const t = frame / FPS;
@@ -1338,6 +1381,18 @@ export function mountTimelineEditor(node) {
         const steps = Math.max(0, Math.round((base - 5) / 17));
         return 5 + 17 * steps;
     };
+    const relayLength = () => {
+        try {
+            const seg = linkedPromptSegment(node);
+            const widget = seg?.widgets?.find(item => item.name === '潜桥续接');
+            return Number(widget?.value) > 0;
+        } catch (_error) { return false; }
+    };
+    const alignSegmentLength = value => {
+        const base = Math.max(1, Math.round(Number(value) || 0));
+        if (!relayLength()) return align17(base);
+        return Math.max(17, 17 * Math.floor(base / 17));
+    };
     // 帧单位时输入框本身也吸附到 17k+5（失焦/回车/点箭头后生效）；步长=17，上下箭头每次 ±17 始终合法
     const everyInput = $("[data-every]");
     if (everyInput) {
@@ -1346,7 +1401,7 @@ export function mountTimelineEditor(node) {
             if (T.unit !== "f") return;
             everyInput.step = "17";
             const raw = Number(everyInput.value);
-            const next = Math.max(5, align17(raw));
+            const next = Math.max(5, alignSegmentLength(raw));
             everyInput.value = String(next);
         });
         // 上下调整统一走前后 −/+ 按钮：滚轮不再改动数值。
@@ -1662,10 +1717,129 @@ export function mountTimelineEditor(node) {
         // 历史快照已包含正确绑定，不能拿编辑后的段线再次迁移。
         if (restoredBindings) lastIntervals = snapshotIntervals();
         else remapImageSegments();
+        // 删除/裁剪/切分后白线不能停在时间线之外；失效的候选切点条目一并清理。
+        const totalAfterEdit = duration();
+        if (Number.isFinite(totalAfterEdit)) T.playhead = Math.max(0, Math.min(T.playhead, totalAfterEdit));
+        pruneSmartCandidates();
+        paintSmartInfo();
         render();
         scheduleLayout(40);
         node.setDirtyCanvas(true, true);
     }
+
+    // 潜桥开启：保持当前段数/提示词不变，把可见视频轨道重排成总帧 floor(源总帧/17)*17，
+    // 按段数尽量均匀分配（如 3 段 248 帧 -> 85/85/68）。只处理单视频轨、无独立音频轨的常见情况。
+    const applyRelayPlan = relayContext => {
+        const context = Math.max(0, Number(relayContext) || 0);
+        if (!context) return false;
+        const lanes = T.state.video_tracks || [];
+        const active = lanes.map((lane, index) => ({ lane, index })).filter(item => item.lane?.length);
+        if (active.length !== 1) {
+            hint("潜桥自动重排目前只支持一条可见视频轨道；请先合并/隐藏其它视频轨。", true);
+            return false;
+        }
+        if ((T.state.audio_tracks || []).some(lane => lane?.length)) {
+            hint("潜桥自动重排暂不处理独立音频轨；请先把音频片段去掉或合并到视频轨。", true);
+            return false;
+        }
+        const clips = [...active[0].lane].sort((a, b) => Number(a.tl_start) - Number(b.tl_start));
+        if (!clips.length) return false;
+        const sourceIds = new Set(clips.map(clip => clip.source));
+        if (sourceIds.size !== 1) {
+            hint("潜桥自动重排需要同一源视频的连续片段；当前视频轨来自多个源文件。", true);
+            return false;
+        }
+        // 连续性校验：只对“同一源、时间线连续、源范围连续”的片段自动重排；
+        // 任何空隙/重叠/跳源都保留用户编辑并明确提示，不能把已删内容重新取回。
+        const eps = 0.5 / FPS;
+        for (let index = 0; index < clips.length; index++) {
+            const clip = clips[index];
+            if (!Number.isFinite(Number(clip.tl_start)) || !Number.isFinite(Number(clip.src_in))
+                    || !Number.isFinite(Number(clip.src_out))) {
+                hint("潜桥自动重排发现片段缺少时间/源范围数值，已保留你的编辑。", true);
+                return false;
+            }
+            if (index === 0) continue;
+            const previous = clips[index - 1];
+            if (Math.abs(Number(clip.tl_start) - clipEnd(previous)) > eps) {
+                hint("潜桥自动重排要求时间线连续、中间没有空隙或重叠；当前有断开，已保留你的编辑（可先合并或删掉空隙再试）。", true);
+                return false;
+            }
+            if (Math.abs(Number(clip.src_in) - Number(previous.src_out)) > eps) {
+                hint("潜桥自动重排要求源视频范围连续；当前片段之间跳源/有删减，已保留你的编辑。", true);
+                return false;
+            }
+        }
+        const totalStart = Math.min(...clips.map(clip => Number(clip.tl_start) || 0));
+        if (Math.abs(totalStart) > eps) {
+            hint("潜桥自动重排要求视频从时间线 0 开始；当前前面有空隙，已保留你的编辑。", true);
+            return false;
+        }
+        const totalEnd = Math.max(...clips.map(clip => clipEnd(clip)));
+        const totalFrames = Math.max(0, Math.round((totalEnd - totalStart) * FPS));
+        const count = clips.length;
+        const units = Math.floor(totalFrames / 17);
+        if (units < count) {
+            hint(`源视频只有 ${totalFrames} 帧，潜桥至少需要 ${count * 17} 帧才能保持 ${count} 段。`, true);
+            return false;
+        }
+        const base = Math.floor(units / count), extra = units % count;
+        const targets = Array.from({ length: count }, (_, index) => (base + (index < extra ? 1 : 0)) * 17);
+        // 按最终生成帧数 G=target+C 预检单段上限，避免排队后才报错。
+        const maxWidget = (node.widgets || []).find(widget => widget.name === "max_frames");
+        const maxRaw = Number(maxWidget?.value ?? maxWidget?.options?.default);
+        const maxFrames = Number.isFinite(maxRaw) && maxRaw > 0 ? maxRaw : 0;
+        if (maxFrames) {
+            for (let index = 0; index < targets.length; index++) {
+                if (targets[index] + context > maxFrames) {
+                    hint(`潜桥重排后第 ${index + 1} 段需要生成 ${targets[index] + context} 帧（${targets[index]}+C=${context}），超过单段上限 ${maxFrames} 帧；已保留原编辑，请增加段数/缩短时长或提高单段上限。`, true);
+                    return false;
+                }
+            }
+        }
+        const signature = [clips[0].source, totalFrames, count, context, targets.join("/")].join("|");
+        if (T.state.segment_recipe?.relay_plan?.signature === signature) return false;
+        const template = clips[0];
+        const sourceStart = Number(template.src_in) || 0;
+        let cursorFrames = 0;
+        const nextClips = targets.map((frames, index) => {
+            const start = cursorFrames / FPS;
+            const end = (cursorFrames + frames) / FPS;
+            cursorFrames += frames;
+            return {
+                ...template,
+                id: uid("v"),
+                tl_start: snapFrame(start),
+                src_in: snapFrame(sourceStart + start),
+                src_out: snapFrame(sourceStart + end),
+                retained_src_in: undefined,
+                retained_src_out: undefined,
+            };
+        });
+        pushUndo();
+        T.state.video_tracks = lanes.map((lane, index) => index === active[0].index ? nextClips : []);
+        T.state.duration = snapFrame(cursorFrames / FPS);
+        T.state.segmentation = "clips";
+        T.state.split_points = [];
+        T.state.segment_recipe = {
+            ...(T.state.segment_recipe || {}),
+            frames: targets[0], count, unit: "f", custom: true,
+            relay_plan: { signature, targets, total: cursorFrames, context,
+                          source: clips[0].source, source_start: sourceStart },
+        };
+        T.unit = "f";
+        T.selected.clear();
+        T.segment = -1;
+        T.playhead = 0;
+        const every = $("[data-every]");
+        const countInput = $("[data-count]");
+        if (every) every.value = targets[0];
+        if (countInput) countInput.value = count;
+        afterEdit();
+        hint(`潜桥已重排：${count} 段 ${targets.join(" / ")} 帧，共 ${cursorFrames} 帧（C=${context}，尾部不足 17 帧的部分不生成）。`);
+        return true;
+    };
+    node._adH3ApplyRelayPlan = applyRelayPlan;
 
     // ---------- 波形 ----------
     let audioCtx = null, previewDisposed = false;
@@ -2047,8 +2221,12 @@ export function mountTimelineEditor(node) {
 .ad-lib-foot .primary[disabled]{opacity:.5;cursor:not-allowed}`;
         document.head.append(style);
     }
-    let libraryPanel = null;
-    function closeLibraryPanel() { if (libraryPanel) { libraryPanel.remove(); libraryPanel = null; } }
+    let libraryPanel = null, libraryPanelKeyHandler = null;
+    function closeLibraryPanel() {
+        // 关闭面板时移除注册的 keydown 监听，避免每次打开都遗留一个监听器。
+        if (libraryPanelKeyHandler) { document.removeEventListener("keydown", libraryPanelKeyHandler); libraryPanelKeyHandler = null; }
+        if (libraryPanel) { libraryPanel.remove(); libraryPanel = null; }
+    }
     async function openLibraryPanel(mode) {
         ensureLibraryPanelStyle(); closeLibraryPanel();
         const overlay = document.createElement("div"); overlay.className = "ad-lib-overlay";
@@ -2095,6 +2273,7 @@ export function mountTimelineEditor(node) {
         };
         const onKey = event => { if (event.key === "Escape") { document.removeEventListener("keydown", onKey); closeLibraryPanel(); } };
         document.addEventListener("keydown", onKey);
+        libraryPanelKeyHandler = onKey;
         overlay.addEventListener("click", async event => {
             if (event.target === overlay) { document.removeEventListener("keydown", onKey); closeLibraryPanel(); return; }
             const button = event.target.closest("button"); if (!button) return;
@@ -2141,11 +2320,16 @@ export function mountTimelineEditor(node) {
     }
     // 「素材路径」= 批处理素材清单：回车/失焦后自动读取路径内文件数量来更新右上角「分段清单（x段）」，
     // 同时绝不把这些文件导入素材准备节点（不新增素材、不新增端口、不改时间线）。
-    function applyBatchPath() {
+    // 最近一次真正应用到时间线状态的路径：避免失焦/切换时值没变也重复应用，或空值把已保存路径清掉。
+    let appliedBatchPath = "";
+    function applyBatchPath({clear = false} = {}) {
         const input = $("[data-path-input]");
         const raw = String(input?.value || "").trim().replace(/^"(.*)"$/, "$1");
+        // 空输入不清 path_source（清空需显式 clear）；值与上次应用相同也不重复 afterEdit/扫描。
+        if (!clear && (!raw || raw === appliedBatchPath)) return raw;
+        appliedBatchPath = raw;
         if (raw) T.state.path_source = raw;
-        else delete T.state.path_source;
+        else if (clear) delete T.state.path_source;
         try { afterEdit(); } catch {}
         if (!raw) {
             T.batchCount = 0;
@@ -2156,6 +2340,7 @@ export function mountTimelineEditor(node) {
         return raw;
     }
     let batchScanTicket = 0;
+    const batchScanAbort = new AbortController();  // 节点销毁时取消在途路径扫描
     function showBatchCount(count, summary = "") {
         T.batchCount = count;
         node._adH3BatchCount = count;
@@ -2174,6 +2359,7 @@ export function mountTimelineEditor(node) {
             const response = await api.fetchApi("/aiden_h3/scan_path", {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ path }),
+                signal: batchScanAbort.signal,
             });
             const data = await response.json();
             if (ticket !== batchScanTicket) return 0;
@@ -2190,6 +2376,7 @@ export function mountTimelineEditor(node) {
             return list.length;
         } catch (error) {
             if (ticket !== batchScanTicket) return 0;
+            if (batchScanAbort.signal.aborted || previewDisposed) return 0;  // 节点已销毁，不再提示
             showBatchCount(0);
             hint(`读取素材路径失败：${error.message}`, true);
             return 0;
@@ -2205,20 +2392,27 @@ export function mountTimelineEditor(node) {
         if (label) label.addEventListener("click", () => input?.focus?.());
         if (input) {
             let pathInputTimer = 0;
+            // 输入框失焦/回车/改动时提交：空值不清已保存路径，值未变化不重复应用。
+            const commitPathInput = () => {
+                const raw = String(input.value || "").trim().replace(/^"(.*)"$/, "$1");
+                applyBatchPath();
+                if (raw) void scanBatchPath(raw, { announce: true });
+            };
             input.addEventListener("input", () => {
                 const raw = String(input.value || "").trim().replace(/^"(.*)"$/, "$1");
-                if (raw) T.state.path_source = raw; else delete T.state.path_source;
+                if (!raw) { clearTimeout(pathInputTimer); return; }  // 清空输入不丢已保存路径，等显式清除
+                T.state.path_source = raw;
                 clearTimeout(pathInputTimer);
                 ++batchScanTicket; showBatchCount(0);
-                pathInputTimer = setTimeout(() => { applyBatchPath(); void scanBatchPath(input.value, { announce: true }); }, 350);
+                pathInputTimer = setTimeout(() => { commitPathInput(); }, 350);
             });
-            input.addEventListener("change", () => { clearTimeout(pathInputTimer); applyBatchPath(); void scanBatchPath(input.value, { announce: true }); });
-            input.addEventListener("blur", () => { clearTimeout(pathInputTimer); applyBatchPath(); void scanBatchPath(input.value, { announce: true }); });
+            input.addEventListener("change", () => { clearTimeout(pathInputTimer); commitPathInput(); });
+            input.addEventListener("blur", () => { clearTimeout(pathInputTimer); commitPathInput(); });
             input.addEventListener("keydown", event => {
-                if (event.key === "Enter") { event.preventDefault(); clearTimeout(pathInputTimer); applyBatchPath(); void scanBatchPath(input.value, { announce: true }); }
+                if (event.key === "Enter") { event.preventDefault(); clearTimeout(pathInputTimer); commitPathInput(); }
             });
             const saved = T.state.path_source;
-            if (saved) { input.value = saved; setTimeout(() => { void scanBatchPath(saved); }, 0); }
+            if (saved) { input.value = saved; appliedBatchPath = saved; setTimeout(() => { void scanBatchPath(saved); }, 0); }
         }
     }
 
@@ -2372,12 +2566,14 @@ export function mountTimelineEditor(node) {
             hint(`第 ${index+1} 段 ${Math.round((end-start)*FPS)} 帧；后块仅顺延，帧数保留。`);
         };
         const move=ev=>{last=ev;if(!raf)raf=requestAnimationFrame(()=>{raf=0;apply(last);});};
+        let finished=false;
         const up=()=>{
-            window.removeEventListener("pointermove",move);window.removeEventListener("pointerup",up);
+            if(finished)return;finished=true;
+            window.removeEventListener("pointermove",move);window.removeEventListener("pointerup",up);window.removeEventListener("pointercancel",up);
             if(raf){cancelAnimationFrame(raf);raf=0;apply(last);}endInteraction();
             if(moved)afterEdit();
         };
-        window.addEventListener("pointermove",move);window.addEventListener("pointerup",up);
+        window.addEventListener("pointermove",move);window.addEventListener("pointerup",up);window.addEventListener("pointercancel",up);
     }
 
     // ---------- 播放试听 ----------
@@ -2662,9 +2858,13 @@ export function mountTimelineEditor(node) {
             T.segment = -1;
             paintSelection();
         };
+        let finished = false;
         const up = e => {
+            if (finished) return;
+            finished = true;
             window.removeEventListener("pointermove", move);
             window.removeEventListener("pointerup", up);
+            window.removeEventListener("pointercancel", up);
             box?.remove();
             endInteraction();
             if (!moved) {
@@ -2689,6 +2889,7 @@ export function mountTimelineEditor(node) {
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
+        window.addEventListener("pointercancel", up);
     }
     function selectSegmentAt(t) {
         const index = segmentAt(t);
@@ -2781,7 +2982,7 @@ export function mountTimelineEditor(node) {
     }
     function dragClip(event, element) {
         if (event.button !== 0) return;
-        
+
         event.preventDefault();
         const resume = T.playing;
         if (resume) stopPlayback();
@@ -2961,9 +3162,13 @@ export function mountTimelineEditor(node) {
             bumpSnapCache();
             if (!raf) raf = requestAnimationFrame(() => { raf = 0; patchClipsDuringDrag(); });
         };
+        let dragFinished = false;
         const up = () => {
+            if (dragFinished) return;
+            dragFinished = true;
             window.removeEventListener("pointermove", move);
             window.removeEventListener("pointerup", up);
+            window.removeEventListener("pointercancel", up);
             if (raf) { cancelAnimationFrame(raf); raf = 0; patchClipsDuringDrag(); }
             endInteraction();
             if (moved) {
@@ -2978,6 +3183,7 @@ export function mountTimelineEditor(node) {
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
+        window.addEventListener("pointercancel", up);
     }
     function splitSelectedClips(clips, points) {
         const cutsFor = clip => [...new Set((points instanceof Map ? points.get(clip.id) || [] : points).map(snapFrame))].sort((a,b)=>a-b);
@@ -2994,8 +3200,9 @@ export function mountTimelineEditor(node) {
                         ...clip,
                         id: index ? uid("c") : clip.id,
                         tl_start: ends[index],
-                        src_in: clip.src_in + ends[index] - clip.tl_start,
-                        src_out: clip.src_in + end - clip.tl_start,
+                        // 帧对齐：切分点已按 24FPS 吸附，派生源范围也统一帧对齐，保证都是 1/24 秒整数倍。
+                        src_in: snapFrame(clip.src_in + ends[index] - clip.tl_start),
+                        src_out: snapFrame(clip.src_in + end - clip.tl_start),
                     };
                     nextSelected.add(piece.id);
                     return piece;
@@ -3009,13 +3216,17 @@ export function mountTimelineEditor(node) {
     function splitClipAt(clip, t) {
         if (!clip || t <= clip.tl_start + 0.5 * FRAME || t >= clipEnd(clip) - 0.5 * FRAME) { hint("播放头要落在片段内部才能切断。", true); return; }
         pushUndo();
-        const right = { ...clip, id: uid("c"), tl_start: snapFrame(t), src_in: clip.src_in + (t - clip.tl_start) };
-        clip.src_out = clip.src_in + (t - clip.tl_start);
+        // 帧对齐：同一个 snapFrame 后的切点推导右段起点与两段源范围，保证 tl_start/src_in/src_out 都是 1/24 秒整数倍。
+        const cut = snapFrame(t);
+        const cutIn = snapFrame(clip.src_in + (cut - clip.tl_start));
+        const right = { ...clip, id: uid("c"), tl_start: cut, src_in: cutIn };
+        clip.src_out = cutIn;
         for (const key of ["video_tracks", "audio_tracks"]) T.state[key] = T.state[key].map(lane => {
             const index = lane.findIndex(item => item.id === clip.id);
             return index === -1 ? lane : [...lane.slice(0, index + 1), right, ...lane.slice(index + 1)];
         });
         T.state.segmentation = "clips";
+        T.state.split_points = [];  // 与其它切分路径一致：清掉旧的连续切点
         T.selected = new Set([clip.id, right.id]);  // 切开后两段都保持可选中的蓝色框
         afterEdit();
         hint("已在播放头处切断片段。");
@@ -3055,7 +3266,13 @@ export function mountTimelineEditor(node) {
         const snapshot = JSON.stringify(T.state), selected = new Set(T.selected), sources = sourcesOf();
         T.merging = true; hint("正在合并实际保留的片段…");
         try {
-            const clips = ordered.map(({clip}) => ({...sources[clip.source], src_in: clip.src_in, src_out: clip.src_out}));
+            // 后端 assets.merge_clips 支持逐片段 muted：把片段/轨道静音状态一起传过去，静音段不混入声音。
+            const laneMuteFlags = (T.state.muted_tracks || {})[key] || [];
+            const clipMuted = clip => !!(
+                (key === "video_tracks" && clip.audio_muted)
+                || (laneMuteFlags[li] ?? !!sources[clip.source]?.muted)
+            );
+            const clips = ordered.map(({clip}) => ({...sources[clip.source], src_in: clip.src_in, src_out: clip.src_out, muted: clipMuted(clip)}));
             const response = await api.fetchApi("/aiden_h3/merge_clips", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:key === "video_tracks" ? "video" : "audio", clips})});
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || "合并失败");
@@ -3203,7 +3420,8 @@ export function mountTimelineEditor(node) {
         }
         if (button.dataset.edit) {
             const action = button.dataset.edit;
-            const t = T.playhead;
+            // 帧对齐：裁剪/切断统一用吸附到 24FPS 的切点推导。
+            const t = snapFrame(T.playhead);
             // 无音视频：生成段走同一套裁切/切断
             if (!hasAvClips()) { editGeneration(action); return; }
             if (action === "split") {
@@ -3220,12 +3438,13 @@ export function mountTimelineEditor(node) {
             for (const clip of clips) {
                 if (action === "left") {
                     if (t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME) {
-                        clip.src_in += t - clip.tl_start;
-                        clip.tl_start = snapFrame(t);
+                        // 左裁：源起点与时间线起点都由同一个帧对齐切点推导。
+                        clip.src_in = snapFrame(clip.src_in + (t - clip.tl_start));
+                        clip.tl_start = t;
                         changed.push(clip);
                     }
                 } else {
-                    if (t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME) {clip.src_out = clip.src_in + (t - clip.tl_start);changed.push(clip);}
+                    if (t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME) {clip.src_out = snapFrame(clip.src_in + (t - clip.tl_start));changed.push(clip);}
                 }
             }
             for(const clip of changed){clip.retained_src_in=clip.src_in;clip.retained_src_out=clip.src_out;}
@@ -3374,6 +3593,8 @@ export function mountTimelineEditor(node) {
                 try { rawSources = JSON.parse(value || "{}").sources || []; } catch { rawSources = []; }
                 T.state = loadStateValue(value);
                 if(node._adWorkflowSession){T.state.session_id=node._adWorkflowSession;T.state.workflow_task_id=node._adWorkflowTask;}
+                // 基础校验：时间/源范围异常的片段已在 loadStateValue 里丢弃，这里提示而不是白屏。
+                if (lastLoadDropped) hint(`已丢弃 ${lastLoadDropped} 个时间/源范围异常的片段记录，其余内容已正常载入。`, true);
             }
             catch (error) { hint(error.message, true); T.state = emptyTimeline(); }
             // 旧版本删除图片只清了参考记录：加载时清掉没有池条目的孤儿图片源
@@ -3385,6 +3606,13 @@ export function mountTimelineEditor(node) {
                 hint("已自动移除内置嘟声测试音源；请加载真实音频/视频。");
                 try { updateMaterialOutputs(node, T.state); } catch {}
             }
+            // 路径批处理：重开工作流回填路径框，并按当前路径重新扫描分段数（空值不清已保存的路径）。
+            const pathInput = $("[data-path-input]");
+            const savedPath = String(T.state.path_source || "");
+            if (pathInput) pathInput.value = savedPath;
+            appliedBatchPath = savedPath;
+            if (savedPath) setTimeout(() => { if (node.graph) void scanBatchPath(savedPath); }, 0);
+            else { T.batchCount = 0; node._adH3BatchCount = 0; }
             T.selected.clear(); T.segment = -1;
             const iv=segmentIntervals(T.state), recipe=T.state.segment_recipe;
             T.unit=recipe?.unit==="s"?"s":"f";
@@ -3565,12 +3793,36 @@ export function mountTimelineEditor(node) {
         smartCutButton.dataset.adH3Bound = "1";
         smartCutButton.addEventListener("click", () => splitVideoAtPlayhead());
     }
+    // 切分/裁剪/合并/删除后，清理 smartScopes/smartOwners 中已失效片段的候选条目；
+    // 片段仍在但范围变了同样视为失效（旧候选线位置不再有效），由 afterEdit 统一调用。
+    function pruneSmartCandidates() {
+        const scopes = T.smartScopes;
+        if (!scopes) return;
+        const live = new Map([...(T.state.video_tracks || []), ...(T.state.audio_tracks || [])]
+            .flat().map(clip => [clip.id, clipScope(clip)]));
+        const stale = new Set();
+        for (const id of Object.keys(scopes)) {
+            if (live.has(id) && live.get(id) === scopes[id]) continue;
+            stale.add(id);
+            delete scopes[id];
+        }
+        if (!stale.size) return;
+        T.smartOwners ||= {};
+        for (const frame of T.smartCuts || []) {
+            const owners = (T.smartOwners[frame] || []).filter(id => !stale.has(id));
+            if (owners.length) T.smartOwners[frame] = owners;
+            else delete T.smartOwners[frame];
+        }
+        T.smartCuts = (T.smartCuts || []).filter(frame => T.smartOwners[frame]?.length);
+        root._adH3SmartCuts = [...T.smartCuts];
+    }
     let followedPlayhead = null;
     node._adH3FollowSegment = (seconds, {remember = false} = {}) => {
         const value = Number(seconds);
         if (!Number.isFinite(value)) return;
         if (remember && followedPlayhead === null) followedPlayhead = T.playhead;
-        T.playhead = Math.max(0, Math.min(duration(), value));
+        // 帧对齐：跟随段起点/区间统一按 24FPS 吸附后写入，后续裁剪/切分都从对齐的游标推导。
+        T.playhead = Math.max(0, Math.min(duration(), snapFrame(value)));
         renderOverlays();
         renderClock({seekPreview: true});
         syncButtons();
@@ -3788,6 +4040,8 @@ export function mountTimelineEditor(node) {
     };
     const onRemoved = node.onRemoved;
     node.onRemoved = function () {
+        try { closeLibraryPanel(); } catch {}
+        try { batchScanAbort.abort(); } catch {}  // 节点销毁时取消在途路径扫描
         storagePanel.dispose();
         stopPlayback();clearInterval(planTimer);
         contentObserver.disconnect(); clearTimeout(layoutTimer);
@@ -3806,7 +4060,7 @@ export function mountTimelineEditor(node) {
         for (const job of audioPending.values()) job.controller.abort();
         audioPending.clear(); audioCache.clear(); void audioCtx?.close(); T.buffers.clear();
         thumbCache.clear();
-        
+
         root.remove();  // 节点删除时必须移除控件，否则残留的幽灵层会截走全部点击
         if (activeEditorRoot === root) activeEditorRoot = null;
         return onRemoved?.apply(this, arguments);
@@ -3832,7 +4086,7 @@ export function mountTimelineEditor(node) {
         $("[data-count]").value = recipe.count || DEFAULT_SEG_COUNT;
     }
     render();
-    
+
     const prevConn = node.onConnectionsChange;
     node.onConnectionsChange = function () {
         const result = prevConn?.apply(this, arguments);

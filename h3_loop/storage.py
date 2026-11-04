@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import hashlib
@@ -359,6 +359,7 @@ class SessionStore:
             except FileNotFoundError:
                 state = {"schema": 1, "id": session_id, "cursor": 0, "epoch": 0, "round_no": 1,
                          "status": "ready", "auto": False, "pause_after": False,
+                         "relay_run_id": uuid.uuid4().hex,
                          "segments": [], "active": None, "merged": None, "error": ""}
             if (state.get("execution_round") and not keep_completed) or state.get("draft_trial"):
                 return copy.deepcopy(state)
@@ -536,7 +537,34 @@ class SessionStore:
         state.update(cursor=0, status="ready", auto=False, active=None, pause_after=False,
                      epoch=state["epoch"] + 1,
                      reset_id=uuid.uuid4().hex,
+                     # 每组/每次重置批次独立一条潜桥持久链：旧组的稳定 stage 不再被新组覆盖。
+                     relay_run_id=uuid.uuid4().hex,
                      error="")
+        state.pop("trial_notice", None)
+
+    def _archive_and_start_next_round(self, state, always_next=False):
+        """归档当前轮为历史组并进入下一轮；没有结果时只重置。
+
+        清空重置与新建一组共用：旧轮保留为可回抽的历史组（内部独立潜桥链），
+        新一轮从第 1 段开始，旧结果只留在历史轮快照与预览记录里。
+        """
+        from . import group_history
+        rows = state.get("segments") or []
+        has_results = any(row.get("versions") for row in rows)
+        advanced = False
+        if has_results or always_next:
+            group_history.archive(self, state)
+            number = max(int(state.get("group_seq", 1) or 1), int(state.get("round_no", 1) or 1)) + 1
+            state["round_no"] = number
+            state["group_seq"] = number
+            advanced = True
+        self._reset_round(state)
+        if advanced and has_results:
+            for row in rows:
+                row["versions"] = []
+                row["boundary_changed"] = False
+                row.pop("stale_after_reroll", None)
+        return state
 
     def ensure_run_token(self, session_id, token=""):
         """Return a token that matches an active reservation.
@@ -583,8 +611,8 @@ class SessionStore:
                 return fresh
 
             if status == "completed" and self._batch_path(state):
-                # 素材路径批处理完成：不要求手动清空，直接自动清空本轮并从第 1 段开始新一轮。
-                self._reset_round(state)
+                # 素材路径批处理完成：不要求手动清空，归档本轮并自动开始新一轮。
+                self._archive_and_start_next_round(state)
                 return _reserve_at_cursor(state)
             if status in {"ready", "paused", "error"}:
                 state["active"] = None
@@ -605,7 +633,7 @@ class SessionStore:
                 # 进度只增不减：停止后再开始、改完参数再开始、上一轮中断残留的 active，
                 # 都只在当前游标处重新预约，不清空结果、不回退游标。
                 if state.get("status") == "completed":
-                    self._reset_round(state)
+                    self._archive_and_start_next_round(state)
                 state["active"] = None
                 index = max(0, min(int(state.get("cursor", 0)), len(state["segments"]) - 1))
                 try:
@@ -709,9 +737,19 @@ class SessionStore:
             state["status"] = "review"
             if state.get("auto_accept") and not state.get("pause_after"):
                 # 生成即通过：新界面不再需要「同意批准」步骤，完成后自动通过并前进一段。
-                self._accept(state)
+                try:
+                    self._accept(state)
+                    state["error"] = ""
+                except ValueError as exc:
+                    # 潜桥 latent 可能还没落盘：版本必须照样保存，等存盘回调补提升后用户重试通过；
+                    # 绝不能因为提升失败丢掉版本记录（否则存盘回调找不到版本，永远补不上）。
+                    state.update(status="review", auto=False, active=None, error=str(exc))
             elif state["auto"] and not state["pause_after"]:
-                self._accept(state)
+                try:
+                    self._accept(state)
+                    state["error"] = ""
+                except ValueError as exc:
+                    state.update(status="review", auto=False, active=None, error=str(exc))
             elif state["pause_after"]:
                 state["status"] = "paused"
                 state["auto"] = False
@@ -748,10 +786,18 @@ class SessionStore:
             version.update(details or {})
             version["reset_id"] = state.get("reset_id", "legacy")
             row["versions"].append(version)
-            row["selected"] = version["id"]
-            row["valid"] = True
-            row["accepted"] = bool(state.get("auto_accept"))
-            row["boundary_changed"] = False
+            if matched:
+                row["selected"] = version["id"]
+                row["valid"] = True
+                row["accepted"] = bool(state.get("auto_accept"))
+                row["boundary_changed"] = False
+            if matched:
+                self._promote_relay_stage(state, row, version)
+            else:
+                # 停止/改参数/中断后才到达的结果：只登记为历史版本（可用“选用旧版本”手动改选）。
+                # 绝不改 selected/valid/accepted/状态/游标：否则用户“停止 → 改数值 → 重新开始”时，
+                # 旧条件结果会被当成当前段结果拦住开始或被前端自动接受，导致一直复用旧参数。
+                version["late"] = True
             if not current:
                 row["valid"] = False
                 if matched:
@@ -764,18 +810,124 @@ class SessionStore:
                     if state.get("auto_accept"):
                         current_row = state["segments"][state["cursor"]]
                         if current_row.get("valid") and current_row.get("selected"):
-                            self._accept(state)
+                            try:
+                                self._accept(state)
+                                state["error"] = ""
+                            except ValueError as exc:
+                                # 同上：版本先保存；存盘回调稍后会补提升，用户重试通过即可。
+                                state.update(status="review", auto=False, error=str(exc))
                         else:
                             state["status"] = "ready"
                     else:
                         state["status"] = "review"
-            else:
-                # 停止/改参数/中断后才到达的结果：只追加版本并等待审核，不动当前运行状态。
-                state["error"] = ""
-                if not state.get("auto_accept") and state["status"] not in {"queued", "running"} and not state.get("preview_hold"):
-                    state["status"] = "review"
-                self._restore_preview_hold(state, successful=True)
+            # 迟到结果不改会话状态：用户点“开始/分段循环”时按当前参数正常重跑。
             return self._save(state)
+
+
+    def _promote_relay_stage(self, state, row, version=None):
+        """把被选中版本对应的潜桥 stage 提升到稳定 run_id 的当前段目录。
+
+        每次生成存盘使用唯一 save_run_id，避免重做覆盖旧版本的 latent；选中/批准时
+        再把该版本 stage 复制到稳定 run_id 的同一段号，下一段桥接总是读到当前选用。
+
+        失败不再静默：源文件缺失或复制失败都会打印明确原因并返回 False；
+        复制使用“临时文件 + os.replace”原子替换，避免半截文件被下一段当父 latent。
+        """
+        if not isinstance(version, dict):
+            return False
+        target = str(version.get("relay_run_id") or "")
+        source = str(version.get("relay_save_run_id") or "")
+        try:
+            stage = int(version.get("relay_stage_index"))
+        except (TypeError, ValueError):
+            return False
+        if not target or not source or target == source:
+            return False
+        try:
+            import folder_paths
+            root = Path(folder_paths.get_output_directory()) / "relay_kit"
+            source_file = root / source / ("stage_%05d.safetensors" % stage)
+            if not source_file.is_file():
+                print("[AD-潜桥] 提升失败：源 stage 不存在（%s）；本段 latent 尚未落盘或已被删除，"
+                      "请重跑该段后再批准。" % (source_file,))
+                return False
+            target_dir = root / target
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_file = target_dir / source_file.name
+            # 不对“大小+秒级 mtime”做去重：不同 latent 经常同大小、也可能落在同一秒，
+            # 误判会静默沿用旧版本。每次提升都原子复制（单文件约 2MB，代价可忽略）。
+            temporary = target_file.with_name(target_file.name + ".ad_tmp")
+            shutil.copy2(source_file, temporary)
+            os.replace(temporary, target_file)
+            return True
+        except Exception as exc:
+            print("[AD-潜桥] 提升失败：%r" % (exc,))
+            return False
+
+    @staticmethod
+    def _relay_version_parts(version):
+        """relay 版本的 (稳定链, 唯一存盘链, 段号)；非 relay 版本返回 None。"""
+        if not isinstance(version, dict):
+            return None
+        target = str(version.get("relay_run_id") or "")
+        source = str(version.get("relay_save_run_id") or "")
+        try:
+            stage = int(version.get("relay_stage_index"))
+        except (TypeError, ValueError):
+            return None
+        if not target or not source or target == source:
+            return None
+        return target, source, stage
+
+    def _ensure_relay_promoted(self, state, row, version, action="继续"):
+        """relay 版本在选用/批准前必须成功提升稳定 latent；失败时阻止推进并明确报错。"""
+        if self._relay_version_parts(version) is None:
+            return True
+        if self._promote_relay_stage(state, row, version):
+            return True
+        raise ValueError(
+            "潜桥 latent 提升失败：该版本的 stage 文件缺失或复制失败，已阻止%s，"
+            "避免下一段接错父 latent。请重跑该段后再选用/批准。" % action)
+
+    def promote_relay_stage_for_save(self, session_id, save_run_id, stage_index):
+        """存盘节点完成后再查一次：若该版本已选中/批准就立即提升（不依赖执行顺序）。"""
+        if not session_id or not save_run_id:
+            return False
+        try:
+            with self.lock(session_id):
+                state = self._load(session_id)
+                for row in state.get("segments") or []:
+                    for version in row.get("versions") or []:
+                        if str(version.get("relay_save_run_id") or "") != str(save_run_id):
+                            continue
+                        raw_stage = version.get("relay_stage_index")
+                        if raw_stage is None:
+                            continue
+                        try:
+                            stage = int(raw_stage)
+                        except (TypeError, ValueError):
+                            continue
+                        if stage != int(stage_index):
+                            continue
+                        # 只有“当前选用版本”的存盘才允许提升；迟到/未选版本绝不能覆盖稳定 latent。
+                        if row.get("selected") != version.get("id"):
+                            return False
+                        if self._promote_relay_stage(state, row, version):
+                            self._save(state)
+                            return True
+                        return False
+        except FileNotFoundError:
+            return False
+        except Exception as exc:
+            print("[AD-潜桥] 存盘后提升检查失败：%r" % (exc,))
+            return False
+        return False
+
+    def _selected_version(self, state, row):
+        selected = row.get("selected")
+        if not selected:
+            return None
+        return next((v for v in (row.get("versions") or []) if v.get("id") == selected), None)
 
     def _accept(self, state):
         segments = state["segments"]
@@ -788,6 +940,7 @@ class SessionStore:
         row = segments[state["cursor"]]
         if not row["valid"] or not row["selected"]:
             raise ValueError("当前段还没有有效结果，无法继续；请先生成本段。")
+        self._ensure_relay_promoted(state, row, self._selected_version(state, row), "通过该段")
         row["accepted"] = True
         if state["cursor"] + 1 == len(state["segments"]):
             state["status"] = "completed"
@@ -813,7 +966,8 @@ class SessionStore:
                 state.update(auto=False, pause_after=False, active=None, status="paused", error="")
                 state.pop("run_return", None)
                 state.pop("affected_run", None)
-                state["epoch"] = int(state.get("epoch", 0)) + 1
+                # 停止不递增 epoch：在途任务完成后仍可作为新版本登记（进度只增不减）。
+                # epoch 只在「清空进度」与「取消抽卡」时递增，用于拒绝被重置/取消的旧结果。
             elif command == "cancel_preview":
                 hold=state.get("preview_hold") or {}
                 if options.get("preview_id") and options["preview_id"] != hold.get("request_id"):
@@ -975,16 +1129,12 @@ class SessionStore:
             elif command == "clear":
                 if options.get("confirmed") is not True:
                     raise ValueError("清空进度需要二次确认")
-                self._reset_round(state)
+                # 清空重置 = 归档当前轮为历史组 + 进入下一轮；旧轮仍可回抽/恢复。
+                self._archive_and_start_next_round(state)
             elif command == "new_group":
                 if state.get("status") in {"queued", "running", "merging"}:
                     raise ValueError("请先停止当前任务，再新建一组")
-                from .group_history import archive
-                archive(self,state)
-                next_group=max(int(state.get("group_seq",1)),int(state.get("round_no",1)))+1
-                self._reset_round(state)
-                for row in state["segments"]:row["versions"]=[]
-                state.update(round_no=next_group,group_seq=next_group)
+                self._archive_and_start_next_round(state, always_next=True)
             elif command == "select":
                 index = int(options["index"])
                 if not 0 <= index < len(state["segments"]):
@@ -996,6 +1146,7 @@ class SessionStore:
                 # 进度只增不减：旧参数生成的版本仍可选用，后续段结果保留。
                 if version.get("archived"):
                     raise ValueError("该版本属于已重置的轮次，仅作历史查看；请用新一轮生成结果。")
+                self._ensure_relay_promoted(state, row, version, "选用该版本")
                 row.update(selected=version["id"], valid=True, accepted=False)
                 state.update(cursor=index, status="review", auto=False, active=None)
             elif command == "start":
@@ -1004,12 +1155,25 @@ class SessionStore:
                 if state["status"] == "completed":
                     if not self._batch_path(state):
                         raise ValueError(blocked_state_message("completed"))
-                    self._reset_round(state)
+                    self._archive_and_start_next_round(state)
                 if state["cursor"] >= len(state["segments"]):
                     state["cursor"] = max(0, len(state["segments"]) - 1)
                 row = state["segments"][state["cursor"]]
                 if row["valid"] and row["selected"]:
-                    raise ValueError("当前段已有生成结果：点「开始」会接受该结果并继续，或点「分段循环」连续生成。")
+                    version = next((item for item in row.get("versions") or []
+                                    if item.get("id") == row["selected"]), None)
+                    signature_changed = bool(
+                        state["status"] == "paused" and version and version.get("signature")
+                        and row.get("signature") and version["signature"] != row["signature"]
+                        and not row.get("accepted"))
+                    if signature_changed:
+                        # 停止后改了参数/素材：旧结果保留为历史版本，本次按新条件重跑当前段，
+                        # 避免“停止 → 改数值 → 开始”时继续沿用旧条件结果。
+                        row["valid"] = False
+                        row["accepted"] = False
+                        row["boundary_changed"] = True
+                    else:
+                        raise ValueError("当前段已有生成结果：点「开始」会接受该结果并继续，或点「分段循环」连续生成。")
                 state.update(status="ready", auto=False, pause_after=False)
             else:
                 raise ValueError("未知操作")

@@ -4,10 +4,12 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import time
+import weakref
 from pathlib import Path
 from collections import OrderedDict
 from threading import RLock
@@ -19,6 +21,9 @@ _IMAGE_CACHE_BYTES = 0
 _IMAGE_CACHE_LIMIT = 128 * 1024 * 1024
 _IMAGE_CACHE_LOCK = RLock()
 _VIDEO_MUTE_LOCK = RLock()
+_DURATION_CACHE = OrderedDict()
+_DURATION_CACHE_LIMIT = 256
+_DURATION_CACHE_LOCK = RLock()
 
 
 class PreparedMediaCache:
@@ -26,6 +31,7 @@ class PreparedMediaCache:
     def __init__(self, budget=1024**3, limit=64):
         self.budget, self.limit = budget, limit
         self.entries, self.pending = OrderedDict(), {}
+        self.retired = OrderedDict()
         self.large = None
         self.bytes = 0
         self.hits = self.misses = 0
@@ -53,6 +59,19 @@ class PreparedMediaCache:
             return sum(PreparedMediaCache.size(getattr(value, name, None), seen) for name in ("images", "audio", "alpha"))
         return 0
 
+    def _remember_retired(self, key, value):
+        # 只记弱引用：执行器仍持有同一对象时可复用，不延长大型张量的寿命。
+        try:
+            self.retired[key] = weakref.ref(value)
+        except TypeError:
+            return
+        self.retired.move_to_end(key)
+        for old in list(self.retired):
+            if self.retired[old]() is None:
+                self.retired.pop(old, None)
+        while len(self.retired) > self.limit * 2:
+            self.retired.popitem(last=False)
+
     def get(self, key, loader, allow_large=False):
         with self.lock:
             if key in self.entries:
@@ -65,6 +84,14 @@ class PreparedMediaCache:
                 self.touched[key] = self.clock()
                 self.hits += 1
                 return self.large[1]
+            retired = self.retired.get(key)
+            if retired is not None:
+                value = retired()
+                if value is not None:
+                    self.retired.move_to_end(key)
+                    self.hits += 1
+                    return value
+                self.retired.pop(key, None)
             pending = self.pending.get(key)
             owner = pending is None
             if owner:
@@ -81,15 +108,20 @@ class PreparedMediaCache:
                 if value is not None and epoch == self.epoch:
                     if size > self.budget:
                         if allow_large:
-                            if self.large is not None: self.touched.pop(self.large[0], None)
+                            if self.large is not None:
+                                self._remember_retired(self.large[0], self.large[1])
+                                self.touched.pop(self.large[0], None)
                             self.large = (key, value, size)
                             self.touched[key] = self.clock()
+                        else:
+                            self._remember_retired(key, value)
                     else:
                         self.entries[key] = (value, size)
                         self.touched[key] = self.clock()
                         self.bytes += size
                         while self.bytes > self.budget or len(self.entries) > self.limit:
-                            evicted_key, (_, evicted) = self.entries.popitem(last=False)
+                            evicted_key, (evicted_value, evicted) = self.entries.popitem(last=False)
+                            self._remember_retired(evicted_key, evicted_value)
                             self.touched.pop(evicted_key, None)
                             self.bytes -= evicted
                 pending.set_result(value)
@@ -102,7 +134,7 @@ class PreparedMediaCache:
                 if self.pending.get(key) is pending:
                     self.pending.pop(key, None)
 
-    def trim(self, keep_recent=8, max_age=120):
+    def trim(self, keep_recent=24, max_age=300):
         """任务边界回收旧缓存；仍被执行器持有的对象按Python引用规则继续有效。"""
         with self.lock:
             now = self.clock()
@@ -112,10 +144,12 @@ class PreparedMediaCache:
                     continue
                 if (len(self.entries) > keep_recent or self.bytes > self.budget // 2
                         or now - self.touched.get(key, now) >= max_age):
-                    _, size = self.entries.pop(key)
+                    value, size = self.entries.pop(key)
+                    self._remember_retired(key, value)
                     self.bytes -= size
                     self.touched.pop(key, None)
             if self.large and self.large[0] not in self.pending:
+                self._remember_retired(self.large[0], self.large[1])
                 self.touched.pop(self.large[0], None)
                 self.large = None
             return {"cache_bytes_before": before, "cache_bytes_after": self.bytes}
@@ -124,6 +158,7 @@ class PreparedMediaCache:
         with self.lock:
             self.epoch += 1
             self.entries.clear()
+            self.retired.clear()
             self.pending.clear()
             self.large = None
             self.bytes = 0
@@ -228,14 +263,36 @@ _DURATION = re.compile(rb"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 
 def probe_duration(path):
-    """用 ffmpeg 的输入摘要读时长（秒）；读不出时返回 None。"""
+    """用 ffmpeg 的输入摘要读时长（秒）；读不出时返回 None。
+
+    有界缓存 key 包含文件大小与 mtime_ns，素材被替换后自动换 key 重新探测。
+    """
+    path = Path(path)
+    try:
+        info = path.stat()
+        key = (str(path.resolve()), info.st_size, info.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None:
+        with _DURATION_CACHE_LOCK:
+            cached = _DURATION_CACHE.get(key)
+            if cached is not None:
+                _DURATION_CACHE.move_to_end(key)
+                return cached[0]
     finished = _run(["-v", "info", "-i", str(path)])
     match = _DURATION.search(finished.stderr or b"")
-    if not match:
-        return None
-    hours, minutes, seconds = (float(part) for part in match.groups())
-    duration = hours * 3600 + minutes * 60 + seconds
-    return duration if duration > 0 else None
+    duration = None
+    if match:
+        hours, minutes, seconds = (float(part) for part in match.groups())
+        value = hours * 3600 + minutes * 60 + seconds
+        duration = value if value > 0 else None
+    if key is not None:
+        with _DURATION_CACHE_LOCK:
+            _DURATION_CACHE[key] = (duration,)
+            _DURATION_CACHE.move_to_end(key)
+            while len(_DURATION_CACHE) > _DURATION_CACHE_LIMIT:
+                _DURATION_CACHE.popitem(last=False)
+    return duration
 
 
 def _flags():
@@ -366,6 +423,13 @@ def _retained_frame_count(filename, size, modified, start, duration):
             first = min(stream.frames, max(0, math.ceil(start * rate - 1e-7)))
             last = min(stream.frames, math.ceil((start + duration) * rate - 1e-7)) if duration else stream.frames
             return max(0, last - first)
+        if start > 0:
+            # 先回退到保留区间起点附近再数包；极端容器 seek 失败时保持从头全扫的兜底。
+            try:
+                container.seek(int(start / stream.time_base) + (stream.start_time or 0),
+                               stream=stream, backward=True)
+            except Exception:
+                pass
         for packet in container.demux(stream):
             if packet.pts is None or not packet.size:
                 continue
@@ -391,12 +455,28 @@ def load_video_object(source, *, start_time=0.0, duration=0.0, normalize=True):
         from .storage import ROOT, digest
         stat = path.stat()
         target = ROOT / "media" / "derived" / ("muted_" + digest([str(path), stat.st_size, stat.st_mtime_ns])[:24] + path.suffix)
+        muxer = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mov", ".mkv": "matroska",
+                 ".webm": "webm", ".avi": "avi"}.get(target.suffix.lower())
         with _VIDEO_MUTE_LOCK:
             if not target.is_file():
                 target.parent.mkdir(parents=True, exist_ok=True)
-                result = _run(["-v", "error", "-nostdin", "-n", "-i", str(path), "-map", "0:v:0", "-c:v", "copy", "-an", str(target)])
-                if result.returncode:
-                    raise ValueError("轨道视频静音失败：" + (result.stderr or b"").decode("utf-8", errors="replace")[-500:])
+                # 先写临时文件，成功且非空后再原子替换，避免失败留下半成品被误复用。
+                temporary = target.with_suffix(target.suffix + ".tmp")
+                try:
+                    temporary.unlink(missing_ok=True)
+                    arguments = ["-v", "error", "-nostdin", "-n", "-i", str(path), "-map", "0:v:0",
+                                 "-c:v", "copy", "-an"]
+                    if muxer:
+                        # 临时文件后缀是 .tmp，ffmpeg 无法据此推断封装格式，显式指定。
+                        arguments.extend(["-f", muxer])
+                    arguments.append(str(temporary))
+                    result = _run(arguments)
+                    if result.returncode or not temporary.is_file() or temporary.stat().st_size == 0:
+                        raise ValueError("轨道视频静音失败：" + (result.stderr or b"").decode("utf-8", errors="replace")[-500:])
+                    os.replace(temporary, target)
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    raise
         path = target
     class PreparedVideoFromFile(VideoFromFile):
         def get_components(self):

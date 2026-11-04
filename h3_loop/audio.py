@@ -106,20 +106,50 @@ def read_audio_entry(entry):
     return {"waveform": audio["waveform"][..., start:end].clone(), "sample_rate": audio["sample_rate"]}
 
 
+def _resample_to_timeline(chunk, rate):
+    """把非 48k 片段重采样到时间线采样率。
+
+    长度仍按旧语义取 round(采样数×48000/rate)；scipy 不可用或重采样异常时回退线性插值。
+    """
+    import torch
+    target_size = max(1, round(chunk.shape[-1] * TIMELINE_RATE / rate))
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        factor = gcd(int(TIMELINE_RATE), int(rate))
+        values = resample_poly(chunk.detach().cpu().numpy(), TIMELINE_RATE // factor,
+                               int(rate) // factor, axis=-1)
+        chunk = torch.from_numpy(values.astype("float32", copy=False))
+    except Exception:
+        return torch.nn.functional.interpolate(chunk, size=target_size, mode="linear", align_corners=False)
+    # 重采样滤波器边界可能让长度差 1 个采样点：按旧路径的长度语义裁/补。
+    if chunk.shape[-1] > target_size:
+        chunk = chunk[..., :target_size]
+    elif chunk.shape[-1] < target_size:
+        chunk = torch.nn.functional.pad(chunk, (0, target_size - chunk.shape[-1]))
+    return chunk
+
+
 def _piece_chunk(piece):
     """把一个秒数范围的素材片段解码并统一到时间线采样率。"""
-    audio = load_audio(resolve_entry(piece))
-    wave = audio["waveform"]
-    rate = int(audio["sample_rate"])
-    first = max(0, min(round(float(piece["src_in"]) * rate), wave.shape[-1]))
-    last = max(first, min(round(float(piece["src_out"]) * rate), wave.shape[-1]))
-    chunk = wave[..., first:last]
+    path = resolve_entry(piece)
+    src_in, src_out = float(piece["src_in"]), float(piece["src_out"])
+    try:
+        # 优先只解码保留区间；取不到时回退下面整条解码的旧行为。
+        audio = load_audio_range(path, src_in, src_out)
+        chunk = audio["waveform"]
+        rate = int(audio["sample_rate"])
+    except Exception:
+        audio = load_audio(path)
+        wave = audio["waveform"]
+        rate = int(audio["sample_rate"])
+        first = max(0, min(round(src_in * rate), wave.shape[-1]))
+        last = max(first, min(round(src_out * rate), wave.shape[-1]))
+        chunk = wave[..., first:last]
     if chunk.shape[-1] == 0:
         return None
     if rate != TIMELINE_RATE:
-        import torch
-        size = max(1, round(chunk.shape[-1] * TIMELINE_RATE / rate))
-        chunk = torch.nn.functional.interpolate(chunk, size=size, mode="linear", align_corners=False)
+        chunk = _resample_to_timeline(chunk, rate)
     return chunk
 
 
@@ -243,7 +273,7 @@ def frame_range(entries, index, fps):
     validate_fps(fps)
     entry = entries[index]
     start = entry.get("source_start", sum(e["seconds_float"] for e in entries[:index]))
-    start_frame = round(start * fps)
+    start_frame = math.floor(start * fps + 0.5)
     native_frames = target_frames(entry["seconds_float"])
     h3_frames = generation_frames(native_frames)
     return start_frame, native_frames, h3_frames

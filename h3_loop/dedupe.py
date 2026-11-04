@@ -160,8 +160,12 @@ def relink_to_canonical(source: Path, canonical: Path) -> bool:
         return False
 
 
-def publish(source: Path, target: Path) -> Path:
-    """把 source 的内容发布为 target 文件名；同内容优先复用已有文件的数据块。"""
+def publish(source: Path, target: Path, *, hardlink: bool = True, relink_source: bool = False) -> Path:
+    """把 source 的内容发布为 target 文件名；同内容优先复用已有文件的数据块。
+
+    hardlink=False：目标用独占复制，用户可见目录不与源文件共享 inode；
+    relink_source=True 才把已存在的同内容源文件重链接到 canonical（默认不改动源文件 inode/mtime）。
+    """
     source, target = Path(source), Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
@@ -169,10 +173,13 @@ def publish(source: Path, target: Path) -> Path:
     try:
         hash_value = file_hash(source)
     except OSError:
-        return link_or_copy(source, target)
+        return link_or_copy(source, target) if hardlink else _exclusive_copy(source, target)
     canonical = canonical_for(hash_value)
     if canonical is not None:
-        relink_to_canonical(source, canonical)
+        if relink_source:
+            relink_to_canonical(source, canonical)
+        if not hardlink:
+            return _exclusive_copy(canonical, target)
         try:
             os.link(canonical, target)
             return target
@@ -181,4 +188,4 @@ def publish(source: Path, target: Path) -> Path:
         except OSError:
             return _exclusive_copy(canonical, target)
     remember(hash_value, source)
-    return link_or_copy(source, target)
+    return link_or_copy(source, target) if hardlink else _exclusive_copy(source, target)

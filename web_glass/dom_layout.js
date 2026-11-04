@@ -44,6 +44,7 @@ export function clampNodeWidth(node, minimum = MIN_NODE_WIDTH) {
 }
 
 // 两个预览控件按实际内容占位，不用外层固定高度反过来测内容。
+// 预览节点自动高度的唯一入口：各分类切换/缩略图变化都只通知内容变高，由这里按 >2px 阈值统一收敛。
 export function fitPreviewContent(node, root) {
     root.style.height = "auto";
     root.style.minHeight = "0";
@@ -55,6 +56,8 @@ export function fitPreviewContent(node, root) {
             frame = 0;
             if (!node.graph || !root.isConnected || !root.offsetWidth) return;
             if (document.fullscreenElement && root.contains(document.fullscreenElement)) return;
+            // 旧工作流：保留用户保存的高度，不按内容强制改写（_adH3Configured 由 h3_loop 在 onConfigure 里置位）。
+            if (node._adH3Configured) return;
             markWidthBreakpoint(root);
             clampNodeWidth(node);
             const size = node.computeSize?.();

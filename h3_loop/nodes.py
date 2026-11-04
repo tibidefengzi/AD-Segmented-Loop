@@ -6,12 +6,13 @@ from pathlib import Path
 import math
 
 from . import assets
+from . import compat
 from .audio import h3_window, read_audio_entry, read_pieces
 from .engine import reference_manifest, segment_signatures, template_for
 from .storage import ROOT, STORE, digest
 from .spec import (ASPECT_CHOICES, DEFAULT_ASPECT, DEFAULT_MEGAPIXELS, FPS, MEGAPIXEL_CHOICES,
-                       resolve_canvas, validate_fps)
-from .timeline import (EMPTY_TIMELINE, MAX_AUDIO_PORTS, MAX_IMAGE_PORTS, MAX_VIDEO_PORTS,
+                       generation_frames, resolve_canvas, target_frames, validate_fps)
+from .timeline import (DEFAULT_SEGMENT_MAX_FRAMES, EMPTY_TIMELINE, MAX_AUDIO_PORTS, MAX_IMAGE_PORTS, MAX_VIDEO_PORTS,
                        audio_pieces, clip_span, loop_settings, output_timeline, reference_pack, source_pieces, timeline_identity, timeline_plan)
 from .video import check_alignment, video_identity, video_plan, video_window
 from .continuum import (
@@ -47,10 +48,62 @@ SEGMENT_REF_NAMES = (
 SEGMENT_EXTRA_NAMES = ("mask_frames",)
 SEGMENT_EXTRA_TYPES = ("IMAGE",)
 
+# 潜桥前置预卷：H3 生成帧必须落在 5+17k 网格；T 是最终目标帧数，C 是桥上下文帧数。
+# G = 最小 5+17k >= T+C，E = G-T-C；动作迁移模式把源窗口向前多取 C+E 帧，
+# 生成 G 帧后裁头 C+E，得到精确 T 帧，且保存 latent 的尾部 C 帧正好落在最终末帧。
+RELAY_MODES = ("关闭", "动作迁移预卷", "普通多参考")
+RELAY_CONTEXTS = ["5", "22", "39"]
+RELAY_CHOICES = (
+    "0 · 关闭",
+    "5 · 上下文5帧",
+    "22 · 上下文22帧（推荐）",
+    "39 · 上下文39帧",
+)
+RELAY_CHOICE_VALUES = {"0 · 关闭": 0, "5 · 上下文5帧": 5,
+                       "22 · 上下文22帧（推荐）": 22, "39 · 上下文39帧": 39}
+
+
+def _relay_choice_value(raw):
+    """把新下拉标签或旧版纯数字统一解析为 0/5/22/39。"""
+    if isinstance(raw, (int, float)):
+        return int(raw) if int(raw) in (0, 5, 22, 39) else 0
+    text = str(raw or "").strip()
+    if not text:
+        return 0
+    if text in RELAY_CHOICE_VALUES:
+        return RELAY_CHOICE_VALUES[text]
+    match = re.match(r"^\s*(\d+)", text)
+    if match:
+        value = int(match.group(1))
+        if value in (0, 5, 22, 39):
+            return value
+    return 0
+
 # 参考视频口输出统一等比缩放到“最长边 864”像素（用户 2026-10-29 确认）。
 # H3 内部还会按自己的 adapt_canvas（短边 768 / 面积上限 768×1344 / 32 对齐）再重采样；
 # 这里先缩是为了把解码内存与 frame-cache 从 1080p 级降到 864 级，避免整机被拉爆。
 REF_VIDEO_LONG_EDGE = 864
+
+# 兼容性告警只打印一次，避免每段执行刷屏。
+_WARNED_ONCE = set()
+
+
+def _material_label(source):
+    """素材的可读名称：优先 name，其次 file，最后 id，用于错误提示定位。"""
+    if isinstance(source, dict):
+        for key in ("name", "file"):
+            value = source.get(key)
+            if value:
+                return str(value)
+        if source.get("id"):
+            return str(source["id"])
+    return "未知素材"
+
+
+def _material_error(source, exc):
+    """有素材但读取/解码失败：带上素材名与原始原因，便于用户定位问题文件。"""
+    return ValueError(f"素材读取失败：{_material_label(source)}（{exc}）")
+
 
 class SegmentOutputTypes(tuple):
     """当前段：前 N 口固定类型，其后为动态参考素材口（视频参考口按 H3 要求输出 IMAGE 帧）。"""
@@ -121,8 +174,9 @@ def _round_image(state, index):
         item = priority[index % len(priority)]
         try:
             return assets.load_image_tensor(item)
-        except Exception:
-            return None
+        except Exception as exc:
+            # 有素材但解码失败必须报错，不能静默输出空结果让用户误以为素材缺失。
+            raise _material_error(item, exc) from exc
     if _single_kind_only(state, "image"):
         scopes = {image.get("source"): image.get("segment", -1) for image in (state.get("images") or [])}
         images = [source for source in (state.get("sources") or [])
@@ -140,8 +194,8 @@ def _round_image(state, index):
                 item = images[index % len(images)]
             try:
                 return assets.load_image_tensor(item)
-            except Exception:
-                return None
+            except Exception as exc:
+                raise _material_error(item, exc) from exc
     return _round_image_legacy(state, index)
 
 
@@ -156,19 +210,20 @@ def _round_audio(state, index):
             if wave is None or wave.shape[1] == 0:
                 return None
             return {"waveform": torch.from_numpy(wave).unsqueeze(0), "sample_rate": rate}
-        except Exception:
-            return None
+        except Exception as exc:
+            raise _material_error(item, exc) from exc
     sources = _round_material(state, "audio")
     if not sources:
         return None
+    item = sources[index % len(sources)]
     try:
         import torch
-        wave, rate = _decode_audio(sources[index % len(sources)])
+        wave, rate = _decode_audio(item)
         if wave is None or wave.shape[1] == 0:
             return None
         return {"waveform": torch.from_numpy(wave).unsqueeze(0), "sample_rate": rate}
-    except Exception:
-        return None
+    except Exception as exc:
+        raise _material_error(item, exc) from exc
 
 
 def _segment_video_source(state, index, entry):
@@ -206,8 +261,9 @@ def _stack_image_sources_uncached(sources):
     for source in sources:
         try:
             tensor = assets.load_image_tensor(source)
-        except Exception:
-            continue
+        except Exception as exc:
+            # 多图叠批时任何一张读取失败都直接报错并带上素材名，便于定位坏图。
+            raise _material_error(source, exc) from exc
         if tensor is not None:
             tensors.append(tensor)
     if not tensors:
@@ -451,8 +507,9 @@ def _video_frames_uncached(source, start=0, count=None, start_time=None, end_tim
         if out is None or written == 0:
             return None
         return torch.from_numpy(out[:written])
-    except Exception:
-        return None
+    except Exception as exc:
+        # 有素材但解码失败必须报错（完全取不到帧仍按“范围为空”返回 None）。
+        raise _material_error(source, exc) from exc
 
 
 def _reference_lanes(state, kind):
@@ -476,15 +533,19 @@ def _fit_reference_frames(frames, height, width):
     if int(frames.shape[1]) == int(height) and int(frames.shape[2]) == int(width):
         return frames
     batch, src_h, src_w, _ = frames.shape
-    data = frames[..., :3].movedim(-1, 1)
     scale = min(width / float(src_w), height / float(src_h))
     new_w = max(2, int(round(src_w * scale)))
     new_h = max(2, int(round(src_h * scale)))
-    if (new_h, new_w) != (src_h, src_w):
-        data = torch.nn.functional.interpolate(data, size=(new_h, new_w), mode="bilinear", align_corners=False)
-    canvas = torch.zeros((batch, 3, int(height), int(width)), dtype=data.dtype)
+    canvas = torch.zeros((batch, 3, int(height), int(width)), dtype=frames.dtype)
     top, left = (int(height) - new_h) // 2, (int(width) - new_w) // 2
-    canvas[:, :, top:top + new_h, left:left + new_w] = data
+    # 保留同一插值算法和输出精度；缩放中间量最多约32MiB，而非再分配整批。
+    chunk = max(1, (32 * 1024 * 1024) // max(1, 3 * new_h * new_w * frames.element_size()))
+    for begin in range(0, batch, chunk):
+        end = min(batch, begin + chunk)
+        data = frames[begin:end, ..., :3].movedim(-1, 1)
+        if (new_h, new_w) != (src_h, src_w):
+            data = torch.nn.functional.interpolate(data, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        canvas[begin:end, :, top:top + new_h, left:left + new_w] = data
     return canvas.movedim(1, -1)
 
 
@@ -509,6 +570,222 @@ def _canvas_mask_frames(source, window, width, height):
     elif frames.shape[0] < count:
         frames = torch.cat([frames, frames[-1:].expand(count - frames.shape[0], -1, -1, -1)], dim=0)
     return frames
+
+
+def _relay_mask_frames(segment_source, window, width, height, pre_frames):
+    """潜桥动作迁移模式：遮罩专用帧从源段起点向前多取 pre_frames 帧，长度=生成帧 G。
+
+    这些预卷帧会交给 VAEEncode/编辑遮罩参与采样，最终被 TrimAV 连同桥钉住区一起裁掉；
+    段首没有足够源帧时用首帧补齐（保持首帧，不复制运动）。
+    """
+    if segment_source is None:
+        return None
+    import torch
+    total = max(1, int(window.get("frame_count") or 0))
+    pre = max(0, int(pre_frames))
+    start = float(segment_source.get("src_in") or 0)
+    shifted = start - pre / float(FPS)
+    clamped = max(0.0, -shifted)
+    source = {**segment_source, "src_in": max(0.0, shifted),
+              "src_out": max(0.0, shifted) + total / float(FPS)}
+    video = _round_video(source)
+    if video is None:
+        return None
+    try:
+        images = video.get_components().images
+    except Exception:
+        return None
+    if images is None or not len(images):
+        return None
+    frames = _fit_reference_frames(images[..., :3].float(), int(height), int(width))
+    pad = int(round(clamped * float(FPS)))
+    if pad > 0:
+        frames = torch.cat([frames[:1].expand(pad, -1, -1, -1), frames], dim=0)
+    if frames.shape[0] > total:
+        frames = frames[:total]
+    elif frames.shape[0] < total:
+        frames = torch.cat([frames, frames[-1:].expand(total - frames.shape[0], -1, -1, -1)], dim=0)
+    return frames
+
+
+def _existing_relay_suffix(session_id):
+    try:
+        import folder_paths
+        root = Path(folder_paths.get_output_directory()) / "relay_kit"
+        pattern = "ad_%s_*" % str(session_id)
+        candidates = [p for p in root.glob(pattern) if p.is_dir() and not p.name[:-len(str(session_id)) - 4].endswith("_v")]
+        candidates = [p for p in candidates if "_v" not in p.name]
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        name = candidates[0].name
+        prefix = "ad_%s_" % str(session_id)
+        return name[len(prefix):] if name.startswith(prefix) else ""
+    except Exception:
+        return ""
+
+
+def _ensure_relay_run_id(session_id, session):
+    """稳定潜桥 run 后缀：首次生成后落盘，恢复历史组不再改目录。"""
+    rid = str(session.get("relay_run_id") or "") if isinstance(session, dict) else ""
+    if not rid:
+        rid = _existing_relay_suffix(session_id)
+    if not rid:
+        import uuid
+        rid = uuid.uuid4().hex
+    if isinstance(session, dict):
+        session["relay_run_id"] = rid
+    try:
+        with STORE.lock(session_id):
+            state = STORE._load(session_id)
+            if not state.get("relay_run_id"):
+                state["relay_run_id"] = rid
+                STORE._save(state)
+    except Exception:
+        pass
+    return rid
+
+
+def _relay_run_id(session_id, session):
+    """潜桥片名：会话 + 持久化 stable id；恢复历史组/升级旧会话不变目录。"""
+    rid = str(session.get("relay_run_id") or "") if isinstance(session, dict) else ""
+    if not rid:
+        rid = str(session.get("reset_id") or "") if isinstance(session, dict) else ""
+    if not rid:
+        rid = "g%s" % ((session.get("group_seq") or session.get("round_no") or 1) if isinstance(session, dict) else 1)
+    return "ad_%s_%s" % (str(session_id), rid)
+
+
+def _migrate_legacy_relay_dir(session_id, target_run):
+    """旧版 relay_kit 目录名补到新稳定目录；旧工作流/旧历史组无感续接。"""
+    try:
+        import folder_paths
+        import shutil
+        root = Path(folder_paths.get_output_directory()) / "relay_kit"
+        target = root / str(target_run)
+        if not target.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        if any(target.glob("stage_*.safetensors")):
+            return
+        legacy = [p for p in root.glob("ad_%s_r*_e*" % str(session_id)) if p.is_dir()]
+        if not legacy:
+            return
+        legacy.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for source in legacy:
+            copied = False
+            for file in source.glob("stage_*.safetensors"):
+                dst = target / file.name
+                if not dst.exists():
+                    shutil.copy2(file, dst)
+                    copied = True
+            if copied:
+                break
+    except Exception:
+        return
+
+
+def _relay_stage_file(run_id, stage_index):
+    """稳定 run 目录里某一段的 stage 文件路径（父 latent 的唯一来源）。"""
+    import folder_paths
+    root = Path(folder_paths.get_output_directory()) / "relay_kit"
+    return root / str(run_id) / ("stage_%05d.safetensors" % int(stage_index))
+
+
+def _require_parent_relay_stage(run_id, index, label=""):
+    """潜桥续接第 2 段起必须先有上一段稳定 stage，否则桥接会读到空父 latent。"""
+    previous = int(index) - 1
+    if previous < 0:
+        return
+    path = _relay_stage_file(run_id, previous)
+    if not path.is_file():
+        scope = ("（%s）" % label) if label else ""
+        raise ValueError(
+            "潜桥续接需要上一段（第 %d 段）的 latent%s，但稳定目录里还没有 stage_%05d。"
+            "请先在第 %d 段所在轮次生成/通过该段，或用「运行此段」重跑后再抽卡。"
+            % (int(index), scope, previous, previous))
+
+
+def _relay_identity(session_id, session, index):
+    """返回 (bridge_run_id, save_run_id, stage_index)。
+
+    抽卡/预览子会话：桥读父会话的稳定 stage；存盘写本次生成唯一的 run_id，
+    选中结果时再把该 stage 提升到父会话的稳定 stage。
+    """
+    parent = session.get("preview_parent") if isinstance(session, dict) else None
+    legacy_owner = session_id
+    if parent:
+        parent_id = str(parent.get("session_id") or "")
+        # 历史轮/旧批次回抽：preview_parent 显式携带该轮自己的潜桥链，不能读当前轮链。
+        target_run = str(parent.get("relay_run_id") or "")
+        stage_index = int(parent.get("index", index))
+        legacy_owner = parent_id
+        if not target_run:
+            try:
+                parent_state = STORE.read(parent_id)
+            except Exception:
+                parent_state = {}
+            _ensure_relay_run_id(parent_id, parent_state)
+            target_run = _relay_run_id(parent_id, parent_state)
+    else:
+        _ensure_relay_run_id(session_id, session)
+        target_run = _relay_run_id(session_id, session)
+        stage_index = int(index)
+    token = ""
+    active = session.get("active") if isinstance(session, dict) else None
+    if isinstance(active, dict):
+        token = str(active.get("token") or "")
+    if not token:
+        token = str(index)
+    save_run = "%s_v%s" % (target_run, token[:24])
+    _migrate_legacy_relay_dir(legacy_owner, target_run)
+    return target_run, save_run, stage_index
+
+
+def _relay_targets_for_entries(entries):
+    """全潜桥段统一按总时长向下取整到 17 网格，再尽量均匀分配。
+
+    逐段独立 floor 会让 65 帧段只剩 51 帧，并让总帧数低于 total//17*17。
+    这里先固定总单位 = sum(T_i)//17，再按各段小数余数从大到小补 17 帧，
+    保证所有段输出都是 17n 且总输出 = floor(源总帧/17)*17。
+    """
+    sizes = []
+    for entry in entries or []:
+        try:
+            sizes.append(max(0, int(target_frames(float(entry.get("seconds_float") or 0)))))
+        except Exception:
+            sizes.append(0)
+    total_units = sum(sizes) // 17
+    units = [size // 17 for size in sizes]
+    remainder = total_units - sum(units)
+    if remainder > 0 and sizes:
+        order = sorted(range(len(sizes)), key=lambda i: (sizes[i] % 17, sizes[i]), reverse=True)
+        for key in order:
+            if remainder <= 0:
+                break
+            units[key] += 1
+            remainder -= 1
+    return [17 * u for u in units]
+
+
+def relay_plan(target, context, mode=None):
+    """潜桥 17 网格计划：输出 L 必须是 17 的倍数，G=L+C 自动是 5+17k。
+
+    这时 E=0，裁头只裁 C；源/参考视频窗口是否预卷由调用方按是否有视频帧决定。
+    """
+    target = int(target)
+    context = int(context)
+    if target < 1:
+        raise ValueError("目标帧数必须为正")
+    if context < 1:
+        raise ValueError("潜桥上下文帧数必须为正")
+    if target % 17:
+        raise ValueError("潜桥输出段长必须是 17 的倍数")
+    generated = target + context
+    if generated < 5 or (generated - 5) % 17:
+        raise ValueError("H3 生成长度必须落在 5+17k")
+    return {"target_frames": target, "context_frames": context,
+            "generation_frames": generated, "residue_frames": 0,
+            "trim_frames": context, "pre_roll_frames": context}
 
 
 def _reference_video_window_frames(lane, source_map, start, end):
@@ -538,7 +815,16 @@ def _reference_video_window_frames(lane, source_map, start, end):
     if len(pieces) == 1:
         return pieces[0]
     height, width = int(pieces[0].shape[1]), int(pieces[0].shape[2])
-    return torch.cat([_fit_reference_frames(item, height, width) for item in pieces], dim=0)
+    # 直接写入拼接结果，避免同时保留各片段的整批缩放副本再cat。
+    result = torch.empty((sum(len(item) for item in pieces), height, width, 3), dtype=pieces[0].dtype)
+    chunk = max(1, (32 * 1024 * 1024) // max(1, height * width * 3 * result.element_size()))
+    offset = 0
+    for item in pieces:
+        for begin in range(0, len(item), chunk):
+            part = _fit_reference_frames(item[begin:begin + chunk], height, width)
+            result[offset:offset + len(part)] = part
+            offset += len(part)
+    return result
 def _full_lane_audio_pieces(lane, source_map):
     """整条音频复用：按时间线顺序拼接该轨道所有片段，不受当前段起止范围裁剪。"""
     pieces = []
@@ -690,6 +976,29 @@ def _timeline_material_values(queue, used=None, index=None, window=None):
 
 # 清单库只暴露分段清单；参考口改由当前段动态挂载。
 
+
+def _config_dict(raw):
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(raw or "{}")
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _merged_queue_config(queue_state, h3_editor_state):
+    """主清单与编辑器状态的合并规则：与 build 完全一致，IS_CHANGED 复用同一份结果。"""
+    main_cfg = _config_dict(queue_state)
+    editor_cfg = _config_dict(h3_editor_state)
+    # 编辑器实际状态可能保存在 h3_editor_state；空清单时用它，且补齐缺失的单段上限
+    if not main_cfg.get("version") and editor_cfg.get("version"):
+        main_cfg = editor_cfg
+    elif editor_cfg.get("max_frames") is not None and main_cfg.get("max_frames") is None:
+        main_cfg = dict(main_cfg, max_frames=editor_cfg["max_frames"])
+    return main_cfg
+
+
 class AidenH3AudioQueue:
     @classmethod
     def INPUT_TYPES(cls):
@@ -708,25 +1017,16 @@ class AidenH3AudioQueue:
 
     @classmethod
     def IS_CHANGED(cls, queue_state, h3_editor_state="{}", prompt=None, unique_id=None):
-        return timeline_identity(queue_state)
+        # build 会在主清单为空时改用 h3_editor_state、并补齐缺失的单段上限；
+        # 缓存键必须用同一份合并配置，否则只改编辑器状态/上限时不会重新执行。
+        # timeline_identity 不包含 max_frames（它只描述素材时间线），这里单独并入。
+        merged = _merged_queue_config(queue_state, h3_editor_state)
+        raw = json.dumps(merged, ensure_ascii=False)
+        return digest([timeline_identity(raw), merged.get("max_frames")])
 
     def build(self, queue_state, h3_editor_state="{}", prompt=None, unique_id=None):
         import json as _json
-        def _as_dict(raw):
-            if isinstance(raw, dict):
-                return raw
-            try:
-                data = _json.loads(raw or "{}")
-                return data if isinstance(data, dict) else {}
-            except (TypeError, ValueError):
-                return {}
-        main_cfg = _as_dict(queue_state)
-        editor_cfg = _as_dict(h3_editor_state)
-        # 编辑器实际状态可能保存在 h3_editor_state；空清单时用它，且补齐缺失的单段上限
-        if not main_cfg.get("version") and editor_cfg.get("version"):
-            main_cfg = editor_cfg
-        elif editor_cfg.get("max_frames") is not None and main_cfg.get("max_frames") is None:
-            main_cfg = dict(main_cfg, max_frames=editor_cfg["max_frames"])
+        main_cfg = _merged_queue_config(queue_state, h3_editor_state)
         raw = _json.dumps(main_cfg, ensure_ascii=False)
         assets.PREPARED_MEDIA.bind(str(unique_id or "material-queue"), timeline_identity(raw))
         plan = timeline_plan(raw)  # old queue formats auto-migrate to timeline
@@ -914,6 +1214,7 @@ class AidenH3Segment:
     def INPUT_TYPES(cls):
         return {"required": {},
                 "optional": {"queue": ("H3_AUDIO_QUEUE",),
+                             "潜桥续接": (list(RELAY_CHOICES), {"default": "0 · 关闭", "tooltip": "0=关闭潜桥；5/22/39=开启潜桥，C为上下文帧数。开启后每段输出=17的倍数，H3生成=输出+C，裁头=C"}),
                              "aspect_ratio": (list(ASPECT_CHOICES), {"default": DEFAULT_ASPECT}),
                              "megapixels": ("FLOAT", {"default": 0.5, "min": 0.05, "max": 64.0, "step": 0.1, "tooltip": "百万像素，自由填写"}),
                              "multiple": ("INT", {"default": 32, "min": 1, "max": 64, "tooltip": "倍数（宽高按此倍数对齐）"}),
@@ -921,7 +1222,9 @@ class AidenH3Segment:
                              "统一提示词前缀": ("STRING", {"multiline": True, "default": ""}),
                              "反向提示词": ("STRING", {"multiline": True, "default": ""}),
                              "段索引": ("INT", {"default": -1, "min": -1, "max": 9999, "tooltip": "独立模式下的起始段索引；-1 表示 0，由分段循环自动设置"}),
-                             "ref_counts": ("STRING", {"default": "{}", "tooltip": "动态参考口数量（前端自动写入）"})},
+                             "ref_counts": ("STRING", {"default": "{}", "tooltip": "动态参考口数量（前端自动写入）"}),
+                             "潜桥模式": (list(RELAY_MODES), {"default": "关闭", "tooltip": "关闭=原有逐段生成；普通多参考=自选17倍数段长做潜桥；动作迁移预卷=源视频动作迁移/人物替换，前置预卷后裁头，保持65帧等任意目标帧数"}),
+                             "潜桥上下文帧数": (list(RELAY_CONTEXTS), {"default": "22", "tooltip": "旧参数：兼容旧工作流，前端会自动迁移"})},
                 "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
     RETURN_TYPES = SegmentOutputTypes(SEGMENT_FIXED_TYPES + tuple(
@@ -1028,9 +1331,13 @@ class AidenH3Segment:
                 if not owned.get('workflow_task_id'):owned['workflow_task_id']=task_id;STORE._save(owned)
         run_token = STORE.ensure_run_token(session_id, kwargs.get("run_token", ""))
         session = STORE.begin(session_id, run_token)
-        from comfy_execution.utils import get_executing_context
-        executing = get_executing_context()
-        if executing and not session["active"].get("prompt_id"):
+        executing = compat.executing_context()
+        if executing is None:
+            # ComfyUI 私有执行上下文接口缺失（版本差异）：跳过进度监听，不影响本次生成。
+            if "executing_context" not in _WARNED_ONCE:
+                _WARNED_ONCE.add("executing_context")
+                print("AidenH3: 未找到 ComfyUI 执行上下文接口，已跳过进度监听（不影响本次生成）")
+        elif not session["active"].get("prompt_id"):
             import asyncio
             from server import PromptServer
             from .engine import watch_prompt
@@ -1041,8 +1348,8 @@ class AidenH3Segment:
             asyncio.run_coroutine_threadsafe(watch_prompt(session_id, run_token, executing.prompt_id), PromptServer.instance.loop)
         index = int(session["active"]["index"])
         entry = entries[index]
-        # 未显式设置单段上限时不设 362 硬限制（用户可在素材库显式设置）
-        settings["max_frames"] = int(state.get("max_frames") or 3600)
+        # 未显式设置单段上限时按统一默认 362 计算窗口（与时间线/前端默认一致）。
+        settings["max_frames"] = int(state.get("max_frames") or DEFAULT_SEGMENT_MAX_FRAMES)
         batch_source = entry.get("batch_source")
         if batch_source:
             metadata = entry.get("batch_metadata") or {}
@@ -1053,6 +1360,40 @@ class AidenH3Segment:
                       "overlap_frames": 0, "history_frames": 0, "reanchor": False}
         else:
             window = h3_window(entries, index, **settings)
+        # ---- 潜桥续接：单下拉 0/5/22/39。0=关闭；>0=开启，输出 L=17n，G=L+C，裁头=C。 ----
+        relay_raw = kwargs.get("潜桥续接")
+        relay_context = _relay_choice_value(relay_raw)
+        relay_active = bool(relay_context > 0 and not batch_source)
+        relay_pre_roll = 0
+        relay_trim_frames = 0
+        relay_run_id = ""
+        relay_save_run_id = ""
+        relay_stage_index = int(index)
+        if relay_active:
+            source_target = int(window["target_frames"])
+            relay_target = _relay_targets_for_entries(entries)[index]
+            if relay_target < 17:
+                raise ValueError("潜桥开启时每段至少需要 17 帧目标长度")
+            if relay_target <= relay_context:
+                raise ValueError(f"潜桥上下文 C={relay_context} 必须小于本段输出帧数 {relay_target}")
+            plan = relay_plan(relay_target, relay_context)
+            # 潜桥输出 L 与上下文 C 都确定后，必须按最终生成帧数 G=L+C 重新核对单段上限，
+            # 不能只沿用 h3_window 里按 L 算的旧上限（否则 G 会静默超限）。
+            limit_frames = int(settings.get("max_frames") or DEFAULT_SEGMENT_MAX_FRAMES)
+            need_frames = int(plan["generation_frames"])
+            if need_frames > limit_frames:
+                raise ValueError(
+                    f"潜桥开启后本段需要生成 {need_frames} 帧（输出 {relay_target} 帧 + 上下文 C={relay_context} 帧），"
+                    f"超过单段上限 {limit_frames} 帧；请缩短本段、降低上下文 C，或提高单段上限后再运行。")
+            window["target_frames"] = relay_target
+            window["frame_count"] = plan["generation_frames"]
+            relay_trim_frames = plan["trim_frames"]
+            relay_pre_roll = plan["pre_roll_frames"]
+            relay_run_id, relay_save_run_id, relay_stage_index = _relay_identity(session_id, session, index)
+            # 上一段的稳定 stage 是桥接的唯一父 latent 来源；缺失说明存盘/提升还没完成，
+            # 必须显式报错，不能带着空父 latent 静默生成（预览子会话用父段号校验）。
+            relay_label = str((session.get("preview_parent") or {}).get("group_label") or "")
+            _require_parent_relay_stage(relay_run_id, relay_stage_index, relay_label)
         used = None
         if isinstance(prompt, dict) and unique_id is not None:
             slots = set()
@@ -1096,7 +1437,15 @@ class AidenH3Segment:
                    "timeline_references": queue.get("references") or None,
                    "video_segment": None if timeline_video is None else timeline_video.get("name"),
                    "video_segment_file": None if timeline_video is None else timeline_video["file"],
-                   "prompt_text": state_prompt, **window}
+                   "prompt_text": state_prompt,
+                   "relay_run_id": relay_run_id,
+                   "relay_save_run_id": relay_save_run_id,
+                   "relay_stage_index": relay_stage_index,
+                   # 裁头必须从 context 拿到 C，否则内部裁头会静默按 0 帧处理。
+                   "relay_trim_frames": int(relay_trim_frames),
+                   "relay_context_frames": int(relay_context),
+                   "relay_pre_roll_frames": int(relay_pre_roll),
+                   **window}
         source_video = _source_video(entry["source_video"], state) if (need(12) and entry.get("source_video")) else None
         original_audio = _original_audio(entry, state, index) if need(13) and not batch_source else None
         round_image = _round_image(state, index) if need(9) and not batch_source else None
@@ -1163,7 +1512,10 @@ class AidenH3Segment:
         out_refs.extend(refs[offset:])
         extra_frames = None
         if need(extra_slot) and segment_source is not None and not batch_source:
-            extra_frames = _canvas_mask_frames(segment_source, window, width, height)
+            if relay_active:
+                extra_frames = _relay_mask_frames(segment_source, window, width, height, relay_pre_roll)
+            else:
+                extra_frames = _canvas_mask_frames(segment_source, window, width, height)
         return fixed + tuple(out_refs) + (extra_frames,)
 
 
@@ -1271,48 +1623,6 @@ class AidenH3PickReferences:
         return *(images.get(f"image{i}") for i in range(1, 5)), entry.get("mode", "none")
 
 
-class AidenH3PreviousFrames:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"context": ("H3_LOOP_CONTEXT",),
-                             "frames": ("INT", {"default": 5, "min": 1, "max": 257, "tooltip": "取前段末尾多少帧；可与当前段重叠帧数不同"})}}
-
-    RETURN_TYPES = ("IMAGE","IMAGE","BOOLEAN")
-    RETURN_NAMES = ("previous_tail","best_handoff","has_history")
-    FUNCTION = "load"
-    CATEGORY = CATEGORY
-    DESCRIPTION = "前段保真尾帧接外部 H3 历史引导；首段和重锚定段使用原始参考。历史画面帧数由本节点独立设置，不必等于当前段重叠帧数。"
-
-    def load(self, context, frames):
-        import numpy as np
-        import torch
-        state = STORE.read(context["session_id"])
-        if context["index"]==0 or context.get("reanchor"):
-            return None,None,False
-        from .storage import contained
-        row=state["segments"][context["index"]-1]
-        selected=row.get("selected")
-        version=next((v for v in (row.get("versions") or []) if selected and v.get("id")==selected),None)
-        if version is None:
-            if state.get("preview_hold") or state.get("preview_parent"):
-                return None,None,False
-            raise ValueError(f"第 {context['index']} 段没有可用的选中版本，无法读取前段尾帧，请先生成前段")
-        if not version.get("tail_file"):raise ValueError("前段缺少保真尾帧，请用当前版本重做前段")
-        history_session = context.get("preview_parent_session") or context["session_id"]
-        data=np.load(contained(STORE.directory(history_session),version["tail_file"]),allow_pickle=False)
-        # 本节点 frames 独立控制取多少尾帧；不再强制等于 Segment.overlap_frames。
-        count = int(frames)
-        if count < 1:
-            raise ValueError("历史画面帧数至少为 1")
-        overlap = int(context.get("overlap_frames") or 0)
-        if overlap and count != overlap:
-            print(f"AidenH3PreviousFrames: frames={count} 与当前段 overlap_frames={overlap} 不一致；按本节点 frames 取尾帧")
-        if len(data) < count:
-            raise ValueError(f"保存的保真历史帧不足：需要 {count} 帧，实际 {len(data)} 帧。请减少 frames 或重新生成前段（Commit 会按 history_frames 保存尾帧）")
-        chosen=version.get("handoff",{}).get("index",len(data)-1)
-        return torch.from_numpy(data[-count:].copy()).float(),torch.from_numpy(data[chosen:chosen+1].copy()).float(),True
-
-
 class AidenH3Commit:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1350,8 +1660,8 @@ class AidenH3Commit:
             raise
         from server import PromptServer
         PromptServer.instance.send_sync("aiden-h3/progress", {"session_id": session_id, "status": state["status"]})
-        from comfy_api.latest._input_impl import VideoFromFile
-        saved = VideoFromFile(str(path))
+        # ComfyUI 私有视频接口集中在 compat 适配层，版本升级只需改一处。
+        saved = compat.video_from_file(path)
         saved._ad_h3_preview_record = {"origin": "session", "file": f"{session_id}/{name}"}
         return {"ui": {"h3_session": [session_id]}, "result": (saved,)}
 
@@ -1458,6 +1768,9 @@ class AidenH3VideoPreview:
                 name = f"segment_{loop_context['index'] + 1:04d}_{uuid.uuid4().hex[:8]}.mp4"
                 normalized.save_to(str(session_dir / name))
                 details.update(media_kind="video", prompt_text=loop_context.get("prompt_text", ""))
+                for _key in ("relay_run_id", "relay_save_run_id", "relay_stage_index"):
+                    if loop_context.get(_key) not in (None, ""):
+                        details[_key] = loop_context.get(_key)
                 STORE.register_result(session_id, name, details, context=loop_context)
                 record = {"origin": "session", "file": f"{session_id}/{name}", "kind": "video"}
             else:
@@ -1547,7 +1860,8 @@ class AidenH3VideoPreview:
                                                 prompt_text=(loop_context or {}).get("prompt_text", ""))
                 else:
                     target = target_dir / source.name
-                    dedupe.publish(source, target)
+                    # 用户可见归档独占复制，不与会话内部结果共享 inode，避免外部剪辑软件原地改写相互影响。
+                    dedupe.publish(source, target, hardlink=False)
                 record["archive"] = str(target)
                 record["auto_saved"] = str(target)  # 兼容已有前端结果字段。
                 if loop_context and record["kind"] != "video":
@@ -1880,9 +2194,20 @@ class AidenH3RoundBlocked:
 
 from .final_output import FinalSave, SelectedResult
 
+# 最小内嵌潜桥（B 最小 vendor）：只使用上游 MIT 许可的桥接/存盘/裁头三块运行时，
+# 其余上游节点不注册、不暴露。上游许可证见 h3_loop/_relay_vendor/LICENSE-MIT.txt。
+try:
+    from ._relay_vendor import nodes as _relay_vendor_runtime
+except Exception as _relay_vendor_error:  # pragma: no cover - 依赖/宿主兼容问题时给出明确提示
+    _relay_vendor_runtime = None
+    _RELAY_VENDOR_IMPORT_ERROR = str(_relay_vendor_error)
+else:
+    _RELAY_VENDOR_IMPORT_ERROR = ""
+
 NODE_CLASS_MAPPINGS = {
     "AD_FinalSave": FinalSave,
     "AD_FinalSelectedMedia": SelectedResult,
+    "AidenH3EditMask": AidenH3EditMask,
     "AidenH3AudioQueue": AidenH3AudioQueue,
     "AidenH3Segment": AidenH3Segment,
     "AidenH3VideoPreview": AidenH3VideoPreview,
@@ -1891,10 +2216,157 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AD_FinalSave": "AD-最终保存",
     "AD_FinalSelectedMedia": "AD-已选成果读取（内部）",
+    "AidenH3EditMask": "AD-角色替换遮罩适配",
     "AidenH3AudioQueue": "AD-素材准备",
     "AidenH3Segment": "AD-分段生成",
     "AidenH3VideoPreview": "AD-分段预览",
     "AD_RoundBlocked": "AD-本轮排队保护（内部）",
 }
 
+class ADH3InternalBridge:
+    """内部桥：从 AD 分段节点的 context 输出读取 run_id/stage，不接受用户接线。"""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT",),
+            "relay_context": ("H3_LOOP_CONTEXT",),
+            "context_frames": ("INT", {"default": 22, "min": 5, "max": 124, "step": 17}),
+        }, "optional": {
+            "mask_mode": (["hard", "taper", "ramp", "blend", "window"], {"default": "hard"}),
+            "pin_audio": ("BOOLEAN", {"default": True}),
+        }}
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = False
+
+    def run(self, latent, relay_context, context_frames=22, mask_mode="hard", pin_audio=True):
+        ctx = relay_context if isinstance(relay_context, dict) else {}
+        run_id = str(ctx.get("relay_run_id") or "ad_relay")
+        stage = int(ctx.get("relay_stage_index") or 0)
+        upstream = _relay_vendor_runtime.H3RelayCopyBridge()
+        result = upstream.bridge(latent, context_frames=int(context_frames), mask_mode=str(mask_mode or "hard"),
+                                 pin_audio=bool(pin_audio), run_id=run_id, stage_index=stage)
+        return (result[0],)
+
+
+class ADH3InternalSave:
+    """内部存盘：run_id 使用每次生成的唯一 relay_save_run_id，选中后再提升。"""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT",),
+            "relay_context": ("H3_LOOP_CONTEXT",),
+        }, "optional": {"note": ("STRING", {"default": "AD hidden relay"})}}
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = True
+
+    def run(self, latent, relay_context, note="AD hidden relay"):
+        ctx = relay_context if isinstance(relay_context, dict) else {}
+        upstream = _relay_vendor_runtime.H3RelayLatentSave()
+        upstream.save(latent, str(ctx.get("relay_save_run_id") or "ad_relay_save"),
+                      int(ctx.get("relay_stage_index") or 0), note=note)
+        # 存盘与结果登记可能谁先谁后：存盘完成后再查一次，若本版本已被选中/批准就立即提升，
+        # 不再依赖“登记时刻源文件已存在”这一顺序假设。
+        try:
+            parent_session = str(ctx.get("preview_parent_session") or "")
+            if not parent_session:
+                from .storage import STORE as _STORE
+                _STORE.promote_relay_stage_for_save(
+                    str(ctx.get("session_id") or ""),
+                    str(ctx.get("relay_save_run_id") or ""),
+                    int(ctx.get("relay_stage_index") or 0))
+        except Exception as exc:  # 提升失败不影响本段生成，但必须可见
+            print("[AD-潜桥] 存盘后提升检查失败（不影响本段生成）：%r" % (exc,))
+        return (latent,)
+
+
+class ADH3InternalTrim:
+    """内部裁头：trim_frames 从 context 读取，不再暴露独立输出口。"""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "relay_context": ("H3_LOOP_CONTEXT",),
+        }, "optional": {
+            "audio": ("AUDIO",),
+            "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001}),
+        }}
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = False
+
+    def run(self, images, relay_context, audio=None, fps=24.0):
+        import contextlib
+        import io
+
+        ctx = relay_context if isinstance(relay_context, dict) else {}
+        if ctx.get("relay_run_id") and "relay_trim_frames" not in ctx:
+            # 兼容防线：旧前端/旧序列化没有携带裁头帧数时不能静默按 0 帧处理。
+            raise ValueError(
+                "潜桥裁头缺少 relay_trim_frames：本次提交与后台版本不匹配。"
+                "请保存工作流后重新点「开始」；若仍出现，请重启 ComfyUI 并刷新网页后重试。")
+        frames = int(ctx.get("relay_trim_frames") or 0)
+        upstream = _relay_vendor_runtime.H3RelayTrimAV()
+        before_images = int(images.shape[0])
+        before_audio = (int(audio["waveform"].shape[-1])
+                        if isinstance(audio, dict) and audio.get("waveform") is not None else None)
+        # 上游裁头会打印含 emoji/制表符的报告，在重定向 stdout（日志采集/服务化启动）时会抛
+        # UnicodeEncodeError；这里捕获其输出，只回一行中文摘要，同时关闭无用的 PCM 边车。
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            result = upstream.trim(images, trim_frames=frames, fps=float(fps),
+                                   audio=audio, settle_frames=0, save_pcm=False)
+        if isinstance(result, dict):
+            result = result.get("result")
+        trimmed_images, trimmed_audio = result[0], result[1]
+        after_images = int(trimmed_images.shape[0])
+        after_audio = (int(trimmed_audio["waveform"].shape[-1])
+                       if isinstance(trimmed_audio, dict) and trimmed_audio.get("waveform") is not None else None)
+        line = "[AD-潜桥] 裁头 %d 帧：画面 %d → %d 帧" % (frames, before_images, after_images)
+        if before_audio is not None and after_audio is not None:
+            line += "；音频 %d → %d 采样点" % (before_audio, after_audio)
+        print(line)
+        return (trimmed_images, trimmed_audio)
+
+
+# ---- 内嵌潜桥的运行节点（完全隐藏：只由前端提交时注入，不进入画布/菜单） ----
+_INTERNAL_RELAY_KEYS = {
+    "ADH3InternalBridge": "bridge",
+    "ADH3InternalSave": "save",
+    "ADH3InternalTrim": "trim",
+}
+if _relay_vendor_runtime is not None:
+    for _key, _kind in _INTERNAL_RELAY_KEYS.items():
+        if _kind == "bridge":
+            NODE_CLASS_MAPPINGS[_key] = ADH3InternalBridge
+            NODE_DISPLAY_NAME_MAPPINGS[_key] = "AD-内部潜桥桥接"
+        elif _kind == "save":
+            NODE_CLASS_MAPPINGS[_key] = ADH3InternalSave
+            NODE_DISPLAY_NAME_MAPPINGS[_key] = "AD-内部潜桥存盘"
+        elif _kind == "trim":
+            NODE_CLASS_MAPPINGS[_key] = ADH3InternalTrim
+            NODE_DISPLAY_NAME_MAPPINGS[_key] = "AD-内部潜桥裁头"
+
+    # 旧工作流无感加载：外部插件未安装时，注册上游三个旧类型为兼容层。
+    # 外部插件已安装时跳过，避免同名类型重复注册。
+    try:
+        _custom_nodes_root = Path(__file__).resolve().parents[2]
+        _external_relay = ((_custom_nodes_root / "ComfyUI-H3-Latent-Relay").is_dir()
+                           or (_custom_nodes_root / "h3-relay").is_dir())
+    except Exception:
+        _external_relay = False
+    if not _external_relay:
+        NODE_CLASS_MAPPINGS.setdefault("H3RelayApplyEditMask", AidenH3EditMask)
+        NODE_DISPLAY_NAME_MAPPINGS.setdefault("H3RelayApplyEditMask", "AD-角色替换遮罩适配（兼容）")
+        NODE_CLASS_MAPPINGS.setdefault("H3RelayCopyBridge", _relay_vendor_runtime.H3RelayCopyBridge)
+        NODE_CLASS_MAPPINGS.setdefault("H3RelayLatentSave", _relay_vendor_runtime.H3RelayLatentSave)
+        NODE_CLASS_MAPPINGS.setdefault("H3RelayTrimAV", _relay_vendor_runtime.H3RelayTrimAV)
+        NODE_DISPLAY_NAME_MAPPINGS.setdefault("H3RelayCopyBridge", "H3 Relay · Copy Bridge（兼容）")
+        NODE_DISPLAY_NAME_MAPPINGS.setdefault("H3RelayLatentSave", "H3 Relay · Latent Save（兼容）")
+        NODE_DISPLAY_NAME_MAPPINGS.setdefault("H3RelayTrimAV", "H3 Relay · Trim AV（兼容）")
 

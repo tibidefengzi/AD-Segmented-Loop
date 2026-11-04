@@ -1,5 +1,5 @@
 // 只处理提交副本；编辑器始终展示用户最新内容，不回写旧参数或旧连线。
-import {currentTaskId} from "./workflow_task.js?v=20261102-group-v64";
+import {currentTaskId} from "./workflow_task.js";
 export function installRoundQueue(api, app) {
     if (api._adRoundQueueInstalled) return;
     api._adRoundQueueInstalled = true;

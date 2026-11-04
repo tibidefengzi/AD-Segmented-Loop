@@ -17,3 +17,9 @@ AD-Segmented-Loop 0.4.64 第三方依赖说明
 三、再分发
 本包提供插件完整运行源代码；修改及再分发请保留 GPL-3.0-only 许可、LICENSE
 与相应第三方声明。不能将“不复制第三方源码文件”等同于免除相应许可义务。
+
+四、内嵌第三方运行时（MIT）
+- ComfyUI-H3-Latent-Relay 0.6.39（ZenHG，MIT，commit 054936a5313fe94902e2d7fd672754691beff320）。
+- 本插件仅内嵌运行所需的桥接/潜桥存盘/裁头最小运行时，位于 h3_loop/_relay_vendor/；
+  上游完整 MIT 许可证与第三方通知随附在该目录，根目录 THIRD_PARTY_LICENSES.md 汇总说明。
+- 本插件自身仍为 GPL-3.0-only；内嵌 MIT 代码保留原版权与许可声明，不改变其许可。

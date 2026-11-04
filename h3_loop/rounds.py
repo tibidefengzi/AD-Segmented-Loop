@@ -4,12 +4,211 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import uuid
 import hashlib
 from pathlib import Path
 
 from .storage import STORE, atomic_json, contained, identifier
+
+
+def _relay_choice(graph, node_id):
+    raw = ((graph or {}).get(str(node_id)) or {}).get("inputs", {}).get("潜桥续接")
+    match = re.match(r"^(\d+)", str(raw or "").strip())
+    value = int(match.group(1)) if match else 0
+    return value if value in (0, 5, 22, 39) else 0
+
+
+def _stable_run(sid, relay_id):
+    return "ad_%s_%s" % (str(sid), str(relay_id or ""))
+
+
+def _stage_path(run_id, stage):
+    import folder_paths
+    return (Path(folder_paths.get_output_directory()) / "relay_kit" / str(run_id)
+            / ("stage_%05d.safetensors" % int(stage)))
+
+
+def _copy_stage(source_run, stage_index, target_run):
+    source = _stage_path(source_run, stage_index)
+    if not source.is_file():
+        return False
+    target = _stage_path(target_run, stage_index)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".ad_tmp")
+    shutil.copy2(source, temporary)
+    os.replace(temporary, target)
+    return True
+
+
+def _anchor_signature(entry):
+    """回抽锚点：只取分段结构/源范围等“这段画面是谁”的字段，参考与提示词不参与。"""
+    entry = entry or {}
+    video = entry.get("video_source") or {}
+    source = entry.get("source_video") or {}
+
+    def number(value):
+        try:
+            return round(float(value), 6)
+        except (TypeError, ValueError):
+            return value
+
+    images = entry.get("images") or []
+    try:
+        image_key = hashlib.sha256(
+            json.dumps(images, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        image_key = str(images)
+    return {"video": (video.get("origin"), video.get("file"),
+                      number(video.get("src_in")), number(video.get("src_out"))),
+            "source_video": (source.get("id"), source.get("kind"), source.get("file")),
+            "source_start": number(entry.get("source_start")),
+            "seconds": number(entry.get("seconds_float")),
+            "images": image_key}
+
+
+def _validate_old_round_plan(origin_segments, child_segments, trial_round):
+    hint = ("当前时间线/分段与第 %d 轮不一致，无法按该轮回抽；"
+            "请先恢复第 %d 轮再抽卡，或撤销分段改动。"
+            % (int(trial_round), int(trial_round)))
+    if len(origin_segments or []) != len(child_segments or []):
+        raise ValueError(hint)
+    for index, (old, new) in enumerate(zip(origin_segments, child_segments)):
+        if _anchor_signature(old.get("entry")) != _anchor_signature(new.get("entry")):
+            raise ValueError("（第 %d 段）%s" % (index + 1, hint))
+
+
+def _version_from_preview(segments, preview):
+    if not isinstance(preview, dict) or not preview.get("file"):
+        return None
+    name = str(preview.get("file") or "").replace("\\", "/")
+    scope = ""
+    session_id = preview.get("session_id")
+    if preview.get("origin") == "session":
+        scope, separator, name = name.partition("/")
+        if not separator:
+            return None
+    child = scope if scope.startswith("trial_") else (
+        session_id if str(session_id or "").startswith("trial_") else "")
+    for row in segments or []:
+        for version in row.get("versions") or []:
+            file = str(version.get("file") or "").replace("\\", "/")
+            normal = file == name or file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1])
+            trial = (bool(child) and version.get("preview_only") and version.get("trial_request")
+                     and file == "trial_" + str(version.get("trial_request")) + "_" + name)
+            if normal or trial:
+                return version
+    return None
+
+
+def _pick_parent_version(origin_segments, target, target_version):
+    """旧轮父 latent 的来源：优先该轮选用版本，其次只在“目标生成之前存在”的版本里取。
+
+    不能兜底选“最新版本”：目标版本可能是旧记录，之后才生成的版本不可能是它的父 latent，
+    选错会导致回抽取到未来版本的父 latent，接缝/连续性错位。
+    """
+    row = origin_segments[int(target) - 1]
+    candidates = [version for version in row.get("versions") or []
+                  if version.get("relay_save_run_id") and version.get("relay_stage_index") is not None]
+    if not candidates:
+        return None
+    selected = row.get("selected")
+    if selected:
+        for version in candidates:
+            if version.get("id") == selected:
+                return version
+
+    def created(version):
+        try:
+            return float(version.get("created_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    timed = [version for version in candidates if created(version) > 0]
+    try:
+        anchor = float(target_version.get("created_at") or 0)
+    except (TypeError, ValueError):
+        anchor = 0.0
+    if anchor > 0:
+        before = [version for version in timed if created(version) <= anchor]
+        if not before:
+            return None
+        candidates = before
+    elif len(candidates) != 1:
+        # 没有时间锚点且候选不唯一：无法确定当时用的是哪一版，交给上层明确报错。
+        return None
+    return max(candidates, key=created)
+
+
+def _recover_old_round_chain(sid, parent, origin_state, target, trial_round, target_version):
+    """为旧轮准备独立潜桥链：旧数据共用链/缺父 stage 时，从唯一存盘目录恢复父 latent。"""
+    from . import group_history
+    origin_segments = origin_state.get("segments") or []
+    relay_id = str(origin_state.get("relay_run_id") or "")
+    chain = _stable_run(sid, relay_id) if relay_id else ""
+    # 历史轮与当前轮共用旧目录时必须恢复：只查历史快照会漏掉“历史链 == 当前链”。
+    shared = bool(relay_id) and (
+        relay_id == str(parent.get("relay_run_id") or "")
+        or relay_id in group_history.shared_relay_run_ids(STORE, parent))
+    needs_recover = (not relay_id) or shared
+    if not needs_recover and target > 0 and not _stage_path(chain, target - 1).is_file():
+        needs_recover = True
+    if not needs_recover:
+        return chain
+    new_relay = uuid.uuid4().hex
+    new_chain = _stable_run(sid, new_relay)
+    if target > 0:
+        parent_version = _pick_parent_version(origin_segments, target, target_version)
+        if not parent_version:
+            raise ValueError(
+                "第 %d 轮第 %d 段无法确定目标生成时使用的父版本（历史记录不足/时间戳缺失），"
+                "不能安全回抽；请先恢复该轮重跑第 %d 段。"
+                % (int(trial_round), int(target) + 1, int(target)))
+        stage = int(parent_version.get("relay_stage_index"))
+        if not _copy_stage(str(parent_version.get("relay_save_run_id") or ""), stage, new_chain):
+            raise ValueError(
+                "第 %d 轮第 %d 段的 latent 文件缺失，无法恢复父链，回抽已取消；"
+                "请先恢复该轮重跑第 %d 段。"
+                % (int(trial_round), int(target), int(target)))
+    origin_state["relay_run_id"] = new_relay
+    group_history.save_snapshot(STORE, parent, trial_round, origin_state)
+    return new_chain
+
+
+def _plan_old_round_reroll(sid, parent, origin_state, target, preview, trial_round, relay_on):
+    from . import group_history
+    group_history.ensure_rerollable(parent, trial_round)
+    target_version = _version_from_preview(origin_state.get("segments") or [], preview)
+    if target_version is None:
+        raise ValueError("所选卡片不属于第 %d 轮快照，无法回抽；请重新选择该轮卡片。"
+                         % int(trial_round))
+    if not relay_on:
+        return ""
+    chain = _recover_old_round_chain(sid, parent, origin_state, target, trial_round, target_version)
+    if target > 0 and not _stage_path(chain, target - 1).is_file():
+        raise ValueError("第 %d 轮第 %d 段缺少上一段 latent，回抽已取消；请先在该轮重跑第 %d 段。"
+                         % (int(trial_round), int(target) + 1, int(target)))
+    return chain
+
+
+def _plan_current_reroll(sid, parent, target, preview, relay_on):
+    if not relay_on:
+        return ""
+    chain = _stable_run(sid, parent.get("relay_run_id") or "")
+    target_version = _version_from_preview(parent.get("segments") or [], preview)
+    if target_version is not None and target_version.get("archived"):
+        version_chain = str(target_version.get("relay_run_id") or "")
+        if version_chain and version_chain != chain:
+            raise ValueError(
+                "该卡片属于清空重置前的旧批次，还没有归档为独立轮次，不能直接接到当前轮。"
+                "请先点一次「清空重置」（会把当前批次归档成历史轮），再回到该轮抽卡。")
+    if target > 0 and not _stage_path(chain, target - 1).is_file():
+        raise ValueError(
+            "第 %d 段抽卡需要第 %d 段的 latent，但当前新一轮还没有 stage_%05d。"
+            "请先在新一轮生成并通过第 %d 段，再抽第 %d 段。"
+            % (int(target) + 1, int(target), int(target) - 1, int(target), int(target) + 1))
+    return chain
 
 
 def session_for(prompt, node_id):
@@ -116,8 +315,16 @@ def seed_policies(graph, workflow):
 
 def execution_prompt(state, snapshot):
     graph = copy.deepcopy(snapshot["prompt"])
-    index = int((state.get("active") or {}).get("index", state["cursor"]))
-    reroll = state["segments"][index].get("reroll", 0)
+    segments = state.get("segments") or []
+    try:
+        index = int((state.get("active") or {}).get("index", state.get("cursor")))
+    except (TypeError, ValueError):
+        index = int(state.get("cursor") or 0)
+    if segments and not 0 <= index < len(segments):
+        # 段被切分/删除后旧上下文可能越界：回退到当前游标，不能抛 IndexError。
+        index = int(state.get("cursor") or 0)
+    index = min(max(0, index), len(segments) - 1) if segments else 0
+    reroll = segments[index].get("reroll", 0) if segments else 0
     step = index + int(reroll)
     for policy in snapshot.get("seed_policies", []):
         if policy["mode"] == "randomize":
@@ -217,12 +424,21 @@ def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None):
                     "materials": material_state}
         rounds_dir = STORE.directory(sid) / "rounds"
         rounds_dir.mkdir(parents=True, exist_ok=True)
-        for stale in rounds_dir.glob("*.json"):
+        atomic_json(rounds_dir / (token + ".json"), snapshot)
+        # 旧快照可能正被另一线程 read_snapshot 读取：先写新快照，再按 mtime 只保留最近 2 份；
+        # 删除失败忽略，避免并发读取时瞬时找不到文件。
+        snapshots = []
+        for item in rounds_dir.glob("*.json"):
+            try:
+                snapshots.append((item.stat().st_mtime_ns, item.name, item))
+            except OSError:
+                continue
+        snapshots.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+        for _, _, stale in snapshots[2:]:
             try:
                 stale.unlink()
             except OSError:
                 pass
-        atomic_json(rounds_dir / (token + ".json"), snapshot)
         current["execution_round"] = {"id": token, "file": "rounds/" + token + ".json",
                                       "segment_node": str(node_id), "batch": bool(batch)}
         current.pop("resume_round", None)
@@ -401,7 +617,10 @@ def start_trial(data):
         parent = STORE._load(sid)
         if parent["status"] in {"queued", "running", "merging"} or parent.get("draft_trial"):
             raise ValueError("请先停止分段循环，并等待本段抽卡结束")
-        target = int(data.get("index", parent["cursor"]))
+        try:
+            target = int(data.get("index", parent["cursor"]))
+        except (TypeError, ValueError):
+            raise ValueError("无效段号") from None
         preview = data.get("preview")
         trial_round = int(parent.get("round_no", 1) or 1)
         origin_state=parent
@@ -417,8 +636,13 @@ def start_trial(data):
                 archive(STORE,origin_state)
                 parent.setdefault('group_snapshots',{}).update(origin_state.get('group_snapshots') or {})
             target = resolve_resume_anchor(origin_state, preview, target + 1) - 1
-        if target < 0 or target >= len(parent["segments"]) and not data.get("draft_target"):
+        parent_segments = parent.get("segments") or []
+        origin_segments = origin_state.get("segments") or []
+        if target < 0 or (target >= len(parent_segments) and not data.get("draft_target")):
             raise ValueError("无效段号")
+        if origin_state is not parent and not 0 <= target < len(origin_segments):
+            # 旧轮快照里已没有该段：不能越界取段（避免 IndexError），明确提示重新选卡。
+            raise ValueError("所选预览对应的原轮分段已改变，请重新选择原预览")
         child_id = "trial_" + uuid.uuid4().hex
         node_id = str(data["segment_node"])
         graph = copy.deepcopy(data["prompt"])
@@ -434,16 +658,24 @@ def start_trial(data):
         child = sync_graph_now({**data, "prompt": graph, "session_id": child_id})
         if target >= len(child["segments"]):
             raise ValueError("当前编辑内容中已没有这个段号，请选择仍然存在的片段试跑")
+        # 回抽锚点/潜桥链：旧轮锁该轮结构与父 latent；设置仍取当前编辑（提示词/参考/参数）。
+        relay_on = _relay_choice(data.get("prompt") or {}, node_id)
+        if origin_state is not parent:
+            _validate_old_round_plan(origin_segments, child.get("segments") or [], trial_round)
+            chain_run = _plan_old_round_reroll(sid, parent, origin_state, target, preview,
+                                               trial_round, relay_on)
+        else:
+            chain_run = _plan_current_reroll(sid, parent, target, preview, relay_on)
         request = uuid.uuid4().hex
         # 前段尾帧只读原轮选用版本；将元数据拷入独立会话，文件仍由原轮保管。
         for index in range(target):
-            row = origin_state["segments"][index] if index < len(origin_state["segments"]) else None
+            row = origin_segments[index] if index < len(origin_segments) else None
             if row is None:
                 continue
             child["segments"][index].update(versions=copy.deepcopy(row["versions"]),
                                             selected=row["selected"], valid=row["valid"], accepted=row["accepted"])
         reset_id = origin_state.get("reset_id", "legacy")
-        prior = origin_state["segments"][target].get("versions", []) if target < len(origin_state["segments"]) else []
+        prior = origin_segments[target].get("versions", []) if 0 <= target < len(origin_segments) else []
         prior = [v for v in prior if v.get("preview_only") and not v.get("archived") and v.get("reset_id", "legacy") == reset_id]
         redraw_count = max([len(prior), *(int(v.get("redraw_count") or 0) for v in prior)]) + 1
         child.update(cursor=target, auto=False, status="ready", reset_id=reset_id,
@@ -451,12 +683,16 @@ def start_trial(data):
                      round_no=trial_round,
                      preview_parent={"session_id": sid, "epoch": parent["epoch"], "request_id": request,
                                      "index": target, "redraw_count": redraw_count,
-                                     "segment_key": parent["segments"][target]["segment_key"] if target < len(parent["segments"]) else None})
+                                     # 桥接必须读卡片所属轮次自己的潜桥链（历史轮/旧批次也不例外）。
+                                     "relay_run_id": chain_run or "",
+                                     "group_label": "第 %d 轮" % int(trial_round),
+                                     "segment_key": parent_segments[target]["segment_key"] if 0 <= target < len(parent_segments) else None})
         if origin_state is not parent:
             child["preview_parent"]["group_file"]=(parent.get('group_snapshots') or {}).get(str(trial_round))
-            child["preview_parent"]["segment_key"]=origin_state['segments'][target]['segment_key']
+            child["preview_parent"]["segment_key"]=origin_segments[target]["segment_key"]
         STORE._save(child)
         freeze(child, graph, node_id, data.get("workflow"))
+        parent.pop("trial_notice", None)
         parent["draft_trial"] = {"session_id": child_id, "request_id": request, "target": target}
         return STORE._save(parent)
 
@@ -517,9 +753,27 @@ def finish_trial(child_id, success=True):
                     versions.append(version)
                 if parent.get("auto_accept") and row is not None and child.get("round_no")==destination.get("round_no"):
                     # 新界面生成即通过：最新抽卡结果直接成为该段当前选用/通过版本，不改变游标。
-                    row["selected"] = version["id"]
-                    row["valid"] = True
-                    row["accepted"] = True
+                    # 但潜桥 latent 提升必须成功才能选定；失败时不能带着旧父 latent 继续。
+                    relay_version = bool(version.get("relay_run_id") and version.get("relay_save_run_id"))
+                    promoted = (STORE._promote_relay_stage(destination, row, version)
+                                if relay_version else True)
+                    if promoted:
+                        row["selected"] = version["id"]
+                        row["valid"] = True
+                        row["accepted"] = True
+                        if destination is not parent:
+                            # 回抽旧轮：后续段只加“待更新”提示，不失效、不阻断合并。
+                            target_index = int(source["index"])
+                            for index, after in enumerate(destination.get("segments") or []):
+                                if index > target_index:
+                                    after["stale_after_reroll"] = True
+                            parent["trial_notice"] = (
+                                "已回抽第 %d 轮第 %d 段，结果归该轮；后续段如需画面连续可自行重跑（不强制）。"
+                                % (int(child.get("round_no", 0) or 0), target_index + 1))
+                    else:
+                        parent["error"] = (
+                            "本段抽卡结果已登记，但潜桥 latent 提升失败，未作为当前选用；"
+                            "请重跑该段后再继续，避免下一段接错父 latent。")
         if destination is not parent:
             atomic_json(contained(STORE.directory(sid),source["group_file"]),destination)
         parent.pop("draft_trial", None)

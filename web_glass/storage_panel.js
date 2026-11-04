@@ -107,12 +107,15 @@ export function mountStoragePanel(root, node, api, scheduleLayout, onClearAll) {
         finally { cleaning = false; if (!disposed) void refresh().catch(() => {}); }
     };
     const onFocus=(cache=false)=>{if(!disposed&&!document.hidden&&root.isConnected)void refresh({cache}).catch(()=>{});};
+    // 具名 handler：dispose() 才能把窗口聚焦/页面可见性监听真正移除，避免反复挂载节点后监听器泄漏。
+    const onWindowFocus = () => onFocus(false);
+    const onVisibilityChange = () => onFocus(false);
     const summary=panel.querySelector(".h3-storage-summary");
     summary.title="点击刷新磁盘占用统计";summary.style.cursor="pointer";
     summary.addEventListener("click",event=>{event.stopPropagation();onFocus(true);});
-    window.addEventListener("focus", () => onFocus(false));
-    document.addEventListener("visibilitychange", () => onFocus(false));
+    window.addEventListener("focus", onWindowFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     const timer = setInterval(onFocus, 60000);
     void refresh().catch(() => {});
-    return {refresh, canImport, dispose() { disposed = true; clearInterval(timer);window.removeEventListener("focus",onFocus);document.removeEventListener("visibilitychange",onFocus); }};
+    return {refresh, canImport, dispose() { disposed = true; clearInterval(timer);window.removeEventListener("focus",onWindowFocus);document.removeEventListener("visibilitychange",onVisibilityChange); }};
 }

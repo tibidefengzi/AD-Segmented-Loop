@@ -1,9 +1,13 @@
-import {resultAliases,sameResult,mergeResult,redrawKey,identityFields} from "./preview_identity.js?v=20261102-group-v64";
-import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js?v=20261102-group-v64";
-import { retainedHistoryRounds, previewHistoryGroups } from "./preview_history.js?v=20261102-group-v64";
-import { interruptOwnedPrompt } from "./queue_runner.js?v=20261102-group-v64";
+import {resultAliases,sameResult,mergeResult,redrawKey,redrawBase,recordLabel,nextRedrawCount,normalizeRedrawCounts,identityFields} from "./preview_identity.js";
+import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js";
+import { retainedHistoryRounds, previewHistoryGroups } from "./preview_history.js";
+import { interruptOwnedPrompt } from "./queue_runner.js";
 // 0.4.53：分段预览播放框与「AD-最终保存」一致（原生播放条），仅额外保留上一帧/下一帧。
+// 样式只注入一次（模块被重复求值时不会插入多份）。
+const frameStylesId = "ad-h3-native-player-frame-styles";
+if (!document.getElementById(frameStylesId)) {
 const frameStyles=document.createElement("style");
+frameStyles.id=frameStylesId;
 frameStyles.textContent=`
 .ad-h3-video.aiden-h3 .ad-h3-screen>.ad-h3-player-controls.ad-h3-native-controls-hidden{display:none!important}
 .ad-h3-video.aiden-h3 .ad-h3-screen video{width:100%;height:100%;object-fit:contain;background:#08090c}
@@ -14,6 +18,7 @@ frameStyles.textContent=`
 .ad-h3-video.aiden-h3.ad-h3-audio-mode .ad-h3-frame-step,.ad-h3-preview-layout.is-comparing .ad-h3-frame-step,.ad-h3-video.aiden-h3 .ad-h3-frame-step[hidden]{display:none!important}
 `;
 document.head.append(frameStyles);
+}
 // 所有入口共用进入/退出切换；状态以浏览器fullscreenElement为准（包括Esc退出）。
 export async function togglePlayerFullscreen(target) {
     const doc = target.ownerDocument || document;
@@ -32,6 +37,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const video = root.querySelector("video"), title = root.querySelector(".ad-h3-preview-title");
     const imageView = root.querySelector("[data-media-image]"), audioView = root.querySelector("[data-media-audio]");
     const layout = root.querySelector(".ad-h3-preview-layout");
+    const lightboxClosers = new Set();
+    const releaseMedia = media => {
+        media.pause();
+        if (media.hasAttribute("src")) { media.removeAttribute("src"); media.load(); }
+    };
     const transport = root.querySelector(".ad-h3-player-controls");
     root.querySelector(".ad-h3-screen").append(transport);
     audioView.controls = true;
@@ -109,7 +119,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     // 下载前弹出系统文件夹选择框；选中后同步到保存路径输入框。留空时按类型从生成目录起始。
     async function chooseSaveFolder() {
         try {
-            const response = await fetch("/aiden_h3/pick_folder", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({initial_dir: saveState.dir, kind: active?.kind || ""})});
+            const response = await api.fetchApi("/aiden_h3/pick_folder", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({initial_dir: saveState.dir, kind: active?.kind || ""})});
             const result = await response.json();
             const path = String(result.path || "").trim();
             if (path) { dirInput.value = path; syncSaveConfig(); }
@@ -128,7 +138,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     async function saveMediaToChosenPath(info, index) {
         const defaultName = String(info?.file || "").split("/").pop() || "AD-H3-export";
         try {
-            const response = await fetch("/aiden_h3/pick_save_path", {
+            const response = await api.fetchApi("/aiden_h3/pick_save_path", {
                 method: "POST", headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({default_name: defaultName, initial_dir: saveState.dir, kind: info?.kind || active?.kind || "", title: "选择保存位置"}),
             });
@@ -136,7 +146,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 const picked = await response.json();
                 const target = String(picked.path || "").trim();
                 if (!target) return {cancelled: true};
-                const saved = await fetch("/aiden_h3/save_media", {
+                const saved = await api.fetchApi("/aiden_h3/save_media", {
                     method: "POST", headers: {"Content-Type": "application/json"},
                     body: JSON.stringify({origin: info.origin || "media", file: info.file, target}),
                 });
@@ -147,7 +157,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         } catch (error) { throw error; }
         const dir = await chooseSaveFolder();
         if (!dir) return {cancelled: true};
-        const response = await fetch("/aiden_h3/save_media", {
+        const response = await api.fetchApi("/aiden_h3/save_media", {
             method: "POST", headers: {"Content-Type": "application/json"},
             body: JSON.stringify({origin: info.origin || "media", file: info.file,
                 dir, template: saveState.template, index: index || 1}),
@@ -166,7 +176,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 if ("only_b" in config) saveState.onlyB = !!config.only_b;
                 dirInput.value = saveState.dir;
                 nameInput.value = saveState.template;
-               
+
                 if (onlyBInput) onlyBInput.checked = saveState.onlyB;
             }
         } catch {}
@@ -239,7 +249,14 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const markABMode = () => { abOverlay.dataset.zoom = abMode === "split" ? "image" : "canvas"; };
     let abFocus = "B";
     const abFps = {A: 24, B: 24};
+    // 媒体帧率缓存：只缓存成功结果（失败下次重试），并限制条数避免长时间使用后无限增长。
+    const MEDIA_INFO_CACHE_LIMIT = 64;
     const mediaInfoCache = new Map();
+    const rememberMediaFps = (key, fps) => {
+        if (mediaInfoCache.has(key)) mediaInfoCache.delete(key);
+        mediaInfoCache.set(key, fps);
+        while (mediaInfoCache.size > MEDIA_INFO_CACHE_LIMIT) mediaInfoCache.delete(mediaInfoCache.keys().next().value);
+    };
     const fetchMediaFps = async (record) => {
         const origin = record?.origin || "media";
         const file = record?.file;
@@ -247,13 +264,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const key = `${origin}/${file}`;
         if (mediaInfoCache.has(key)) return mediaInfoCache.get(key);
         try {
-            const response = await fetch(`/aiden_h3/media_info/${origin}/${String(file).split("/").map(encodeURIComponent).join("/")}`);
+            const response = await api.fetchApi(`/aiden_h3/media_info/${encodeURIComponent(origin)}/${String(file).split("/").map(encodeURIComponent).join("/")}`);
             const data = await response.json();
             const fps = Number(data?.fps) > 0 ? Number(data.fps) : 24;
-            mediaInfoCache.set(key, fps);
+            // 失败结果不缓存，下次显示时重新读取；成功才写入 LRU。
+            if (response.ok && !data?.failed && Number(data?.fps) > 0) rememberMediaFps(key, fps);
             return fps;
         } catch {
-            mediaInfoCache.set(key, 24);
             return 24;
         }
     };
@@ -263,8 +280,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (Math.abs((target.currentTime || 0) - (source.currentTime || 0)) > 0.15) target.currentTime = source.currentTime;
     };
     for (const [videoEl, other] of [[abVideoA, abVideoB], [abVideoB, abVideoA]]) {
-        videoEl.addEventListener("play", () => { if (other.paused) other.play().catch(() => {}); });
-        videoEl.addEventListener("pause", () => { if (!other.paused) other.pause(); });
+        videoEl.addEventListener("play", () => { abPlay.textContent = "暂停"; if (other.paused) other.play().catch(() => {}); });
+        videoEl.addEventListener("pause", () => { abPlay.textContent = "播放"; if (!other.paused) other.pause(); });
         videoEl.addEventListener("timeupdate", () => {
             abSync(videoEl, other);
             if (videoEl === abVideoA) {
@@ -278,10 +295,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             abTime.textContent = `${(videoEl.currentTime || 0).toFixed(2)} / ${duration.toFixed(2)} 秒`;
         });
     }
-    abPlay.addEventListener("click", () => {
+    const toggleABPlayback = () => {
+        if (abSlots.A?.kind !== "video" || abSlots.B?.kind !== "video") return;
         if (abVideoA.paused) { abVideoA.play().catch(() => {}); abVideoB.play().catch(() => {}); abPlay.textContent = "暂停"; }
         else { abVideoA.pause(); abVideoB.pause(); abPlay.textContent = "播放"; }
-    });
+    };
+    abPlay.addEventListener("click", toggleABPlayback);
     abOverlay.querySelectorAll("[data-ab-step]").forEach(button => button.addEventListener("click", () => {
         const step = Number(button.dataset.abStep) * abStepSeconds();
         for (const videoEl of [abVideoA, abVideoB]) {
@@ -295,8 +314,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (document.fullscreenElement === abOverlay && document.exitFullscreen) { void document.exitFullscreen().catch(() => {}); }
         abSlots.A = null; abSlots.B = null; abPicking = false;
         resetABView();
-        abVideoA.pause(); abVideoB.pause();
-        abVideoA.removeAttribute("src"); abVideoB.removeAttribute("src");
+        for (const media of [abVideoA, abVideoB, abAudioA, abAudioB]) releaseMedia(media);
         abA.removeAttribute("src"); abB.removeAttribute("src");
         paintAB();
         const hint = root.querySelector("[data-tab-hint]");
@@ -324,6 +342,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const tags = abOverlay.querySelectorAll(".ad-h3-ab-tag");
         if (tags[0]) tags[0].classList.toggle("on", abFocus === "A");
         if (tags[1]) tags[1].classList.toggle("on", abFocus === "B");
+        if (abSlots.A.kind === "video" && abSlots.B.kind === "video") {
+            event.preventDefault(); event.stopPropagation();
+            toggleABPlayback();
+        }
     });
     abModeButton.addEventListener("click", event => {
         event.stopPropagation();
@@ -370,6 +392,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             abVideoA.pause(); abVideoB.pause();
             return;
         }
+        video.pause(); audioView.pause();
         const isVideo = abSlots.A.kind === "video" && abSlots.B.kind === "video";
         const isAudio = abSlots.A.kind === "audio" && abSlots.B.kind === "audio";
         const isImage = abSlots.A.kind === "image" && abSlots.B.kind === "image";
@@ -499,7 +522,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 return;
             }
         }
-        if (abMode !== "slider") return;
+        if (abMode !== "slider" || abSlots.A?.kind !== "image" || abSlots.B?.kind !== "image") return;
         if (event.button !== 0) return;
         abDragging = true; abOverlay.setPointerCapture?.(event.pointerId);
         const width = abOverlay.clientWidth || 1;
@@ -604,20 +627,14 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const trimMediaRecords = kind => {
         enforceHistoryRetention();
     };
-    // 合并同类卡片触发的节点高度重算，每轮渲染只安排一次。
+    // 渲染后只合并一次重绘通知；节点高度统一由 dom_layout.fitPreviewContent 的 ResizeObserver 收敛，
+    // 这里不再直接 setSize，避免与用户拖动/其它高度来源互相抢高度。
     let mediaResizeToken = 0;
-    function scheduleMediaResize(minHeight = 200) {
+    function scheduleMediaResize() {
         const token = ++mediaResizeToken;
         setTimeout(() => {
             if (token !== mediaResizeToken) return;
-            try {
-                const size = node.computeSize?.();
-                if (size) {
-                    const target = Math.max(minHeight, Math.round(size[1]));
-                    if (Math.abs((Number(node.size?.[1]) || 0) - target) > 2) node.setSize([node.size[0], target]);
-                }
-                node.setDirtyCanvas?.(true, true);
-            } catch {}
+            try { node.setDirtyCanvas?.(true, true); } catch {}
         }, 0);
     }
     // 分段生成/合并生成缩略图的本地隐藏记录（X 只移除预览，不删文件/进度）；持久化到节点属性。
@@ -648,10 +665,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const activeRoundId = () => String(node.properties?.ad_execution_round?.id
         || latestSessionState?.execution_round?.id || "");
     const activeRoundNo = () => {
-        const stored = Number(node.properties?.ad_h3_round_no) || 0;
-        if (stored) return stored;
+        // 服务端 round_no 是逻辑轮次权威；本地保存值只作离线/旧会话回退。
         const logical = Number(latestSessionState?.round_no) || 0;
         if (logical) return logical;
+        const stored = Number(node.properties?.ad_h3_round_no) || 0;
+        if (stored) return stored;
         return roundNoOf(activeRoundId());  // 旧会话兜底
     };
     const rememberRound = state => {
@@ -756,6 +774,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     let redrawReview = null;
     // 点「停止」时如果分段循环正在运行，记住它；抽卡只是预览备选，点「开始」要续接原来的分段循环位置。
     let batchResume = false, redrawRequest=0;
+    // 停止请求进行中：本地已先标 paused，但后台可能仍在中断；此期间拒绝抽卡，避免和停止竞态。
+    let stopPending = false;
     // 分类与主预览联动（2026-10-28 用户要求）：
     // - 图片分类只显示图片，绝不显示播放控制栏；音频/视频分类各自显示对应内容。
     // - 用户手动选中缩略图后，新结果自动到达时不抢当前预览（避免“删除预览后自己跳到下一张”）。
@@ -778,7 +798,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         record?.redraw ? (Number(record.redraw_count) || 1) : 0,
         Number(record?.serial) || 0,
     ];
-    const displayedBase = record => Number(record?.redraw_base) || recordSegmentNo(record) || Number(record?.serial) || 0;
+    const displayedBase = record => redrawBase(record);
     function placeRedrawRecord(kind, item) {
         const list = mediaRecords[kind];
         const at = list.indexOf(item);
@@ -792,17 +812,6 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (insert >= 0) list.splice(insert + 1, 0, item);
         else list.push(item);
     }
-    const recordLabel = (record, index) => {
-        const round = recordRoundNo(record);
-        const segment = recordSegmentNo(record) || (Number(index) + 1);
-        const prefix = round > 0 ? `R${round}-` : "#";
-        const base = String(segment).padStart(2, "0");
-        if (record?.redraw && Number(record.redraw_base) > 0) {
-            const count = Number(record.redraw_count) > 0 ? Number(record.redraw_count) : 1;
-            return `${prefix}${base}-${count}`;
-        }
-        return `${prefix}${base}`;
-    };
     let previewPinned = false;
     // 记录持久化到节点属性：重新打开工作流/刷新页面后仍能在分类里看到缩略图
     const savedMedia = node.properties?.ad_h3_media_records;
@@ -813,18 +822,32 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     .map((item, index) => ({...item, serial: item.redraw ? 0 : (Number(item.serial) > 0 ? Number(item.serial) : index + 1)}));
         }
     }
-    // 编号高水位单独持久化，不随删卡、清空预览或60条存档裁剪回收。
+    // 编号高水位单独持久化，不随删卡、清空预览或存档裁剪回收。
+    // 键格式：kind:A/B端:组号:段号；旧版（含 reset_id 或只有三段）统一并入 A 端高水位。
     function rememberRedrawCounts() {
         node.properties ||= {};
         const saved = node.properties.ad_h3_redraw_counts;
-        const counts = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
-        for (const key of Object.keys(counts)) if (key.split(":").length===3) {
-            counts[key+":legacy"]=Math.max(Number(counts[key+":legacy"])||0,Number(counts[key])||0);delete counts[key];
-        }
+        const counts = {};
+        const absorb = (key, value) => {
+            const count = Number(value) || 0;
+            if (count <= 0) return;
+            const parts = String(key).split(":");
+            if (parts.length === 4 && (parts[1] === "A" || parts[1] === "B")) {
+                counts[key] = Math.max(Number(counts[key]) || 0, count);
+                return;
+            }
+            // 旧格式 kind:组:段[:reset_id]：不再按 reset_id 分批，只保留最大次数。
+            if (parts.length === 3 || parts.length === 4) {
+                const target = `${parts[0]}:A:${parts[1]}:${parts[2]}`;
+                counts[target] = Math.max(Number(counts[target]) || 0, count);
+            }
+        };
+        if (saved && typeof saved === "object" && !Array.isArray(saved))
+            for (const [key, value] of Object.entries(saved)) absorb(key, value);
         for (const kind of ["image", "audio", "video"]) {
             for (const entry of mediaRecords[kind]) {
                 if (!entry.redraw) continue;
-                const key = redrawKey(kind,entry);
+                const key = redrawKey(kind,entry,redrawBase(entry));
                 counts[key] = Math.max(0, Number(counts[key]) || 0, Number(entry.redraw_count) || 0);
             }
         }
@@ -832,6 +855,19 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         return counts;
     }
     rememberRedrawCounts();
+    // 抽卡编号归一化：同组同段同类型同 A/B 端内「第几次」必须唯一。
+    // 已经唯一的编号保持原样（旧卡不重排），重复编号顺延到该段最大编号之后；
+    // 这样重新打开工作流/刷新页面也会把历史重复编号修正为 R1-01-1、R1-01-2。
+    function normalizeRedrawNumbers() {
+        const entries = [];
+        for (const kind of ["image", "audio", "video"])
+            for (const record of mediaRecords[kind]) if (record?.redraw) entries.push({kind, record});
+        const {changed} = normalizeRedrawCounts(entries);
+        rememberRedrawCounts();
+        for (const {record} of entries) record.label = recordLabel(record, 0);
+        if (changed) persistMedia();
+        return changed;
+    }
     const persistMedia = () => {
         node.properties ||= {};
         rememberRedrawCounts();
@@ -912,14 +948,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (videoActions) videoActions.style.display = kind === "video" ? "flex" : "none";
         node._adH3OnTab?.(kind);
         if (options.sync !== false) syncPreviewToTab(kind);
-        // 切分类后按实际内容重算节点高度，避免缩略图被裁掉露出半截
-        setTimeout(() => {
-            try {
-                const size = node.computeSize?.();
-                if (size) node.setSize([node.size[0], Math.max(200, Math.round(size[1]))]);
-                node.setDirtyCanvas?.(true, true);
-            } catch {}
-        }, 0);
+        // 切分类后的高度由 dom_layout.fitPreviewContent 的 ResizeObserver 按内容统一收敛，这里只通知重绘。
+        node.setDirtyCanvas?.(true, true);
     }
     function showLastForTab(kind) {
         const saved = lastShown[kind];
@@ -1026,7 +1056,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     toggleMergeSelection(record, kind, record.role === "B" ? "B" : "A");
                     return;
                 }
-                pickAB(record, kind);
+                const pickedForAB = pickAB(record, kind);
+                if (!pickedForAB && !abOverlay.hidden) exitAB();
                 show({...record, kind, label: recordLabel(record, index), url: mediaUrl(record.origin || "media", record.file)});
                 markActiveCard(record);
                 setRedoTarget(record, button);
@@ -1058,10 +1089,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const clearButton = root.querySelector("[data-clear-preview]");
     if (clearButton) clearButton.addEventListener("click", async () => {
         // 只清空本轮进度与选用记录；预览内容、素材、分段、提示词和文件都保留。
-        if (!window.confirm("只清空本轮生成进度和选用记录？（预览内容、素材、分段、提示词与已生成文件都保留）")) return;
+        if (!window.confirm("归档当前轮并开始新一轮？（预览内容、素材、分段、提示词与已生成文件都保留，旧轮可在历史组回抽）")) return;
         try { if(await node._adH3Act?.("clear", {skipConfirm:true})===false)return; } catch { return; }
         previewPinned = false;
-        if (node._adH3ReviewStatus) node._adH3ReviewStatus("已重置本轮进度；预览内容与已生成文件保留。");
+        if (node._adH3ReviewStatus) node._adH3ReviewStatus("已归档当前轮并进入下一轮；旧轮可在历史组回抽，预览内容与已生成文件保留。");
         node.setDirtyCanvas?.(true, true);
     });
     const clearMediaButton = root.querySelector("[data-clear-media-preview]");
@@ -1160,10 +1191,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 node._adH3Hint?.("已续接分段循环，从停止处继续…", false);
                 if (typeof node._adH3Batch === "function") { void node._adH3Batch({merge:false,resumeSelection:false}); return; }
             }
-            // 分段循环已完成：点「开始」直接清空本轮进度（保留素材/分段/提示词/已生成文件）并重新开始第 1 段。
+            // 分段循环已完成：点「开始」归档本轮并进入下一轮（保留素材/分段/提示词/已生成文件），从第 1 段重新开始。
             if (latestSessionState && latestSessionState.status === "completed") {
                 redrawPending = null; redrawReview = null; batchResume = false;
-                node._adH3Hint?.("本轮已完成，正在重置本轮进度并重新开始（文件与预览保留）…", false);
+                node._adH3Hint?.("本轮已完成，正在归档本轮并开始新一轮（文件与预览保留）…", false);
                 if (typeof node._adH3Act === "function") {
                     Promise.resolve(node._adH3Act("clear", {skipConfirm:true}))
                         .then(result => {
@@ -1209,15 +1240,21 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             batchResume = batchResume || !!node._adH3BatchRunning;
             const stopping=++redrawRequest;
             redrawPending = null; previewPinned = false;
+            stopPending = true;
             if (latestSessionState) latestSessionState = {...latestSessionState, status: "paused"};
             if (typeof node._adH3Act === "function") {
                 Promise.resolve(node._adH3Act("stop"))
-                    .then(result => { if (stopping===redrawRequest && result === false) interruptNow(); })
-                    .catch(() => {if(stopping===redrawRequest)interruptNow();});
-            } else interruptNow();
+                    .then(result => { stopPending = false; if (stopping===redrawRequest && result === false) interruptNow(); })
+                    .catch(() => {stopPending = false; if(stopping===redrawRequest)interruptNow();});
+            } else { stopPending = false; interruptNow(); }
             return;
         }
         if (command === "redo") {
+            // 停止请求还没返回时先不发抽卡，避免和中断竞态。
+            if (stopPending) {
+                node._adH3Hint?.("正在停止，请稍候…", true);
+                return;
+            }
             // 运行中需要先点「停止」：流程待命后再抽卡。
             if (sessionIsRunning()) {
                 node._adH3Hint?.("分段循环运行中：请先点「停止」，流程待命后再点「本段抽卡」", true);
@@ -1261,7 +1298,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     });
     const keyOf = record => `${record.role||"A"}|${record.origin || "session"}/${record.file}`;
     function playlistVideos() {
+        // 两轮结果共存时只循环播放当前轮；没有轮号（旧数据/未记录）时保留旧行为，全部参与。
+        const currentRound = activeRoundNo();
         return stripStore.segment.filter(record => inferMediaKind(record.file,record.kind)==="video"
+            && (!currentRound || recordRoundNo(record)===currentRound)
             && !hiddenStrips.has(stripKey("segment",record)))
             .slice().sort((a,b)=>{
                 const left=numberOrder(a),right=numberOrder(b);
@@ -1330,7 +1370,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
         let scale = 1, offsetX = 0, offsetY = 0, dragging = false, startX = 0, startY = 0;
         const apply = () => { if (!isVideo) mediaEl.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`; };
-        const close = () => overlay.remove();
+        const close = () => { cleanup(); overlay.remove(); };
         overlay.onclick = event => { if (event.target === overlay) close(); };
         if (!isVideo) {
             overlay.addEventListener("wheel", event => {
@@ -1379,6 +1419,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         overlay.dataset.role = "lightbox";
         document.body.append(overlay);
         const cleanup = () => {
+            if (isVideo) releaseMedia(mediaEl); else mediaEl.removeAttribute("src");
+            lightboxClosers.delete(close);
             document.removeEventListener("fullscreenchange", syncLightboxFullscreen);
             window.removeEventListener("mousemove", move);
             window.removeEventListener("mouseup", up);
@@ -1386,6 +1428,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         };
         const observer = new MutationObserver(() => { if (!overlay.isConnected) { cleanup(); observer.disconnect(); } });
         observer.observe(document.body, {childList: true});
+        lightboxClosers.add(close);
     }
     const originalShow = show;
     imageView.addEventListener("click", () => {
@@ -1487,11 +1530,17 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (media.paused) void media.play().catch(() => { title.textContent = "暂时无法播放，请重新选择片段"; });
         else media.pause();
     };
-    // 点击预览画面：播放 / 暂停
-    video.addEventListener("click", () => {
-        if (!active) return;
-        if (video.paused) void video.play().catch(() => { title.textContent = "暂时无法播放，请重新选择片段"; });
-        else video.pause();
+    // 整个视频画面（含留黑区域）可点按；原生控制条仍由浏览器处理，避免一次点击反复切换。
+    root.querySelector(".ad-h3-screen").addEventListener("click", event => {
+        if (event.defaultPrevented || event.button !== 0 || !active || active.kind !== "video" || video.hidden || !abOverlay.hidden) return;
+        if (event.target.closest("button,input,select,a,.ad-h3-player-controls,.ad-h3-frame-step,.ad-h3-ab-overlay")) return;
+        if (event.target === video && video.controls) {
+            const rect = video.getBoundingClientRect();
+            const scale = rect.height / (video.offsetHeight || rect.height || 1);
+            if (event.clientY >= rect.bottom - 44 * scale) return;
+        }
+        event.preventDefault(); event.stopPropagation();
+        play.onclick();
     });
     video.style.cursor = "pointer";
     imageView.style.cursor = "default";
@@ -1572,11 +1621,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     toggleMergeSelection(record, itemKind, stripKind === "segmentB" ? "B" : stripKind === "segment" ? "A" : "");
                     return;
                 }
-                pickAB({...record, kind: itemKind}, itemKind);
+                const pickedForAB = pickAB({...record, kind: itemKind}, itemKind);
+                if (!pickedForAB && !abOverlay.hidden) exitAB();
                 mergeSelection.clear();
                 processingRecord = {...record, kind: itemKind, label: record.label || recordLabel(record, 0)};
                 paintMergeSelection();
-                if (stripKind==="segment" && itemKind==="video" && playlistEnabled) playPlaylistRecord(record);
+                if (!pickedForAB && stripKind==="segment" && itemKind==="video" && playlistEnabled) playPlaylistRecord(record);
                 else show({...record, key: keyOf(record), kind: itemKind, url: mediaUrl(record.origin || "session",record.file)});
                 // 分段生成A/B缩略图：点选即成为「本段抽卡」目标（合并片段无段号，只预览）。
                 if (stripKind === "segment" || stripKind === "segmentB") {
@@ -1793,7 +1843,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             : "按段号顺序";
         node._adH3Hint?.(`正在${orderText}合并 ${sourceTag} 端 ${selected.length} 个视频…`, false);
         try {
-            const response = await fetch("/aiden_h3/merge_clips", {
+            const response = await api.fetchApi("/aiden_h3/merge_clips", {
                 method: "POST", headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({kind: "video", clips: selected.map(item => ({origin: item.origin || "media", file: item.file}))}),
             });
@@ -1839,9 +1889,23 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         return merged;
     }
     let versionSignature = "";
+    // FNV-1a 32 位短哈希：只用于比较版本是否变化，不参与数据存取。
+    const shortHash = value => {
+        const text = String(value ?? "");
+        let hash = 0x811c9dc5;
+        for (let index = 0; index < text.length; index++) {
+            hash ^= text.charCodeAt(index);
+            hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        return hash.toString(36);
+    };
     function reconcileSessionRecords(state) {
         if (!state?.id || !Array.isArray(state?.segments)) return false;
-        const signature = `${state.id}|${state.round_no || 0}|${state.reset_id||"legacy"}|${state.epoch||0}|` + state.segments.map(row => (row.versions || []).length).join(",");
+        // 版本签名：包含选用版本，以及每个版本 id/file/updated_at/reset_id 的短哈希；
+        // “删一增一”等数量相同的替换也能触发列表刷新，同时避免对整段状态做大对象序列化。
+        const versionSignatureOf = row => `${row?.selected || ""}:${(row?.versions || []).map(version =>
+            shortHash(`${version?.id || ""}|${version?.file || ""}|${version?.updated_at ?? ""}|${version?.reset_id || ""}`)).join(".")}`;
+        const signature = `${state.id}|${state.round_no || 0}|${state.reset_id||"legacy"}|${state.epoch||0}|` + state.segments.map(versionSignatureOf).join(",");
         if (signature === versionSignature) return false;
         versionSignature = signature;
         const changed = new Set();
@@ -1865,7 +1929,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                     for(const alias of resultAliases(record))for(const strip of ["segment","segmentB","merged"])hiddenStrips.add(`${strip}:${alias}`);
                     persistHiddenStrips();changed.add(kind);continue;
                 }
-                if(record.redraw&&!record.redraw_count)record.redraw_count=(Number(rememberRedrawCounts()[redrawKey(kind,record)])||0)+1;
+                if(record.redraw&&!record.redraw_count)record.redraw_count=nextRedrawCount(record,redrawBase(record),mediaRecords[kind],
+                    record.official_redraw_count,Number(rememberRedrawCounts()[redrawKey(kind,record,redrawBase(record))])||0);
                 if(!record.serial&&!record.redraw)record.serial=Math.max(0,...mediaRecords[kind].map(item=>Number(item.serial)||0))+1;
                 record.label=recordLabel(record,0);
                 const index=mediaRecords[kind].findIndex(item=>sameResult(item,record));
@@ -1874,6 +1939,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             }
         }
         if (!changed.size) return false;
+        normalizeRedrawNumbers();
         enforceHistoryRetention();
         for (const kind of changed) renderMedia(kind);
         syncStripFromMedia();persistMedia();persistMergeIndex();
@@ -1960,7 +2026,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             && Number(previous.redraw_base) === base && Number(previous.redraw_count) > 0;
         item.redraw = true;
         item.redraw_base = base;
-        item.redraw_count = Number(record.official_redraw_count)|| (repeated ? Number(previous.redraw_count) : (Number(counts[key]) || 0) + 1);
+        // 同一段已有抽卡编号时继续往后排（后台次数只作参考，避免清空重置后又从 -1 重来）。
+        item.redraw_count = repeated ? Number(previous.redraw_count)
+            : nextRedrawCount(item, base, mediaRecords[kind].filter(entry => entry !== item),
+                record.official_redraw_count, counts[key]);
         counts[key] = Math.max(Number(counts[key]) || 0, item.redraw_count);
         item.serial = 0;  // 抽卡结果不占用正常生成的整数序号
         item.label = recordLabel(item, 0);
@@ -1995,6 +2064,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             if (index >= 0) mediaRecords[kind][index] = item; else mediaRecords[kind].push(item);
             // 本段抽卡结果：编号为「原编号-第几次」（黄色），并记录待继续的段号。
             if (markRedrawRecord(item, kind, record, existing)) placeRedrawRecord(kind, item);
+            normalizeRedrawNumbers();
             node._adH3RedoPending = false;
             trimMediaRecords(kind);
             persistMedia();
@@ -2013,6 +2083,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const index = mediaRecords.video.findIndex(entry => sameResult(entry,record));
         if (index >= 0) mediaRecords.video[index] = item; else mediaRecords.video.push(item);
         if (markRedrawRecord(item, "video", record, existingVideo)) placeRedrawRecord("video", item);
+        normalizeRedrawNumbers();
         node._adH3RedoPending = false;
         rememberMergeRecord(item);persistMergeIndex();
         trimMediaRecords("video");
@@ -2054,7 +2125,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         renderRecords(merges, stripStore.merged, "merged");
         const saved = node.properties?.ad_h3_media_records;
         if (!saved || typeof saved !== "object") {
-            restoreHistoryRecords();syncStripFromMedia();
+            restoreHistoryRecords();normalizeRedrawNumbers();syncStripFromMedia();
             renderRecords(segments, stripStore.segment.filter(record => record.role !== "B"), "segment");
             renderRecords(segmentsB, stripStore.segment.filter(record => record.role === "B"), "segmentB");
             return;
@@ -2065,7 +2136,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 .map((item, index) => ({...item, serial: item.redraw ? 0 : (Number(item.serial) > 0 ? Number(item.serial) : index + 1)}));
             renderMedia(kind);
         }
-        restoreHistoryRecords();rememberRedrawCounts();
+        restoreHistoryRecords();rememberRedrawCounts();normalizeRedrawNumbers();
         for (const kind of ["image","audio","video"]) renderMedia(kind);
         // 重新打开工作流时保持原先的分类与空闲画面，不自动弹出别的预览。
         syncStripFromMedia();
@@ -2074,6 +2145,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     for (const record of node.properties?.ad_h3_merge_index || []) rememberMergeRecord(record);
     // 恢复现存完整索引中的历史，完整保留最近10组。
     restoreHistoryRecords();
+    normalizeRedrawNumbers();
     syncStripFromMedia();
     renderRecords(merges, stripStore.merged, "merged");
     renderMedia("image");
@@ -2102,7 +2174,19 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         consumeResumeTarget(){resumeTarget = null;},
         resetGroupSelection(){resumeTarget=null;redoTarget=null;redrawPending=null;redrawReview=null;batchResume=false;previewPinned=false;redrawRequest++;},
         clearPin(){ previewPinned = false; }, get revision(){return revision;},
-        dispose(){disposed=true; document.removeEventListener("fullscreenchange",onFullscreenChange); window.removeEventListener("keydown",onPreviewEscape,true); setPlaylistEnabled(false); setIdle(true); video.pause(); video.removeAttribute("src"); video.load(); cards.clear();}};
+        dispose(){
+            if (disposed) return;
+            disposed=true;
+            document.removeEventListener("fullscreenchange",onFullscreenChange);
+            window.removeEventListener("keydown",onPreviewEscape,true);
+            setPlaylistEnabled(false); setIdle(true);
+            if (videoWatchdog) {clearTimeout(videoWatchdog);videoWatchdog=0;}
+            for (const close of [...lightboxClosers]) close();
+            for (const media of [video,audioView,abVideoA,abVideoB,abAudioA,abAudioB]) releaseMedia(media);
+            for (const image of root.querySelectorAll("img")) image.removeAttribute("src");
+            mediaInfoCache.clear();cards.clear();
+            for (const owned of Object.values(mediaCards)) owned.clear();
+        }};
 }
 
 export function mountNativePlayer(node, api) {
@@ -2123,7 +2207,14 @@ export function mountNativePlayer(node, api) {
     bindWidgetWidth(node,widget);
     fitPreviewContent(node,root);
     widget.serialize = false; widget.computeSize = width=>[width,height()];
-    node.setSize([Math.max(node.size[0],MIN_NODE_WIDTH),Math.max(node.size[1],460)]);
+    // 初始最小尺寸只在新节点（未从工作流恢复尺寸）时生效；旧工作流保留用户保存的宽高。
+    setTimeout(() => {
+        if (!node.graph || node._adH3Configured) return;
+        const width = Math.max(Number(node.size?.[0]) || 0, MIN_NODE_WIDTH);
+        const height = Math.max(Number(node.size?.[1]) || 0, 460);
+        if (Math.abs(width - Number(node.size?.[0])) > 0.5 || Math.abs(height - Number(node.size?.[1])) > 0.5) node.setSize([width, height]);
+        node.setDirtyCanvas?.(true, true);
+    }, 0);
     // 列表按实际内容收高，不把节点额外高度反复加回列表。
     for (const list of root.querySelectorAll(".ad-h3-media-list")) {
         list.style.height="auto";list.style.minHeight="0";list.style.maxHeight="none";

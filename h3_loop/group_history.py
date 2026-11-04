@@ -1,7 +1,70 @@
 """按真实组保存/恢复执行进度；旧版仅从仍可精确定位的预览文件恢复。"""
 from __future__ import annotations
+import uuid
 import copy,re
 from .storage import atomic_json,contained
+
+# 历史轮次回抽保留策略：默认只保留最近 10 轮可回抽（含当前轮）。
+REROLL_RETAIN_ROUNDS = 10
+
+
+def _load_snapshot(store,state,path):
+    import json
+    with contained(store.directory(state['id']),path).open(encoding='utf-8') as f:
+        return json.load(f)
+
+
+def rerollable_rounds(state):
+    """最近 N 轮（含当前轮）可回抽，更早的轮次只读。"""
+    current=int(state.get('round_no',1) or 1)
+    numbers={current}
+    for number in (state.get('group_snapshots') or {}):
+        try:
+            numbers.add(int(number))
+        except (TypeError,ValueError):
+            continue
+    ordered=sorted(numbers,reverse=True)
+    return set(ordered[:REROLL_RETAIN_ROUNDS])
+
+
+def ensure_rerollable(state,number):
+    if int(number) not in rerollable_rounds(state):
+        raise ValueError(
+            '该轮已超出回抽保留范围（默认只保留最近 %d 轮）：仍可预览/合并，但不能回抽。'
+            '如需回抽，请在最近的轮次中操作。' % REROLL_RETAIN_ROUNDS)
+
+
+def shared_relay_run_ids(store,state):
+    """旧数据可能出现多个历史组（或历史组与当前轮）共用同一条潜桥链目录。
+
+    只统计历史快照会漏掉“历史轮 == 当前轮链”的情况，回抽会读到被当前轮覆盖的 stage；
+    因此这里把当前会话自己的 relay_run_id 也计入参与者。
+    """
+    counts={}
+    for path in (state.get('group_snapshots') or {}).values():
+        try:
+            snapshot=_load_snapshot(store,state,path)
+        except (FileNotFoundError,ValueError,OSError):
+            continue
+        relay=str(snapshot.get('relay_run_id') or '')
+        if relay:
+            counts[relay]=counts.get(relay,0)+1
+    current=str(state.get('relay_run_id') or '')
+    if current:
+        counts[current]=counts.get(current,0)+1
+    return {relay for relay,count in counts.items() if count>1}
+
+
+def snapshot_path(state,number):
+    return (state.get('group_snapshots') or {}).get(str(int(number)))
+
+
+def save_snapshot(store,state,number,snapshot):
+    path=snapshot_path(state,number)
+    if not path:
+        return False
+    atomic_json(contained(store.directory(state['id']),path),snapshot)
+    return True
 
 def archive(store,state):
     number=int(state.get('round_no',1) or 1)
@@ -75,6 +138,8 @@ def lookup(store,state,number,records):
 def restore(store,state,number,records):
     candidate=lookup(store,state,number,records)
     archive(store,state)
+    if not candidate.get("relay_run_id"):
+        candidate["relay_run_id"] = state.get("relay_run_id") or uuid.uuid4().hex
     candidate.update(group_snapshots=copy.deepcopy(state.get('group_snapshots') or {}),
                      group_seq=max(int(state.get('group_seq',1)),int(state.get('round_no',1)),number),
                      epoch=int(state.get('epoch',0))+1,active=None,auto=False,pause_after=False,status='ready',error='')

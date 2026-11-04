@@ -20,13 +20,13 @@ def prepare_video_segments(raw_segments):
         start = raw.get("start")
         if not isinstance(start, (int, float)) or isinstance(start, bool) or not math.isfinite(start) or start < 0:
             raise ValueError(f"{name} 的起始秒数无效")
-        first = round(start * FPS)
+        first = math.floor(start * FPS + 0.5)
         end = raw.get("end")
         last = None
         if end is not None:
             if not isinstance(end, (int, float)) or isinstance(end, bool) or not math.isfinite(end) or end <= start:
                 raise ValueError(f"{name} 的结束秒数必须大于起始秒数")
-            last = round(end * FPS)
+            last = math.floor(end * FPS + 0.5)
             if last <= first:
                 raise ValueError(f"{name} 短于一帧，请调整起止时间")
         segments.append({"name": str(name), "start": float(start),

@@ -8,10 +8,11 @@
 from __future__ import annotations
 import json, math, os, re, shutil, stat, threading, time
 from pathlib import Path
-from .storage import ROOT, data_roots
+from .storage import ROOT, STORE, atomic_json, contained, data_roots
 
 CACHE_MIN_AGE = 600
 _TRIAL_MIN_AGE = 60
+_BUSY_STATUSES = {'queued', 'running', 'merging'}
 _USAGE_CACHE = {}
 _USAGE_CACHE_TTL = 2.0
 _LOCK = threading.RLock()
@@ -139,7 +140,9 @@ def _protected_refs():
                         progress = Path(entry.path) / 'progress.json'
                         if not progress.is_file(): continue
                         state = json.loads(progress.read_text(encoding='utf-8'))
-                    except OSError: continue
+                    except OSError:
+                        # 读不到进度时无法核对引用：与 JSON 损坏一致，阻断本次清理。
+                        return None
                     except (ValueError, AttributeError, RecursionError): return None
                     if not isinstance(state, dict): return None
                     if state.get('status') in {'queued', 'running', 'merging'}: return None
@@ -180,6 +183,12 @@ def _allowed_relative(relative: str) -> bool:
     if parent == 'media/derived':
         return bool(re.fullmatch(r'muted_[0-9a-f]{24}\.(mp4|mkv|mov|webm|avi|m4v)', name)
                     or re.fullmatch(r'[A-Za-z0-9_.-]+_[0-9]+\.wav', name))
+    if parent == 'thumbs':
+        # 卡片缩略图缓存：只允许按内容摘要命名的 webp。
+        return bool(re.fullmatch(r'[0-9a-f]{64}\.webp', name))
+    if parent == 'detect-temp':
+        # 智能切分的临时 wav；正常结束会主动删除，崩溃残留按可重建缓存清理。
+        return bool(re.fullmatch(r'[A-Za-z0-9_.-]+\.wav', name))
     if parent == 'frame-cache': return bool(re.fullmatch(r'frames_[A-Za-z0-9_-]+\.npy', name))
     if parent == 'import-staging': return bool(re.fullmatch(r'[0-9a-f]{32}\.part', name))
     parts = relative.split('/')
@@ -236,7 +245,8 @@ def plan_cache(min_age=CACHE_MIN_AGE):
     active_trials = _active_trial_ids()
     entries = []; now = time.time()
     for root in _roots():
-        for folder in [root/'media'/'derived', root/'frame-cache', root/'sessions', root/'import-staging']:
+        for folder in [root/'media'/'derived', root/'frame-cache', root/'sessions', root/'import-staging',
+                       root/'thumbs', root/'detect-temp']:
             for path, info in _files(folder):
                 if now - info.st_mtime < min_age: continue
                 try: relative = path.relative_to(root).as_posix()
@@ -373,12 +383,14 @@ def version_plan(keep_recent=3, min_age=0.0, group_limit=10):
                     if marker in seen:
                         continue
                     seen.add(marker)
-                    files.append({'path': marker, 'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns})
+                    files.append({'path': marker, 'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns,
+                                  'session': session.name, 'root': str(session),
+                                  'version': str(version.get('id')), 'field': key, 'name': str(name)})
         snapshots = state.get('group_snapshots') or {}
         if len(snapshots) > group_limit:
             ordered = sorted(((int(number), str(name)) for number, name in snapshots.items()
                               if str(number).isdigit()), reverse=True)
-            for _number, name in ordered[group_limit:]:
+            for number, name in ordered[group_limit:]:
                 path = session / name
                 try:
                     info = path.stat()
@@ -388,7 +400,9 @@ def version_plan(keep_recent=3, min_age=0.0, group_limit=10):
                 if marker in seen:
                     continue
                 seen.add(marker)
-                groups.append({'path': marker, 'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns})
+                groups.append({'path': marker, 'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns,
+                               'session': session.name, 'root': str(session),
+                               'number': str(number), 'name': str(name)})
     return {'files': files, 'groups': groups, 'versions': versions,
             'bytes': sum(item['bytes'] for item in files) + sum(item['bytes'] for item in groups)}
 
@@ -400,29 +414,63 @@ def _version_cache_bytes():
         return 0
 
 
+def _session_lock(session_id):
+    """会话锁；会话名不符合进度命名规则时返回 None（保守跳过该会话）。"""
+    try:
+        return STORE.lock(session_id)
+    except (ValueError, OSError):
+        return None
+
+
+def _mark_deleted_versions(state, marks):
+    """给被清理文件的版本记录打删除标记；只处理仍留在进度里的版本 id。"""
+    changed = False
+    rows = list(state.get('segments') or []) + list(state.get('retired_segments') or [])
+    for row in rows:
+        for version in row.get('versions') or []:
+            stamp = marks.get(str(version.get('id')))
+            if stamp is None:
+                continue
+            version['file_deleted'] = True
+            version['deleted_at'] = stamp
+            changed = True
+    return changed
+
+
 def _prune_group_snapshots(group_limit=10):
-    # 清理接口只在没有任务运行时调用，直接原子重写该会话进度，避免依赖内存中的 STORE 根目录。
-    from .storage import atomic_json
+    # 在会话锁内重读进度后删除超限组快照并同步写回，不再无锁整文件重写。
     for session in list(_session_dirs()):
-        state = _session_progress(session)
-        if not state:
+        lock = _session_lock(session.name)
+        if lock is None:
             continue
-        snapshots = state.get('group_snapshots') or {}
-        if len(snapshots) <= group_limit:
-            continue
-        ordered = sorted(((int(number), str(name)) for number, name in snapshots.items()
-                          if str(number).isdigit()), reverse=True)
-        for number, name in ordered[group_limit:]:
-            try:
-                (session / name).unlink()
-            except OSError:
-                pass
-            snapshots.pop(str(number), None)
-        state['group_snapshots'] = snapshots
-        try:
-            atomic_json(session / 'progress.json', state)
-        except OSError:
-            continue
+        with lock:
+            state = _session_progress(session)
+            if not state or state.get('status') in _BUSY_STATUSES:
+                continue
+            snapshots = state.get('group_snapshots') or {}
+            if len(snapshots) <= group_limit:
+                continue
+            ordered = sorted(((int(number), str(name)) for number, name in snapshots.items()
+                              if str(number).isdigit()), reverse=True)
+            changed = False
+            for number, name in ordered[group_limit:]:
+                try:
+                    path = contained(session, name)
+                except ValueError:
+                    path = None
+                if path is not None:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                if snapshots.pop(str(number), None) is not None:
+                    changed = True
+            state['group_snapshots'] = snapshots
+            if changed:
+                try:
+                    atomic_json(session / 'progress.json', state)
+                except OSError:
+                    continue
 
 
 def clean_versions(confirmed, keep_recent=3, min_age=0.0, group_limit=10):
@@ -434,17 +482,71 @@ def clean_versions(confirmed, keep_recent=3, min_age=0.0, group_limit=10):
     if not confirmed:
         return summary
     removed = freed = 0
-    for item in plan['files'] + plan['groups']:
-        path = Path(item['path'])
-        try:
-            info = path.stat()
-            if info.st_mtime_ns != item['mtime_ns']:
-                continue
-            path.unlink()
-            removed += 1
-            freed += item['bytes']
-        except OSError:
+    # 按会话分组：删除的围栏校验、busy 跳过与进度标记都在同一把会话锁内完成。
+    grouped = {}
+    for item in plan['files']:
+        grouped.setdefault(item['session'], {'root': Path(item['root']), 'files': [], 'groups': []})['files'].append(item)
+    for item in plan['groups']:
+        grouped.setdefault(item['session'], {'root': Path(item['root']), 'files': [], 'groups': []})['groups'].append(item)
+    for session_id, group in grouped.items():
+        root = group['root']
+        lock = _session_lock(session_id)
+        if lock is None:
             continue
+        with lock:
+            state = _session_progress(root)
+            if not state or state.get('status') in _BUSY_STATUSES:
+                continue
+            marks = {}
+            numbers = []
+            for item in group['files']:
+                try:
+                    path = contained(root, item['name'])
+                except ValueError:
+                    continue
+                try:
+                    info = path.stat()
+                    if info.st_mtime_ns != item['mtime_ns']:
+                        continue
+                    path.unlink()
+                except OSError:
+                    continue
+                removed += 1
+                freed += item['bytes']
+                marks[item['version']] = time.time()
+            for item in group['groups']:
+                try:
+                    path = contained(root, item['name'])
+                except ValueError:
+                    continue
+                try:
+                    info = path.stat()
+                    if info.st_mtime_ns != item['mtime_ns']:
+                        continue
+                    path.unlink()
+                except OSError:
+                    continue
+                removed += 1
+                freed += item['bytes']
+                numbers.append(item['number'])
+            if not marks and not numbers:
+                continue
+            # 删除成功后锁内重读进度，给版本记录加删除标记并同步移除已删组快照。
+            latest = _session_progress(root)
+            if not latest or latest.get('status') in _BUSY_STATUSES:
+                continue
+            changed = _mark_deleted_versions(latest, marks) if marks else False
+            if numbers:
+                snapshots = latest.get('group_snapshots') or {}
+                for number in numbers:
+                    if snapshots.pop(str(number), None) is not None:
+                        changed = True
+                latest['group_snapshots'] = snapshots
+            if changed:
+                try:
+                    atomic_json(root / 'progress.json', latest)
+                except OSError:
+                    pass
     _prune_group_snapshots(group_limit)
     if removed:
         _invalidate_usage()
@@ -531,20 +633,23 @@ class ImportReservation:
 
 
 def copy_import(source,target):
-    """失败只移除本次新建文件，不覆盖已有素材。"""
+    """失败只移除本次新建文件，不覆盖已有素材。
+
+    整文件复制不占用全局 _LOCK：额度基线由 ImportReservation 自身加锁维护，
+    这里只保留“独占创建 + 大小校验 + 失败清理”的原子语义，避免大文件阻塞其它导入/统计。
+    """
     source,target=Path(source),Path(target)
     reservation=ImportReservation(); created=False
     try:
         reservation.grow(source.stat().st_size)
         target.parent.mkdir(parents=True,exist_ok=True)
-        with _LOCK:
-            with target.open('xb') as output:
-                created=True
-                with source.open('rb') as incoming: shutil.copyfileobj(incoming,output)
-            if target.stat().st_size != reservation.bytes:
-                raise ValueError('导入时源素材大小发生变化，请稍后重试')
-            shutil.copystat(source,target)
-            reservation.close(committed=True)
+        with target.open('xb') as output:
+            created=True
+            with source.open('rb') as incoming: shutil.copyfileobj(incoming,output)
+        if target.stat().st_size != reservation.bytes:
+            raise ValueError('导入时源素材大小发生变化，请稍后重试')
+        shutil.copystat(source,target)
+        reservation.close(committed=True)
     except Exception:
         if created: target.unlink(missing_ok=True)
         raise

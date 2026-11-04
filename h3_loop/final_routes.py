@@ -36,7 +36,7 @@ def prepare_final(prompt,final_id,records):
         visiting.remove(identifier);visited.add(identifier)
     visit(final_id)
     if len(previews)!=1:
-        raise ValueError('加工所选需要且只能连接一个分段预览来源；普通最终保存可直接连接媒体后运行')
+        raise ValueError('加工所选需要且只能连接一个分段预览来源；请从分段预览媒体口接入处理链后点击加工所选')
     if not isinstance(records,list) or not records: raise ValueError('请先在来源预览中单击或Ctrl选择成果')
     resolved=[describe_record(record) for record in records]
     if len({r['kind'] for r in resolved})!=1:

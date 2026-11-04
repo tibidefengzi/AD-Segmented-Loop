@@ -29,10 +29,12 @@ MAX_VIDEO_PORTS = 3
 MAX_AUDIO_PORTS = 3
 HALF_FRAME = 0.5 / FPS
 KINDS = {"audio", "video", "image"}
+# H3 单段帧数上限兜底：前端分段配方的默认值与前端保持一致，避免无参数时按旧值切段。
+DEFAULT_SEGMENT_MAX_FRAMES = 362
 
-# 新节点默认：无素材、2×124 帧 @24fps（总 248 帧 ≈ 10.333s）
-_DEFAULT_SEG_FRAMES = 124
-_DEFAULT_SEG_COUNT = 2
+# 新节点默认：无素材、3×243 帧 @24fps（总 729 帧 = 30.375s），与前端默认分段配方一致。
+_DEFAULT_SEG_FRAMES = 243
+_DEFAULT_SEG_COUNT = 3
 EMPTY_TIMELINE = json.dumps({
     "version": TIMELINE_VERSION,
     "segmentation": "clips",
@@ -41,7 +43,7 @@ EMPTY_TIMELINE = json.dumps({
     "video_tracks": [[], [], []],
     "audio_tracks": [[], [], []],
     "images": [],
-    "split_points": [_DEFAULT_SEG_FRAMES / FPS],
+    "split_points": [_DEFAULT_SEG_FRAMES * index / FPS for index in range(1, _DEFAULT_SEG_COUNT)],
     "segment_recipe": {"frames": _DEFAULT_SEG_FRAMES, "count": _DEFAULT_SEG_COUNT, "unit": "f"},
 }, separators=(",", ":"), ensure_ascii=False)
 
@@ -810,4 +812,4 @@ def loop_settings(state):
     return {"overlap_frames": number("overlap_frames", 0),
             "guard_frames": number("guard_frames", 0),
             "reanchor_every": number("reanchor_every", 0),
-            "max_frames": number("max_frames", DEFAULT_SEGMENT_MAX_FRAMES if "DEFAULT_SEGMENT_MAX_FRAMES" in globals() else 362)}
+            "max_frames": number("max_frames", DEFAULT_SEGMENT_MAX_FRAMES)}

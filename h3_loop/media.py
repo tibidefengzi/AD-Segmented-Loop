@@ -72,7 +72,9 @@ def normalize_video(video,context,state,directory,strict_sync=False):
     images, alpha_pre, snap_info = snap_images_to_h3(images, components.alpha)
     validate_resolution(images.shape[2],images.shape[1])
     entry=state["segments"][context["index"]]["entry"]
-    target=target_frames(entry["seconds_float"])
+    # 潜桥开启时输出目标已量化为 17n，上下文中的 target_frames 才是本段最终帧数。
+    relay_active = bool(context.get("relay_run_id"))
+    target = int(context.get("target_frames")) if relay_active and context.get("target_frames") else target_frames(entry["seconds_float"])
     overlap=int(context.get("overlap_frames",0))
     available=int(images.shape[0])
     # Continuum Finish already strips Join context. Commit must keep the first
@@ -111,7 +113,7 @@ def normalize_video(video,context,state,directory,strict_sync=False):
         rate=int(audio["sample_rate"])
         # Continuum continuation body is shorter by trim; keep A/V length matched.
         body_seconds = commit_target / FPS
-        original_samples=round(body_seconds*rate) if continuum_trimmed else round(entry["seconds_float"]*rate)
+        original_samples=round(body_seconds*rate) if (continuum_trimmed or relay_active) else round(entry["seconds_float"]*rate)
         waveform=audio["waveform"]
         # A generated soundtrack may contain the guide pre-roll; a supplied
         # target soundtrack already starts at the current segment boundary.

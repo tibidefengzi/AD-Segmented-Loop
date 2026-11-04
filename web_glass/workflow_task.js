@@ -1,6 +1,7 @@
 import {app} from "../../scripts/app.js";
+import { injectHiddenRelay } from "./relay_hidden.js";
 import {api} from "../../scripts/api.js";
-import {loadCachedTask,rememberTask} from "./workflow_task_cache.js?v=20261102-group-v64";
+import {loadCachedTask,rememberTask} from "./workflow_task_cache.js";
 
 const runtime=new WeakMap();
 let fallbackWarned=false;
@@ -103,5 +104,9 @@ export function stampSubmission(serialized,graph=app.graph){
             node.inputs.source_record=JSON.stringify({...source,final_task_id:meta.id});
         }
     }
-    serialized.workflow||={};serialized.workflow.extra||={};serialized.workflow.extra.ad_segmented_task=structuredClone(meta);return serialized;
+    serialized.workflow||={};serialized.workflow.extra||={};serialized.workflow.extra.ad_segmented_task=structuredClone(meta);
+    // 注入失败必须阻断本次提交：静默跳过后后台仍会按潜桥规则改变生成长度，
+    // 会得到“没有桥/没有裁头”的错位成片，比报错更难排查。
+    injectHiddenRelay(serialized, graph);
+    return serialized;
 }

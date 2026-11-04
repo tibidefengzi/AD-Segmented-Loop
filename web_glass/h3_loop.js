@@ -2,19 +2,20 @@
 // cachebust 20261025-0440 segment-dedupe-materials
 // CACHEBUST 2026-10-25-restore-v027-approved-043100
 // CACHEBUST 20261102-group-v64：统一 web_glass 模块版本号，模块去重并避免沿用旧缓存
-import "./ad_theme.js?v=20261102-group-v64";
-import {ensureWorkflowTask,currentTaskId} from "./workflow_task.js?v=20261102-group-v64";
+import "./ad_theme.js";
+import {ensureWorkflowTask,currentTaskId} from "./workflow_task.js";
 // final_output.js由ComfyUI作为扩展入口自动加载，不重复注册。
-import { installGlassTheme } from "./glass_ui.js?v=20261102-group-v64";
-import { executeQueueOnce, interruptOwnedPrompt } from "./queue_runner.js?v=20261102-group-v64";
+import { installGlassTheme } from "./glass_ui.js";
+import { executeQueueOnce, interruptOwnedPrompt } from "./queue_runner.js";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js?v=20261102-group-v64";
-import { mountNativePlayer } from "./native_player.js?v=20261102-group-v64";
-import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js?v=20261102-group-v64";
-import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js?v=20261102-group-v64";
+import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js";
+import { mountNativePlayer } from "./native_player.js";
+import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js";
+import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js";
 
-import { installRoundQueue } from "./round_queue.js?v=20261102-group-v64";
+import { installRoundQueue } from "./round_queue.js";
+import { migrateLegacyRelay, hideInternalNodeTypes, hideLegacyTypesAfterLoad, restoreLegacyTypesForGraph, prepareSegmentNode, normalizeRelayWidget, relayValue } from "./relay_hidden.js";
 installRoundQueue(api, app);
 installProgressEvents(api);
 
@@ -37,6 +38,7 @@ styles.textContent = `
 .ad-h3-prompt-area{display:block;width:100%;max-width:100%;height:226px!important;min-height:226px!important;resize:none;background:rgba(15,20,30,.92);color:#e8eef7;border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:8px 10px;font:13px/1.5 'Microsoft YaHei',system-ui,sans-serif;box-sizing:border-box;outline:none}.ad-h3-prompt-area::placeholder{color:rgba(200,214,235,.42);white-space:pre-line;line-height:1.5}
 .ad-h3-prompt-area.ad-h3-negative-area{height:120px!important;min-height:120px!important;max-height:120px!important}
 .ad-h3-prompt-hint{font-size:11px;line-height:1.5;color:rgba(200,214,235,.55);padding:2px 8px 6px;white-space:normal}
+  .ad-h3-relay-hint{font-size:11px;line-height:1.5;color:#9fdcff;padding:3px 10px 5px;white-space:normal;border-left:2px solid #4d9bd8;background:rgba(40,90,130,.18);margin:1px 6px 4px}
 .ad-h3-resolution-badge{display:block;width:100%;box-sizing:border-box;font-size:16px;font-weight:700;color:#cfd9e8;padding:3px 6px;margin:0 0 4px;letter-spacing:.5px;text-align:center;line-height:1.3;min-height:24px}
 .dom-widget:has(> .ad-h3-video),.dom-widget:has(.ad-h3-video){pointer-events:none!important}
 .dom-widget:has(.aiden-h3){pointer-events:none!important}
@@ -137,12 +139,8 @@ styles.textContent = `
 `;
 document.head.appendChild(styles);
 
-const label = {ready:"待生成",queued:"已排队",running:"生成中",review:"已完成待继续",paused:"已停止",completed:"全部完成",merging:"正在合并",error:"出错了"};
-const natural = new Intl.Collator(undefined, {numeric:true, sensitivity:"base"});
-const esc = value => String(value).replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
-const mediaUrl = (origin, file) => api.apiURL(`/aiden_h3/media/${origin}/${file.split("/").map(encodeURIComponent).join("/")}`);
 const chineseLabels={index:"段号",multiple:"对齐倍数",media:"媒体",positive_prompt:"正向提示词",negative_prompt:"反向提示词",round_image:"本段图像",round_audio:"本段音频",round_video:"本段视频",source_latent:"源视频编码",latent:"音视频潜变量",queue:"分段清单",queue_state:"素材清单",video_queue:"(已弃用)视频分段清单",video_queue_state:"视频分段清单（JSON）",audio_oasis_ui:"音频预览",session_id:"进度名称",fps:"帧率",run_token:"执行标识",overlap_frames:"重叠帧数",guard_frames:"保护帧数",aspect_ratio:"宽高比",megapixels:"百万像素",reanchor_every:"重锚定间隔（段）",max_frames:"单段生成帧数上限",context:"当前段上下文",audio:"本段音频",guide_audio:"含重叠前导音频",prompt_index:"索引号",multiline:"多行模式",seconds_float:"时长（小数秒）",seconds_int:"时长（整数秒）",generation_frames:"本段帧数",start_frame:"起始帧（源）",target_frames:"目标帧数",filename:"素材文件名",video_frames:"视频画面",mask:"遮罩",segment:"覆盖段号（0为全局）",mode:"参考模式",previous:"上一级参考",references:"参考设置",frames:"历史画面帧数",previous_tail:"前段保真尾帧",best_handoff:"最佳交接参考帧",has_history:"存在前段历史",video:"视频",strict_sync:"严格音画同步",prompt_text:"实际提示词",video_oasis_ui:"视频预览",strings:"分段提示词",select:"生成段号",global_prefix:"统一提示词前缀",global_suffix:"统一提示词后缀",prompt:"提示词",width:"画面宽度",height:"画面高度"};
-const chineseTitles={AidenH3EditMask:"角色替换遮罩适配",AidenH3AudioQueue:"素材准备",AidenH3VideoQueue:"视频分段清单",AidenH3Segment:"分段生成",AidenH3SegmentMedia:"视频与遮罩取段",AidenH3References:"全局与本段参考",AidenH3PickReferences:"当前段参考",AidenH3PreviousFrames:"前段末尾画面",AidenH3Commit:"记录分段结果",AidenH3VideoPreview:"分段预览",AidenH3Prompt:"分段提示词",AidenH3Resolution:"分辨率",AidenH3MergedVideo:"读取合并结果",AidenH3ContinuumStatus:"续段检测",AidenH3ContinuumPrepare:"续段准备",AidenH3ContinuumCapture:"续段存档",AidenH3ContinuumRecall:"续段调取",};
+const chineseTitles={AidenH3EditMask:"角色替换遮罩适配",AidenH3AudioQueue:"素材准备",AidenH3VideoQueue:"视频分段清单",AidenH3Segment:"分段生成",AidenH3SegmentMedia:"视频与遮罩取段",AidenH3References:"全局与本段参考",AidenH3PickReferences:"当前段参考",AidenH3Commit:"记录分段结果",AidenH3VideoPreview:"分段预览",AidenH3Prompt:"分段提示词",AidenH3Resolution:"分辨率",AidenH3MergedVideo:"读取合并结果",AidenH3ContinuumStatus:"续段检测",AidenH3ContinuumPrepare:"续段准备",AidenH3ContinuumCapture:"续段存档",AidenH3ContinuumRecall:"续段调取",};
 
 function adEnsureWidgetOptions(widget){
     if(!widget) return null;
@@ -316,15 +314,13 @@ function followRunningSegment(viewer, state) {
 function mountReview(node) {
     if(node._aidenH3Review)return;
     node._aidenH3Review=true;
-    // 「循环控制」面板按用户要求移除：不再创建/挂载 DOM 控件，仅保留后台状态机（刷新/批量/提示）。
-    const root=document.createElement("div");root.className="aiden-h3";
-    root.innerHTML=`<div class="h3-status"></div><div class="h3-message"></div><div class="h3-list"></div>`;
-    const status=root.querySelector(".h3-status"),message=root.querySelector(".h3-message"),list=root.querySelector(".h3-list");
-    const compare=document.createElement("div");compare.className="h3-compare";compare.hidden=true;
-    let disposed=false,busy=false,lastState=null,lastSession="",lastRendered="",connectionFailed=false,lastETag="";
+    // 「循环控制」面板按用户要求移除：不再创建 root/status/message/list/compare 等游离 DOM，
+    // 也不再做 innerHTML/querySelectorAll 重绘；只保留轮询刷新、lastState 与对外接口。
+    // 提示统一转发到预览播放器的提示条（node._adH3Hint 由 mountNativePlayer 提供）。
+    let disposed=false,busy=false,lastState=null,lastSession="",connectionFailed=false,lastETag="";
     let refreshing=false,lastPolled=0,lastPayload="";
     node._adH3FollowCurrent = () => lastState && followRunningSegment(node, {...lastState, status: "queued"});
-    const say=(text,error=false)=>{message.textContent=text;message.classList.toggle("error",error);try{node._adH3Hint?.(text,error);}catch{}};
+    const say=(text,error=false)=>{try{node._adH3Hint?.(text,error);}catch{}};
     function sessionId(segment){
         if(segment?.properties?.ad_task_session)return segment.properties.ad_task_session;
         const frozen = segment?.properties?.ad_execution_round;
@@ -353,53 +349,20 @@ function mountReview(node) {
         const link = graph?.links?.get?.(input?.link) || graph?.links?.[input?.link];
         updateSessionProgress(node, segment, link && graph?.getNodeById?.(link.origin_id), state);
         node._adH3Preview?.updateState(state);
-        const shownIndex=Math.min(Math.max(Number(state.cursor)||0,0),Math.max(0,state.segments.length-1));
-        status.textContent=`第 ${shownIndex+1}/${state.segments.length} 段 · ${label[state.status]||state.status}`;
         if(state.error)say(state.error,true);
-        const running=["queued","running","merging"].includes(state.status);
-        const row=state.segments[state.cursor];
-        const canMerge=state.segments.every(item=>item.valid&&item.accepted);
-        const enabled={start:!running&&!row?.valid,
-            redo:!running,auto:!running,merge:!running&&canMerge,clear:!running,
-            run_segment:!running,run_pending:!running};
-        for(const button of root.querySelectorAll("[data-command]"))button.disabled=busy||!enabled[button.dataset.command];
-        const renderKey=JSON.stringify([state.segments,state.cursor,state.merged,state.manifest,state.merge_options,running]);
-        if(renderKey===lastRendered)return;
-        lastRendered=renderKey;
-        let cumulative=0;
-        list.innerHTML=state.segments.map((row,i)=>{
-            const version=row.versions.find(version=>version.id===row.selected);
-            const text=row.valid?(row.accepted?"已生成":"生成中"):(row.versions.length?"待更新":"未生成");
-            const source=version?`<a href="${esc(mediaUrl("session",`${state.id}/${version.file}`))}" target="_blank" rel="noopener">播放</a>`:"";
-            const options=row.versions.filter(version=>!version.archived).map((version,j)=>`<option value="${esc(version.id)}" ${version.id===row.selected?"selected":""}>版本 ${j+1}</option>`).join("");
-            cumulative+=version?.sync_error_ms||0;
-            const sync=version?`<div class="h3-scores">${version.frames} 帧 · 本段偏差 ${(version.sync_error_ms||0).toFixed(3)} ms · 累计 ${cumulative.toFixed(3)} ms${version.reanchor?" · 原始参考重锚定":""}${version.reference_transition?" · 参考集已切换，请检查场景衔接":""}</div>`:"";
-            return `<div class="h3-review-row ${i===state.cursor?"h3-current":""}"><span>第 ${i+1} 段 · ${text}</span>${source}${row.versions.length?`<select data-version="${i}" aria-label="第 ${i+1} 段版本">${!row.selected?'<option value="">选择版本</option>':""}${options}</select>`:""}${row.versions.length>1?`<button data-compare="${i}">A/B 对比</button>`:""}${sync}</div>`;
-        }).join("");
-        if(state.merged)list.insertAdjacentHTML("beforeend",`<div class="h3-review-row"><a href="${esc(mediaUrl("session",`${state.id}/${state.merged}`))}" target="_blank" rel="noopener">打开最终合并视频</a></div>`);
-        if(state.segments.every(row=>row.valid&&row.accepted))list.insertAdjacentHTML("beforeend",`<a href="${esc(api.apiURL(`/aiden_h3/export/${encodeURIComponent(state.id)}`))}" download>导出分段清单</a>`);
-        list.querySelectorAll("[data-version]").forEach(select=>{select.disabled=running;select.onchange=()=>void act("select",{index:Number(select.dataset.version),version:select.value});});
-        list.querySelectorAll('a[href]:not([download])').forEach(link=>link.onclick=event=>{
-            event.preventDefault();node._adH3Preview?.show({url:link.href,label:link.textContent,kind:"review"});
-        });
-        list.querySelectorAll("[data-compare]").forEach(button=>button.onclick=()=>showCompare(Number(button.dataset.compare)));
-    }
-    function showCompare(index){
-        compare.hidden=false;
-        const row=lastState.segments[index];
-        const selected=row.versions.findIndex(v=>v.id===row.selected);
-        compare.innerHTML=[Math.max(0,selected-1),Math.max(0,selected)].map((value,side)=>`<figure><figcaption>${side?"B":"A"} · 第 ${index+1} 段</figcaption><select aria-label="${side?"B":"A"} 版本">${row.versions.map((v,j)=>`<option value="${j}" ${j===value?"selected":""}>版本 ${j+1}${v.id===row.selected?"（当前选用）":""}</option>`).join("")}</select><button>查看 ${side?"B":"A"}</button></figure>`).join("");
-        compare.querySelectorAll("figure").forEach((figure,side)=>{
-            const select=figure.querySelector("select");
-            figure.querySelector("button").onclick=()=>node._adH3Preview?.show({
-                url:mediaUrl("session",`${lastState.id}/${row.versions[Number(select.value)].file}`),
-                label:`${side?"B":"A"} · 第 ${index+1} 段 · 版本 ${Number(select.value)+1}`,kind:"compare"});
-        });
-        const close=document.createElement("button");close.textContent="关闭对比";close.onclick=()=>{compare.replaceChildren();compare.hidden=true;};compare.append(close);
-        say("选择 A/B 版本后在同一播放器切换查看；不会改变当前选用版本。");
     }
     node._adH3BatchStop = false;
     let actionRevision=0;
+    // 抽卡（redo_preview）被停止/被其它操作打断时，统一调用 cancel_preview 清理后台 preview_hold，
+    // 不把没排队成功或已作废的抽卡占位留在会话里。
+    async function cancelPreviewHold(segment, previewId, reason) {
+        const session = sessionId(segment);
+        if (!session) return;
+        try {
+            await request("/aiden_h3/action", {command:"cancel_preview", session_id:session, reason:reason || "抽卡中断",
+                ...(previewId ? {preview_id:previewId} : {})});
+        } catch {}
+    }
     async function act(command,extra={}) {
         if(command==="stop") {
             node._adH3BatchStop=true;node._adH3StopEpoch=(Number(node._adH3StopEpoch)||0)+1;
@@ -428,35 +391,53 @@ function mountReview(node) {
             let result=null;
             let effective=command;
             try{
-                // 停止后改了种子：点开始应使用新种子重跑当前段，而不是接受旧结果继续。
+                // 停止后改种子/参数：点开始应按新设置重跑当前段，而不是接受旧结果继续。
                 if(command==="start" && lastState?.status==="paused"){
-                    const row=lastState.segments?.[lastState.cursor];
+                    let fresh=lastState;
+                    try{
+                        // 先同步当前画布拿到最新段签名；否则可能用旧数据误判“参数没变”而自动接受旧结果。
+                        fresh=await request("/aiden_h3/sync",{segment_node:String(segment.id),prompt:serialized.output,
+                            workflow:serialized.workflow,client_id:api.clientId,auto_accept:true});
+                        if(operation!==actionRevision)return false;
+                        draw(fresh);
+                    }catch(_error){}
+                    if(operation!==actionRevision)return false;
+                    const row=fresh?.segments?.[fresh.cursor];
                     const version=(row?.versions||[]).find(v=>v.id===row?.selected);
-                    if(row?.valid && row?.selected && version?.seeds){
-                        const norm=obj=>Object.fromEntries(Object.entries(obj||{}).filter(([,v])=>v&&typeof v==="object")
-                            .map(([k,v])=>[k,Object.fromEntries(Object.entries(v).map(([a,b])=>[a,String(b)]))]));
-                        const now={};
-                        for(const [nid,nd] of Object.entries(serialized.output||{})){
-                            const inputs=nd?.inputs||{},seeds={};
-                            for(const k of ["seed","noise_seed"])if(k in inputs)seeds[k]=inputs[k];
-                            if(Object.keys(seeds).length)now[nid]=seeds;
-                        }
-                        if(JSON.stringify(norm(now))!==JSON.stringify(norm(version.seeds))){
-                            effective="redo";say("检测到种子已修改，正在用新种子重跑当前段…");
-                        }else{
-                            effective="approve";
+                    if(row?.valid && row?.selected){
+                        const paramsChanged=!!(version?.signature && row?.signature && version.signature!==row.signature);
+                        if(paramsChanged){
+                            // 参数/素材已改：保持 start，由后端把旧结果留作历史版本并按新设置重跑当前段。
+                            say("检测到参数/素材已修改，正在按新设置重跑当前段…");
+                        }else if(version?.seeds){
+                            const norm=obj=>Object.fromEntries(Object.entries(obj||{}).filter(([,v])=>v&&typeof v==="object")
+                                .map(([k,v])=>[k,Object.fromEntries(Object.entries(v).map(([a,b])=>[a,String(b)]))]));
+                            const now={};
+                            for(const [nid,nd] of Object.entries(serialized.output||{})){
+                                const inputs=nd?.inputs||{},seeds={};
+                                for(const k of ["seed","noise_seed"])if(k in inputs)seeds[k]=inputs[k];
+                                if(Object.keys(seeds).length)now[nid]=seeds;
+                            }
+                            if(JSON.stringify(norm(now))!==JSON.stringify(norm(version.seeds))){
+                                effective="redo";say("检测到种子已修改，正在用新种子重跑当前段…");
+                            }else{
+                                effective="approve";
+                            }
                         }
                     }
                 }
                 result=await request("/aiden_h3/action",{command:effective,session_id:sessionId(segment),segment_node:String(segment.id),
                     prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,confirmed:command==="clear",auto_accept:true,...extra});
-                if(operation!==actionRevision)return false;
+                previewId=result?.preview_hold?.request_id||"";
+                if(operation!==actionRevision){
+                    if(command==="redo_preview"||effective==="redo_preview")await cancelPreviewHold(segment,previewId,"抽卡被打断");
+                    return false;
+                }
                 if (command === "clear" || command === "new_group") {
                     if(segment.properties) delete segment.properties.ad_execution_round;
                     if(node.properties) delete node.properties.ad_execution_round;
                     if(command === "new_group")node._adH3Preview?.resetGroupSelection?.();
                 }
-                previewId=result?.preview_hold?.request_id||"";
                 command=effective;
                 draw(result);
             }catch(error){
@@ -465,7 +446,7 @@ function mountReview(node) {
                 if(queueLinked || !["redo","redo_preview","start"].includes(command)) throw error;
             }
             const messages={stop:"已停止：当前生成已中断，分段循环待命；可点任意预览后「本段抽卡」，抽完点「开始」续接分段循环。",
-                new_group:"已新建一组，旧成果保留；点开始或分段循环生成。",clear:"已重置本轮进度；组号、预览与已生成文件保留。",redo:"已重置当前段，正在重新抽卡…",redo_preview:"正在本段抽卡（新结果将直接作为该段当前选用）…",
+                new_group:"已归档当前轮并新建一组；旧轮可在历史组回抽，预览与已生成文件保留。",clear:"已归档当前轮并进入下一轮；旧轮可在历史组回抽，预览与已生成文件保留。",redo:"已重置当前段，正在重新抽卡…",redo_preview:"正在本段抽卡（新结果将直接作为该段当前选用）…",
                 start:"已开始生成当前段…",approve:"已接受当前段。",auto:"已开始分段循环。",merge:"合并操作已完成。",
                 run_segment:"已切换到指定段：点「开始」只生成这一段，通过后自动回到原进度位置。",
                 run_pending:"已定位到待生成/待更新段：点「开始」只生成这一段，通过后自动回到原进度位置。"};
@@ -474,18 +455,21 @@ function mountReview(node) {
             if(command==="redo_preview"){
                 const stopEpoch=Number(node._adH3StopEpoch)||0;
                 const queued=await executeQueueOnce(app,api,segment.id,{isStopped:()=>(Number(node._adH3StopEpoch)||0)!==stopEpoch,owner:node});
-                if(operation!==actionRevision)return false;
-                if(queued.stopped){node._adH3ActionCancelled=true;say("本段抽卡已停止，原循环位置已恢复。");return false;}
+                if(operation!==actionRevision){await cancelPreviewHold(segment,previewId,"抽卡被打断");return false;}
+                if(queued.stopped){node._adH3ActionCancelled=true;await cancelPreviewHold(segment,previewId,"抽卡已停止");say("本段抽卡已停止，原循环位置已恢复。");return false;}
                 for (let attempt=0;attempt<40;attempt++) {
                     const response=await api.fetchApi("/aiden_h3/session/"+encodeURIComponent(sessionId(segment))+"?t="+Date.now(),{cache:"no-store"});
                     const state=await response.json();
                     if (!response.ok) throw new Error(state.error || "读取试跑结果失败");
                     draw(state);
+                    if(operation!==actionRevision){await cancelPreviewHold(segment,previewId,"抽卡被打断");return false;}
                     if (!state.draft_trial) {result=state;break;}
                     await new Promise(resolve=>setTimeout(resolve,100));
                 }
                 if(result?.draft_trial) throw new Error("试跑已结束，等待结果登记，请稍后再继续");
-                say("本段抽卡完成：新结果已作为该段当前选用；点「开始」继续原循环。");
+                if(operation!==actionRevision){await cancelPreviewHold(segment,previewId,"抽卡被打断");return false;}
+                say(result?.trial_notice
+                    || "本段抽卡完成：新结果已作为该段当前选用；点「开始」继续原循环。");
             }else if(command==="redo"||command==="start"){
                 // 含“记录分段结果”的工作流由后台 action start 直接排队；此时前端不能再排一次，
                 // 否则第二次提交会被 round/prepare 拒绝并显示红色报错（后台其实已在生成）。
@@ -514,18 +498,20 @@ function mountReview(node) {
             }
         return result || true;
         }catch(error){
-            if(operation!==actionRevision)return false;
+            const stale=operation!==actionRevision;
             const detail=error?.message||String(error);
+            if(stale){
+                if(command==="redo_preview")await cancelPreviewHold(segment,previewId,detail);
+                return false;
+            }
             node._adH3LastActionError=detail;
             if(command==="redo_preview"){
                 if(previewId)try{await request("/aiden_h3/action",{command:"cancel_preview",session_id:sessionId(segment),reason:detail,preview_id:previewId});}catch{}
-                if(operation!==actionRevision)return false;
                 say("本段抽卡未成功排队或执行失败："+detail,true);
             }else say(detail,true);
             return false;
         }finally{if(operation===actionRevision){busy=false;void refresh();}}
     }
-    root.querySelectorAll("[data-command]").forEach(button=>button.onclick=()=>button.dataset.command==="auto"?void node._adH3Batch({merge:false}):void act(button.dataset.command));
     node._adH3Act = act;
     node._adH3QueueOwned = async () => {
         const segment = upstreamSegment(node);
@@ -815,9 +801,9 @@ function mountReview(node) {
         const interval=lastState && ["queued","running","merging"].includes(lastState.status)?2000:10000;
         if(!force && Date.now()-lastPolled<interval)return;
         const segment=upstreamSegment(node);const current=sessionId(segment);
-        if(!segment){ status.textContent="连接「当前段上下文」后启用循环控制。"; for(const button of root.querySelectorAll("[data-command]")) button.disabled=true; return; }
+        if(!segment)return;
         if(!current)return;
-        if(current!==lastSession){lastETag="";lastSession=current;lastState=null;lastRendered="";list.textContent="";compare.querySelectorAll("video").forEach(video=>video.pause());compare.replaceChildren();compare.hidden=true;}
+        if(current!==lastSession){lastETag="";lastSession=current;lastState=null;}
         refreshing=true;lastPolled=Date.now();
         try{
             const response=await api.fetchApi(`/aiden_h3/session/${encodeURIComponent(current)}`, {cache:"no-store",headers:lastETag ? {"If-None-Match":lastETag} : {}});
@@ -829,12 +815,6 @@ function mountReview(node) {
             }
             if(response.status===404){lastETag="";
                 if(connectionFailed){say("");connectionFailed=false;}
-                const standaloneReady=!!node._adH3StandaloneReady;
-                status.textContent=standaloneReady?"独立模式 · 本次结果可用":"已连接 · 可以开始第一段";
-                root.querySelectorAll("[data-command]").forEach(button=>{
-                    const allowed=["start","auto"].includes(button.dataset.command)||(button.dataset.command==="approve"&&standaloneReady);
-                    button.disabled=busy||!allowed;
-                });
                 return;
             }
             const state=await response.json();if(!response.ok)throw new Error(state.error);
@@ -1003,7 +983,8 @@ function applySegmentOutputLabels(node) {
         generation_frames: "本段帧数", fps: "帧率", width: "画面宽度", height: "画面高度",
         positive_prompt: "正向提示词", negative_prompt: "反向提示词",
         round_image: "本段图像", round_audio: "本段音频", round_video: "本段视频",
-        source_video: "源视频", original_audio: "源音频", mask_frames: "遮罩专用"};
+        source_video: "源视频", original_audio: "源音频", mask_frames: "遮罩专用",
+        };
     const refLabel = name => {
         const match = String(name || "").match(/^ref_(image|video_audio|video|audio)_(\d+)$/);
         if (!match) return "";
@@ -1356,6 +1337,78 @@ function mountPromptHint(node) {
     widget.computeSize = width => [width, 34];
 }
 
+function reorderSegmentWidgets(node) {
+    const list = node.widgets || [];
+    const selector = list.find(item => item.name === "潜桥续接");
+    if (!selector) return;
+    const current = list.indexOf(selector);
+    if (current < 0) return;
+    // 用户要求：潜桥续接放在宽高比上方，占一行；后端 schema 与旧的 widget_values 顺序不同，这里统一重排。
+    list.splice(current, 1);
+    const aspect = list.findIndex(item => item.name === "aspect_ratio");
+    list.splice(aspect >= 0 ? aspect : 0, 0, selector);
+}
+
+function mountRelayHint(node) {
+    if (!node || node._adH3RelayHintMounted) return;
+    node._adH3RelayHintMounted = true;
+    normalizeRelayWidget(node);
+    const connectedQueue = () => {
+        try {
+            const input = (node.inputs || []).find(item => item.name === "queue");
+            const link = input?.link != null ? (node.graph?.links?.get?.(input.link) || node.graph?.links?.[input.link]) : null;
+            return link ? node.graph?.getNodeById?.(link.origin_id) : null;
+        } catch (_error) { return null; }
+    };
+    const applyMaterialPlan = () => {
+        if (app.configuringGraph) return;
+        const value = relayValue(selector?.value);
+        if (!value) return;
+        const queue = connectedQueue();
+        if (queue && typeof queue._adH3ApplyRelayPlan === "function") queue._adH3ApplyRelayPlan(value);
+    };
+    const el = document.createElement("div");
+    el.className = "ad-h3-relay-hint";
+    const selector = (node.widgets || []).find(item => item.name === "潜桥续接");
+    const messages = {
+        0: "关闭：按原有逐段生成，不启用潜桥。",
+        5: "开启 C=5：每段输出=17n，H3生成=输出+5，裁头5帧。",
+        22: "开启 C=22（推荐）：每段输出=17n，H3生成=输出+22，裁头22帧。",
+        39: "开启 C=39：每段输出=17n，H3生成=输出+39，裁头39帧。",
+    };
+    const update = () => {
+        normalizeRelayWidget(node);
+        const value = relayValue(selector?.value);
+        el.textContent = messages[value] || messages[0];
+    };
+    const widget = node.addDOMWidget("ad_h3_relay_hint", "div", el, {
+        serialize: false, hideOnZoom: false, getHeight: () => 30,
+    });
+    widget.serialize = false;
+    widget.computeSize = width => [width, 30];
+    bindWidgetWidth(node, widget);
+    try {
+        const list = node.widgets || [];
+        const index = list.indexOf(widget);
+        if (index >= 0) list.splice(index, 1);
+        const selectorIndex = list.findIndex(item => item.name === "潜桥续接");
+        list.splice(selectorIndex >= 0 ? selectorIndex + 1 : list.length, 0, widget);
+    } catch (_error) {}
+    if (selector) {
+        const original = selector.callback;
+        selector.callback = function (value) {
+            const result = original?.apply(this, arguments);
+            try { node.properties.ad_relay_choice = relayValue(value); } catch (_error) {}
+            update();
+            applyMaterialPlan();
+            return result;
+        };
+    }
+    update();
+    for (const delay of [700, 1600, 3200]) setTimeout(() => { update(); applyMaterialPlan(); }, delay);
+    fitNodeToWidgets(node);
+}
+
 function updateSegmentIndexVisibility(node) {
     const widget = node.widgets?.find(item => item.name === "段索引");
     if (!widget) return;
@@ -1416,17 +1469,30 @@ function repairSegmentNode(node) {
     } catch {}
 }
 function segmentRepairSignature(node) {
+    // 轻量签名：字符串值只取长度与首尾片段，避免每次 tick 对整个大提示词做序列化。
+    const shortValue = value => typeof value === "string" ? [value.length, value.slice(0, 16), value.slice(-16)] : value;
     return JSON.stringify([node.size?.[0], node.graph?._version,
-        (node.widgets || []).map(widget => [widget.name, widget.value, !!widget.hidden]),
+        (node.widgets || []).map(widget => [widget.name, !!widget.hidden, widget.type, shortValue(widget.value)]),
         (node.inputs || []).map(input => [input.name, input.type, input.link]),
         (node.outputs || []).map(output => [output.name, output.type, output.links])]);
 }
 function startSegmentRepairTimer() {
     if (window.__adH3RepairTimer) return;
+    let emptyTicks = 0;
     window.__adH3RepairTimer = setInterval(() => {
         if (document.hidden || !app?.graph?._nodes) return;
-        for (const node of app.graph._nodes) {
-            if (node?.comfyClass !== "AidenH3Segment") continue;
+        const nodes = app.graph._nodes.filter(node => node?.comfyClass === "AidenH3Segment");
+        // 连续两次 tick 都没有分段生成节点：停止定时器，避免空页面一直空转；新增节点时由 setupNode 重新启动。
+        if (!nodes.length) {
+            if (++emptyTicks >= 2) {
+                clearInterval(window.__adH3RepairTimer);
+                window.__adH3RepairTimer = null;
+                emptyTicks = 0;
+            }
+            return;
+        }
+        emptyTicks = 0;
+        for (const node of nodes) {
             const signature = segmentRepairSignature(node);
             if (signature === node._adH3RepairSignature) continue;
             try { repairSegmentNode(node); } catch {}
@@ -1439,16 +1505,38 @@ function startSegmentRepairTimer() {
 
 const savedSegmentSchemas = new Map();
 const schemasBySavedInfo = new WeakMap();
+const savedSegmentWidgetValues = new WeakMap();
 function setupNode(node) {
     if (["AidenH3AudioQueue", "AidenH3Segment", "AidenH3VideoPreview"].includes(node.comfyClass)) mountNodeProgress(node);
     installGlassTheme();
     if(node.comfyClass==="AidenH3AudioQueue")mountTimelineEditor(node);
     if(node.comfyClass==="AidenH3Segment"){
       normalizeAspectWidget(node);
+      reorderSegmentWidgets(node);
       const prevConfigure=node.onConfigure;
       const syncSegmentOutputs=()=>{normalizeSegmentOutputs(node);try{node._adH3ApplyDynamicOutputs?.();}catch(_error){}};
-      node.onConfigure=function(){this._adH3Configured=true;this._adH3GraphReady=false;const info=arguments[0];const savedOutputs=(info&&schemasBySavedInfo.get(info))||savedSegmentSchemas.get(String(this.id))||(info&&Array.isArray(info.outputs)?info.outputs.map(output=>({...output,links:[...(output.links||[])]})):null);this._adH3SavedSchema=savedOutputs;const restoreNames=()=>{if(savedOutputs)node.outputs=savedOutputs.map((saved,index)=>{const output=node.outputs?.[index]||{links:[]};output.name=saved.name;output.type=saved.type;output.h3_key=undefined;output.slot_index=index;return output;});};restoreNames();const out=prevConfigure?.apply(this,arguments);restoreNames();normalizeAspectWidget(node);syncSegmentOutputs();const repairLinks=()=>{try{migrateSegmentLinksBySavedOutputs(node,savedOutputs);}catch(_error){}try{migrateLegacySegmentLinks(node);}catch(_error){}};repairLinks();setTimeout(syncSegmentOutputs,0);setTimeout(syncSegmentOutputs,400);setTimeout(repairLinks,0);setTimeout(repairLinks,120);return out;};
-      mountResolutionBadge(node);mountPromptEditor(node);mountNegativeEditor(node);mountPromptPrefix(node);
+      node.onConfigure=function(){this._adH3Configured=true;this._adH3GraphReady=false;const info=arguments[0];const savedOutputs=(info&&schemasBySavedInfo.get(info))||savedSegmentSchemas.get(String(this.id))||(info&&Array.isArray(info.outputs)?info.outputs.map(output=>({...output,links:[...(output.links||[])]})):null);this._adH3SavedSchema=savedOutputs;const restoreNames=()=>{if(savedOutputs)node.outputs=savedOutputs.map((saved,index)=>{const output=node.outputs?.[index]||{links:[]};output.name=saved.name;output.type=saved.type;output.h3_key=undefined;output.slot_index=index;return output;});};restoreNames();const out=prevConfigure?.apply(this,arguments);restoreNames();
+        const savedValues=savedSegmentWidgetValues.get(info)||{};
+        const savedSelector=(node.widgets||[]).find(widget=>widget.name==="潜桥续接");
+        if(savedSelector&&Object.prototype.hasOwnProperty.call(savedValues,"潜桥续接")){try{savedSelector.value=savedValues["潜桥续接"];}catch(_error){}}
+        const applyNamedValues=()=>{
+            if(!node.widgets)return;
+            for(const widget of node.widgets){
+                if(widget.name==="潜桥续接")continue;
+                let value;
+                if(Object.prototype.hasOwnProperty.call(savedValues,widget.name))value=savedValues[widget.name];
+                else if(info?.widgets_values_named&&Object.prototype.hasOwnProperty.call(info.widgets_values_named,widget.name))value=info.widgets_values_named[widget.name];
+                if(value!==undefined){try{widget.value=value;}catch(_error){}}
+            }
+            normalizeAspectWidget(node);
+            reorderSegmentWidgets(node);
+            normalizeRelayWidget(node);
+        };
+        applyNamedValues();
+        normalizeAspectWidget(node);reorderSegmentWidgets(node);normalizeRelayWidget(node);syncSegmentOutputs();
+        setTimeout(()=>{try{applyNamedValues();node.setDirtyCanvas?.(true,true);}catch(_error){}},0);
+        setTimeout(()=>{try{applyNamedValues();node.setDirtyCanvas?.(true,true);}catch(_error){}},300);const repairLinks=()=>{try{migrateSegmentLinksBySavedOutputs(node,savedOutputs);}catch(_error){}try{migrateLegacySegmentLinks(node);}catch(_error){}};repairLinks();setTimeout(syncSegmentOutputs,0);setTimeout(syncSegmentOutputs,400);setTimeout(repairLinks,0);setTimeout(repairLinks,120);return out;};
+      mountResolutionBadge(node);mountPromptEditor(node);mountNegativeEditor(node);mountPromptPrefix(node);mountRelayHint(node);
       startSegmentRepairTimer(); repairSegmentNode(node);
       const relabel={"正向提示词":"正向提示词","统一提示词前缀":"统一提示词前缀","反向提示词":"反向提示词",multiple:"倍数"};
       syncSegmentOutputs();
@@ -1589,9 +1677,37 @@ function registerCustomSlotDefaults(){
     litegraph.slot_types_default_in["H3_LOOP_CONTEXT"] = [{node:"AidenH3Segment"}];
     return true;
 }
+const AD_SEG_WIDGET_NEW_ORDER = ["潜桥续接", "aspect_ratio", "megapixels", "multiple",
+    "正向提示词", "统一提示词前缀", "反向提示词", "段索引", "ref_counts", "潜桥模式", "潜桥上下文帧数"];
+const AD_SEG_WIDGET_OLD_ORDER = ["aspect_ratio", "megapixels", "multiple",
+    "正向提示词", "统一提示词前缀", "反向提示词", "段索引", "ref_counts", "潜桥模式", "潜桥上下文帧数", "潜桥续接"];
+const AD_SEG_WIDGET_DEFAULTS = { "潜桥续接": "0 · 关闭", "潜桥模式": "关闭", "潜桥上下文帧数": "22" };
+
+function remapSegmentWidgetValues(info) {
+    if (!info || info.type !== "AidenH3Segment") return;
+    if (info.__adWidgetOrderRemapped) return;
+    info.__adWidgetOrderRemapped = true;
+    const oldValues = Array.isArray(info.widgets_values) ? info.widgets_values : [];
+    const named = info.widgets_values_named && typeof info.widgets_values_named === "object" ? info.widgets_values_named : {};
+    const map = {};
+    for (let i = 0; i < AD_SEG_WIDGET_OLD_ORDER.length; i++) {
+        if (i < oldValues.length) map[AD_SEG_WIDGET_OLD_ORDER[i]] = oldValues[i];
+    }
+    for (const [key, value] of Object.entries(named)) map[key] = value;
+    const values = AD_SEG_WIDGET_NEW_ORDER.map(name => {
+        if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+        return AD_SEG_WIDGET_DEFAULTS[name];
+    });
+    savedSegmentWidgetValues.set(info, map);
+    info.widgets_values = values;
+    info.widgets_values_named = Object.fromEntries(AD_SEG_WIDGET_NEW_ORDER.map((name, index) => [name, values[index]]));
+}
+
 app.registerExtension({
     name:"Aiden.H3Loop",
     async setup(app){
+        try { hideInternalNodeTypes(); } catch (_error) {}
+        for (const delay of [500, 1500, 3000, 6000]) setTimeout(() => { try { hideLegacyTypesAfterLoad(); } catch (_error) {} }, delay);
         registerCustomSlotDefaults();
         setTimeout(registerCustomSlotDefaults, 1000);
         setTimeout(registerCustomSlotDefaults, 3000);
@@ -1615,7 +1731,13 @@ app.registerExtension({
             await new Promise(resolve=>setTimeout(resolve,250));
         }
     },
+    afterLoadGraph(){
+        try { migrateLegacyRelay(app.graph); } catch (error) { console.warn("AD legacy relay migration failed", error); }
+        try { hideLegacyTypesAfterLoad(); } catch (_error) {}
+        try { hideInternalNodeTypes(); } catch (_error) {}
+    },
     beforeConfigureGraph(graphData){
+        try { restoreLegacyTypesForGraph(graphData); } catch (_error) {}
         savedSegmentSchemas.clear();
         const infos = new Map((graphData?.nodes || []).map(info => [String(info.id), info]));
         const rawLinks = graphData?.links || [];
@@ -1625,6 +1747,7 @@ app.registerExtension({
         const setField = (link, key, index, value) => { if (Array.isArray(link)) link[index] = value; else link[key] = value; };
         for (const info of graphData?.nodes || []) {
             if (info.type !== "AidenH3Segment") continue;
+            remapSegmentWidgetValues(info);
             const queueInput = info.inputs?.find(input => input.name === "queue");
             if (queueInput?.link == null) continue;
             const queueLink = links.find(link => String(field(link,"id",0)) === String(queueInput.link));
@@ -1759,43 +1882,7 @@ app.registerExtension({
                 const result=createdSegment?.apply(this,arguments);
                 // 不再重排输出口：保持后端定义顺序，避免旧工作流连线按序号错位
                 fixReanchor(this);
-                                if(false){
-                    this._adResFooter=true;
-                    const previousDraw=this.onDrawForeground;
-                    this.onDrawForeground=function(ctx){
-                        previousDraw?.apply(this,arguments);
-                        const value=name=>this.widgets?.find(widget=>widget.name===name)?.value;
-                        const resolved=h3ResolveCanvas(value("aspect_ratio"), value("megapixels"), Number(value("multiple"))||32);
-                        const text=resolved?`分辨率 ${resolved[0]} x ${resolved[1]}`:`分辨率 -- x --`;
-                        const connected=commitConnected(this);
-                        // 放在全部可见控件（含执行标识）下方，节点底部不够时由 ensureFooterSpace 补足。
-                        const overflow=connected?0:Math.max(0,widgetBottom(this)+18+34-this.size[1]);
-                        const footerY=(connected?Math.max(widgetBottom(this)+18, this.size[1]-16):widgetBottom(this)+18)-overflow;
-                        ctx.save();
-                        ctx.fillStyle="#8ecbff";
-                        ctx.font="bold 16px system-ui,'Microsoft YaHei',sans-serif";
-                        ctx.textAlign="center";
-                        ctx.textBaseline="middle";
-                        ctx.fillText(text, this.size[0]/2, footerY);
-                        if(!connected){
-                            ctx.fillStyle="#ffb86b";
-                            ctx.font="bold 14px system-ui,'Microsoft YaHei',sans-serif";
-                            ctx.fillText("未连接「记录分段结果」节点（context 输出）", this.size[0]/2, footerY+20);
-                        }
-                        ctx.restore();
-                    };
-                }
                 ensureFooterSpace(this);
-                if(false){
-                    this._adSegConn=true;
-                    const previousConn=this.onConnectionsChange;
-                    this.onConnectionsChange=function(){
-                        const out=previousConn?.apply(this,arguments);
-                        ensureFooterSpace(this);
-                        this.setDirtyCanvas?.(true,true);
-                        return out;
-                    };
-                }
                 if(!this._adSegDedupeConfigure){
                     this._adSegDedupeConfigure=true;
                     const previous=this.onConfigure;
@@ -1820,6 +1907,9 @@ if(!chineseTitles[nodeData.name])return;
     },
     async nodeCreated(node){
         try { registerCustomSlotDefaults(); } catch (_error) {}
+        if (!app.configuringGraph && (node?.comfyClass || node?.type) === "AidenH3Segment") {
+            try { prepareSegmentNode(node); } catch (_error) {}
+        }
         setupNode(node);
         // Native canvas nodes already zoom. Forward wheel events from embedded
         // controls to that same canvas, including third-party DOM widgets.

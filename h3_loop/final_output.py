@@ -38,6 +38,8 @@ def describe_record(value):
     result = {**record, "kind": kind, "file_identity": identity}
     if kind in {"video", "audio"}:
         import av
+        # 容器后缀参与“同规格”判定：不同容器不直接 -c copy 混流。
+        result["container"] = path.suffix.lower().lstrip(".")
         with av.open(str(path)) as container:
             if kind == "video":
                 stream = container.streams.video[0]
@@ -46,7 +48,8 @@ def describe_record(value):
                               codec=stream.codec_context.name,pix_fmt=stream.codec_context.pix_fmt)
             if container.streams.audio:
                 audio = container.streams.audio[0]
-                result.update(sample_rate=audio.codec_context.sample_rate,channels=audio.codec_context.channels)
+                result.update(sample_rate=audio.codec_context.sample_rate,channels=audio.codec_context.channels,
+                              audio_codec=audio.codec_context.name)
     return result
 
 
@@ -128,9 +131,37 @@ def publish_final(path, kind, source, directory="", prefix="最终", suffix=""):
     return record
 
 
+def manual_final_source(source_record, prompt, unique_id):
+    """只接受按钮编译的已选成果分支；普通工作流和残留记录不触发保存。"""
+    try:
+        source = parse_record(source_record)
+    except (ValueError, TypeError):
+        return None
+    if not source.get("final_job_token") or not source.get("file") or not isinstance(prompt, dict):
+        return None
+    pending, visited = [str(unique_id)], set()
+    while pending:
+        identifier = pending.pop()
+        if identifier in visited:
+            continue
+        visited.add(identifier)
+        node = prompt.get(identifier, {})
+        if node.get("class_type") == "AD_FinalSelectedMedia":
+            try:
+                selected = parse_record(node.get("inputs", {}).get("record"))
+            except (ValueError, TypeError):
+                continue
+            if all(selected.get(key) == source.get(key) for key in ("origin", "file", "file_identity")):
+                return source
+        for value in node.get("inputs", {}).values():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[1], int) and str(value[0]) in prompt:
+                pending.append(str(value[0]))
+    return None
+
+
 class FinalSave:
     CATEGORY = "AD-Segmented-Loop"
-    DESCRIPTION = "逐个加工选中的已保存成果，按图片/音频/视频保存；不应用H3帧率、尺寸和帧数限制。"
+    DESCRIPTION = "仅通过加工所选或继续剩余执行；普通整图运行跳过。按图片/音频/视频保存，不应用H3帧率、尺寸和帧数限制。"
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
@@ -138,13 +169,22 @@ class FinalSave:
             "文件名前缀":("STRING",{"default":"最终"}),
             "帧序列帧率":("FLOAT",{"default":0.0,"min":0.0,"step":0.001}),
             "source_record":("STRING",{"default":"{}"})},
-            "optional":{"media":("*",),"audio":("AUDIO",)}}
+            "optional":{"media":("*",{"lazy":True}),"audio":("AUDIO",{"lazy":True})},
+            "hidden":{"prompt":"PROMPT","unique_id":"UNIQUE_ID"}}
     RETURN_TYPES = ("*",)
     RETURN_NAMES = ("最终媒体",)
     FUNCTION = "save"
     OUTPUT_NODE = True
-    def save(self, 保存目录="", 文件名前缀="最终", 帧序列帧率=0.0, source_record="{}", media=None, audio=None):
-        source = parse_record(source_record)
+    def check_lazy_status(self, source_record="{}", prompt=None, unique_id=None, **kwargs):
+        if manual_final_source(source_record, prompt, unique_id) is None:
+            return []
+        return [name for name in ("media", "audio") if name in kwargs and kwargs[name] is None]
+
+    def save(self, 保存目录="", 文件名前缀="最终", 帧序列帧率=0.0, source_record="{}", media=None, audio=None, prompt=None, unique_id=None):
+        source = manual_final_source(source_record, prompt, unique_id)
+        if source is None:
+            from comfy_execution.graph import ExecutionBlocker
+            return {"result":(ExecutionBlocker(None),)}
         if media is None:
             raise ValueError("请连接处理后的图片、音频或视频到媒体输入")
         directory = ROOT/"media"
@@ -195,7 +235,7 @@ class FinalSave:
                 if not math.isfinite(fps) or fps <= 0:
                     raise ValueError("视频帧序列需要有效帧率；请连接视频合成节点或填写帧序列帧率")
                 video = VideoFromComponents(VideoComponents(images=images,audio=audio,frame_rate=Fraction(str(fps))))
-                return self.save(保存目录,文件名前缀,帧序列帧率,source_record,video)
+                return self.save(保存目录,文件名前缀,帧序列帧率,source_record,video,prompt=prompt,unique_id=unique_id)
             for index,frame in enumerate(images):
                 array = (frame.detach().cpu().float().numpy()*255).clip(0,255).astype(np.uint8)
                 if array.shape[-1] == 1: array=array[...,0]
@@ -224,12 +264,13 @@ def merge_final(records, directory="", prefix="最终合并", normalize=False):
     # 视频合并默认输出 MP4（浏览器/下载更通用）；容器不支持时回退 MKV。音频统一无损 PCM 容器。
     target = ROOT/'media'/('final_merge_'+uuid.uuid4().hex+('.mp4' if kind=='video' else '.wav'))
     target.parent.mkdir(parents=True,exist_ok=True)
-    keys = ('width','height','fps','codec','pix_fmt','sample_rate','channels') if kind=='video' else ('sample_rate','channels')
+    # 同规格判定包含视频/音频编码与容器：编码或容器不同时不允许 -c copy 直接混流。
+    keys = ('width','height','fps','codec','pix_fmt','sample_rate','channels','audio_codec','container') if kind=='video' else ('sample_rate','channels','audio_codec','container')
     def signature(r): return tuple(r.get(k) for k in keys)
     same = all(signature(r)==signature(sources[0]) for r in sources)
     # 规格统一须先征得同意；像素格式兼容转换不代表同意缩放或改变帧率。
     if not same and not normalize:
-        raise MergeSpecificationError("所选成果的尺寸、帧率、音轨或编码不同。是否按第一条成果的规格统一后合并？")
+        raise MergeSpecificationError("所选成果的尺寸、帧率、音轨编码或容器不同。是否按第一条成果的规格统一后合并？")
     compat_pix = {'yuv420p','yuvj420p','nv12','nv21'}
     odd_size=kind=='video' and (int(sources[0]['width'])%2 or int(sources[0]['height'])%2)
     pixel_format='yuv444p' if odd_size else 'yuv420p'

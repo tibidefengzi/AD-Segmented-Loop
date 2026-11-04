@@ -18,7 +18,7 @@ from aiohttp import web
 from server import PromptServer
 
 from .audio import EXTENSIONS, h3_window, prepare_entries
-from .engine import enqueue, merge_session, segment_signatures, template_for
+from .engine import merge_session, segment_signatures, template_for
 from . import layout
 from .storage import ROOT, STORE, contained, digest, identifier
 from .spec import validate_fps
@@ -41,9 +41,24 @@ async def storage_usage(request):
     return web.json_response(result, headers={"Cache-Control":"no-store, max-age=0"})
 
 
+def _fail_unfinished_sessions():
+    """上次任务没有正常结束：把 queued/running/merging 的进度标记为可继续。"""
+    if not STORE.root.is_dir():
+        return
+    for progress in STORE.root.glob("*/progress.json"):
+        try:
+            existing = STORE.read(progress.parent.name)
+            if existing["status"] in {"queued", "running", "merging"}:
+                STORE.fail(existing["id"], "上次任务没有正常结束，该进度已标记为可继续；点「开始」会从当前段继续。")
+        except (OSError, ValueError, KeyError):
+            pass
+
+
 async def startup_storage_cleanup(app):
     if not _storage_busy():
         await asyncio.to_thread(cleanup.auto_clean)
+    # 不在 import 时扫描进度：热重载会误伤运行中会话，改到启动钩子里后台执行。
+    await asyncio.to_thread(_fail_unfinished_sessions)
 
 
 def register_startup_cleanup(app):
@@ -480,10 +495,12 @@ async def library_pick(request):
         if not allowed:
             raise ValueError(f"所选文件不在素材目录内：{path.name}")
         if mode == "generated":
-            target = input_library / layout.KIND_DIRS[kind] / path.name
+            target_dir = input_library / layout.KIND_DIRS[kind]
+            # 与 library_load 一致：同名但内容不同的旧文件不静默复用，另存为带内容哈希的名字。
+            target = await asyncio.to_thread(_library_target, target_dir, path)
             if not target.is_file():
                 target.parent.mkdir(parents=True, exist_ok=True)
-                dedupe.publish(path, target)
+                await asyncio.to_thread(dedupe.publish, path, target)
             duration = None if kind == "image" else await asyncio.to_thread(probe_duration, target)
             sources.append({"id": target.stem, "kind": kind, "origin": "input",
                             "file": target.relative_to(input_base).as_posix(),
@@ -891,7 +908,7 @@ async def action(request):
     session_id = identifier(data["session_id"])
     from . import rounds
     try:
-        existing = STORE.read(session_id)
+        existing = await asyncio.to_thread(STORE.read, session_id)
     except FileNotFoundError:
         existing = {}
     if existing and data.get("prompt") and data.get("segment_node") is not None:
@@ -915,7 +932,7 @@ async def action(request):
         if command not in {"stop", "cancel_preview"}:
             raise ValueError("本段抽卡尚未结束，请完成后再继续原循环")
         pending = existing["draft_trial"]
-        child = STORE.read(pending["session_id"])
+        child = await asyncio.to_thread(STORE.read, pending["session_id"])
         active_child = child.get("active") or {}
         if command == "stop" and active_child.get("prompt_id"):
             _interrupt_owned_prompt(active_child["prompt_id"])
@@ -991,25 +1008,20 @@ async def action(request):
     elif command == "stop":
         active = {}
         try:
-            active = STORE.read(session_id).get("active") or {}
+            active = (await asyncio.to_thread(STORE.read, session_id)).get("active") or {}
         except FileNotFoundError:
             pass
         try:
-            state = STORE.action(session_id, "stop")
+            state = await asyncio.to_thread(STORE.action, session_id, "stop")
         except FileNotFoundError:
             state = {"id": session_id, "status": "paused", "cursor": 0, "segments": []}
         _interrupt_owned_prompt(active.get("prompt_id"))
     else:
-        state = STORE.action(session_id, command, **{k: data[k] for k in ("confirmed", "index", "indices", "version", "merge_options", "reason", "preview_id") if k in data})
-        if command in {"start", "redo", "approve", "auto"} and data.get("frontend_queue") is not True:
-            template = state.get("template") or {}
-            has_commit = any(node.get("class_type") == "AidenH3Commit" for node in (template.get("prompt") or {}).values())
-            # 纯预览/外部工作流：没有结果记录节点时不在后端重复排队，由预览侧“开始/分段循环”驱动
-            if state["status"] == "ready" and has_commit:
-                await enqueue(session_id)
-                state = STORE.read(session_id)
-            elif state["status"] == "completed" and (command == "auto" or state["auto"]) and has_commit:
-                state = await asyncio.to_thread(merge_session, session_id)
+        # 后台入队已删除（A 区移除 engine.enqueue）：排队统一由前端队列驱动，
+        # 这里只做状态机动作，不再自动入队或自动合并。
+        state = await asyncio.to_thread(
+            STORE.action, session_id, command,
+            **{k: data[k] for k in ("confirmed", "index", "indices", "version", "merge_options", "reason", "preview_id") if k in data})
     return web.json_response(public_state(state))
 
 
@@ -1107,6 +1119,25 @@ async def pick_folder(request):
     return web.json_response({"path": path or ""})
 
 
+def _probe_media_info(path):
+    """阻塞式读取视频帧率/帧数/时长；由路由放到线程池执行，失败向上抛。"""
+    import av
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0] if container.streams.video else None
+        if stream is None:
+            raise ValueError("没有视频画面")
+        fps = float(stream.average_rate or 24.0) or 24.0
+        frames = int(stream.frames or 0)
+        duration = 0.0
+        if stream.duration is not None and stream.time_base is not None:
+            duration = float(stream.duration * stream.time_base)
+        if not frames and duration > 0:
+            frames = round(duration * fps)
+        if not duration and frames:
+            duration = frames / fps
+    return {"fps": round(fps, 3), "frames": frames, "duration": round(duration, 3)}
+
+
 @routes.get("/aiden_h3/media_info/{origin}/{file:.*}")
 @guarded
 async def media_info(request):
@@ -1122,24 +1153,12 @@ async def media_info(request):
     if cached:
         MEDIA_INFO_CACHE.move_to_end(key)
         return web.json_response(cached)
-    info = {"fps": 24.0, "frames": 0, "duration": 0.0}
     try:
-        import av
-        with av.open(str(path)) as container:
-            stream = container.streams.video[0] if container.streams.video else None
-            if stream is not None:
-                fps = float(stream.average_rate or 24.0) or 24.0
-                frames = int(stream.frames or 0)
-                duration = 0.0
-                if stream.duration is not None and stream.time_base is not None:
-                    duration = float(stream.duration * stream.time_base)
-                if not frames and duration > 0:
-                    frames = round(duration * fps)
-                if not duration and frames:
-                    duration = frames / fps
-                info = {"fps": round(fps, 3), "frames": frames, "duration": round(duration, 3)}
-    except Exception:
-        pass
+        info = await asyncio.to_thread(_probe_media_info, path)
+    except Exception as error:
+        # 读取失败不缓存伪值，下次请求仍会重试；前端按 failed 标记显示。
+        return web.json_response({"error": f"无法读取媒体信息：{error}", "fps": 24.0,
+                                  "frames": 0, "duration": 0.0, "failed": True})
     MEDIA_INFO_CACHE[key] = info
     MEDIA_INFO_CACHE.move_to_end(key)
     while len(MEDIA_INFO_CACHE) > MEDIA_INFO_CACHE_LIMIT:
@@ -1194,8 +1213,13 @@ async def thumb(request):
                         await asyncio.to_thread(_write_thumbnail, path, target)
             task = asyncio.create_task(generate())
             _THUMB_TASKS[key] = task
-            task.add_done_callback(lambda done: _THUMB_TASKS.pop(key, None) if _THUMB_TASKS.get(key) is done else None)
-        await asyncio.shield(_THUMB_TASKS[key])
+            task.add_done_callback(lambda done, key=key: _THUMB_TASKS.pop(key, None) if _THUMB_TASKS.get(key) is done else None)
+        try:
+            await asyncio.shield(_THUMB_TASKS[key])
+        except Exception:
+            raise web.HTTPNotFound(text="缩略图生成失败")
+        if not target.is_file():
+            raise web.HTTPNotFound(text="缩略图生成失败")
     response = web.FileResponse(target)
     response.headers["Content-Type"] = "image/webp"
     response.headers["Cache-Control"] = "public, max-age=86400"
@@ -1216,6 +1240,7 @@ async def _cached_detection(path, kind, options, retained, worker, *args, **kwar
     if task is None:
         task = asyncio.create_task(asyncio.to_thread(worker, *args, **kwargs))
         _DETECTION_TASKS[key] = task
+        task.add_done_callback(lambda done, key=key: _DETECTION_TASKS.pop(key, None) if _DETECTION_TASKS.get(key) is done else None)
     try:
         result = await asyncio.shield(task)
         _DETECTION_CACHE[key] = copy.deepcopy(result)
@@ -1272,16 +1297,25 @@ async def detect_cuts(request):
 async def media(request):
     from .assets import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS
     origin = request.match_info["origin"]
-    if origin == "input":
+    name = request.match_info["file"]
+    if origin == "output":
+        # 生成目录直读：优先按布局解析（新/旧生成库），找不到再回退 output 根目录，仍做 contained 校验。
+        path = layout.resolve_output_file(name)
+        if path is None:
+            import folder_paths
+            path = contained(Path(folder_paths.get_output_directory()), name)
+    elif origin == "input":
         import folder_paths
         root = Path(folder_paths.get_input_directory())
+        path = contained(root, name)
     elif origin == "media":
         root = ROOT / "media"
+        path = contained(root, name)
     elif origin == "session":
         root = STORE.root
+        path = contained(root, name)
     else:
         raise ValueError("无法识别的素材来源，请重新导入或重新选择素材。")
-    path = contained(root, request.match_info["file"])
     if path.suffix.lower() not in AUDIO_EXTS | VIDEO_EXTS | IMAGE_EXTS:
         raise ValueError("仅提供音频、视频与图片素材")
     from urllib.parse import quote
@@ -1294,14 +1328,7 @@ async def media(request):
 
 
 # An unfinished process cannot be resumed as if the GPU job were still alive.
-if STORE.root.is_dir():
-    for progress in STORE.root.glob("*/progress.json"):
-        try:
-            existing = STORE.read(progress.parent.name)
-            if existing["status"] in {"queued", "running", "merging"}:
-                STORE.fail(existing["id"], "上次任务没有正常结束，该进度已标记为可继续；点「开始」会从当前段继续。")
-        except (OSError, ValueError, KeyError):
-            pass
+# 该扫描已移到启动钩子 startup_storage_cleanup 内后台执行，import/热重载不再改动运行中进度。
 
 
 
@@ -1316,3 +1343,50 @@ async def prepare_round(request):
 from .rounds import prompt_handler as _round_prompt_handler
 if hasattr(PromptServer.instance, "add_on_prompt_handler"):
     PromptServer.instance.add_on_prompt_handler(_round_prompt_handler)
+
+# 内部节点只用于 prompt 注入，不应出现在前端节点搜索里。
+# 前端自身只从 LiteGraph 注册表移除还不够：新版节点搜索会直接读 /object_info。
+_HIDDEN_OBJECT_INFO = {
+    "ADH3InternalBridge",
+    "ADH3InternalSave",
+    "ADH3InternalTrim",
+    "AD_FinalSelectedMedia",
+    "AD_RoundBlocked",
+}
+
+
+def _install_object_info_filter():
+    app = getattr(PromptServer.instance, "app", None)
+    if app is None or getattr(PromptServer.instance, "_ad_hidden_object_info_filter", False):
+        return
+    setattr(PromptServer.instance, "_ad_hidden_object_info_filter", True)
+
+    @web.middleware
+    async def hide_internal_object_info(request, handler):
+        path = request.path
+        if path != "/object_info" and not path.startswith("/object_info/"):
+            return await handler(request)
+        response = await handler(request)
+        try:
+            if response.content_type != "application/json":
+                return response
+            data = json.loads(response.text)
+            if path == "/object_info":
+                if not isinstance(data, dict):
+                    return response
+                filtered = {key: value for key, value in data.items() if key not in _HIDDEN_OBJECT_INFO}
+                return web.json_response(filtered)
+            name = path.rsplit("/", 1)[-1]
+            if name in _HIDDEN_OBJECT_INFO:
+                return web.json_response({"error": "node is internal"}, status=404)
+        except Exception:
+            return response
+        return response
+
+    app.middlewares.append(hide_internal_object_info)
+
+
+try:
+    _install_object_info_filter()
+except Exception:
+    pass

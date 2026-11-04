@@ -83,9 +83,10 @@ def template_for(prompt, segment_node, extra_pnginfo=None):
         if commit is not None and node["class_type"] in {"VideoOasisPreview","AidenH3VideoPreview"} and node.get("inputs", {}).get("video") == [commit, 0]:
             keep.add(key)
             targets.append(key)
+    # 后端入队已删除，落盘模板不再需要完整 workflow（progress.json 瘦身）；
+    # 只保留执行/回收所需的字段。函数签名保留 extra_pnginfo 以兼容调用方。
     return signature, {"prompt": {key: copy.deepcopy(prompt[key]) for key in keep},
-                       "segment_node": str(segment_node), "targets": targets,
-                       "extra_pnginfo": extra_pnginfo or {}}
+                       "segment_node": str(segment_node), "targets": targets}
 
 
 def segment_signatures(prompt, segment_node, entries, fps, video_segments=None):
@@ -213,134 +214,75 @@ def reference_manifest(prompt, segment_node, index):
     return result
 
 
-async def enqueue(session_id):
-    import execution
-    from server import PromptServer
-    server = PromptServer.instance
-    state = STORE.read(session_id)
-    template = state.get("template")
-    if not template:
-        raise ValueError("缺少工作流，请先从预览侧开始当前段")
-    try:
-        active = STORE.reserve(session_id)
-        prompt = copy.deepcopy(template["prompt"])
-        if state.get("execution_round"):
-            from .rounds import read_snapshot, validate_assets, execution_prompt
-            snapshot = read_snapshot(state)
-            validate_assets(snapshot)
-            prompt = execution_prompt(state, snapshot)
-        prompt[template["segment_node"]]["inputs"]["run_token"] = active["token"]
-        # 方案 A：把“当前段号”写进节点输入，缓存键才能区分不同段；
-        # 同一段抽卡时段号不变 → 上游命中缓存，只重跑种子相关节点。
-        try:
-            prompt[template["segment_node"]]["inputs"]["段索引"] = int(active.get("index", 0))
-        except (TypeError, ValueError):
-            pass
-        if active.get("reroll") and not state.get("execution_round"):
-            for node in prompt.values():
-                for name in ("seed","noise_seed"):
-                    value=node.get("inputs",{}).get(name)
-                    if isinstance(value,int):
-                        node["inputs"][name]=(value+active["reroll"])%(2**64)
-        prompt_id = str(uuid.uuid4())
-        server.node_replace_manager.apply_replacements(prompt)
-        valid = await execution.validate_prompt(prompt_id, prompt, template["targets"])
-        if not valid[0]:
-            raise ValueError("工作流接线校验未通过（常见原因：缺少模型/加载器、节点必填输入为空或连线不完整）。可在 ComfyUI 控制台查看详细校验信息：" + json.dumps(valid[3], ensure_ascii=False))
-        number = server.number
-        server.number += 1
-        extra = {"extra_pnginfo": template.get("extra_pnginfo", {}),"create_time":int(time.time()*1000)}
-        if template.get("client_id"):
-            extra["client_id"] = template["client_id"]
-        item = (number, prompt_id, prompt, extra, valid[2])
-        # ComfyUI added a sensitive-data tuple field; support both queue signatures.
-        if hasattr(execution, "SENSITIVE_EXTRA_DATA_KEYS"):
-            item += ({},)
-        with STORE.lock(session_id):
-            current = STORE._load(session_id)
-            current["active"]["prompt_id"] = prompt_id
-            STORE._save(current)
-        server.prompt_queue.put(item)
-        asyncio.create_task(watch_prompt(session_id, active["token"], prompt_id))
-        return prompt_id
-    except Exception as exc:
-        STORE.fail(session_id, exc)
-        raise
-
-
 async def watch_prompt(session_id, token, prompt_id):
+    """后台等待任务历史：只负责回收预览/抽卡占位，不再自动入队（排队由前端驱动）。"""
     from server import PromptServer
     server = PromptServer.instance
     missing_history = 0
-    while True:
-        await asyncio.sleep(0.5)
-        history = server.prompt_queue.get_history(prompt_id=prompt_id)
-        state = STORE.read(session_id)
-        current = state.get("active")
-        if current and current["token"] != token:
-            return
-        if not current and not state.get("preview_parent") and not any(row["selected"] == token for row in state["segments"]):
-            return
-        if prompt_id not in history:
-            running, pending = server.prompt_queue.get_current_queue()
-            if any(item[1] == prompt_id for item in running + pending):
-                continue
-            # Queue removal can precede history publication. A committed version
-            # is not enough to infer success: the downstream encoder can still fail.
-            missing_history += 1
-            if missing_history < (6 if current else 120):
-                continue
-            if (state.get("active") or {}).get("token") == token:
-                STORE.fail(session_id, "没有等到本次任务的执行结果（可能已被取消、队列被清空或服务重启）。点「开始」会从当前段继续。")
-            else:
-                STORE.fail(session_id, "任务结束但没有收到执行记录（可能被取消或服务重启）。请点「开始」从当前段继续。")
-            if state.get("preview_parent"):
-                from .rounds import finish_trial
-                finish_trial(session_id, success=False)
-            return
-        entry = history[prompt_id]
-        if entry.get("status", {}).get("status_str") != "success":
-            messages = entry.get("status", {}).get("messages", [])
-            text = next((data.get("exception_message", "生成中断") for event, data in reversed(messages)
-                         if event in {"execution_error", "execution_interrupted"}), "生成任务未完成")
-            STORE.fail(session_id, text)
-            if state.get("preview_parent"):
-                from .rounds import finish_trial
-                finish_trial(session_id, success=False)
-            return
-        # 已确认任务成功；只释放插件缓存，不卸载模型、不重置执行器。
-        try:
-            running, pending = server.prompt_queue.get_current_queue()
-            if not running and not pending:
-                from .assets import PREPARED_MEDIA
-                PREPARED_MEDIA.trim()
-                from . import cleanup
-                await asyncio.to_thread(cleanup.clean_frame_cache, 60)
-                await asyncio.to_thread(cleanup.clean_trial_progress, 60)
-        except Exception:
-            pass
-        if current:
-            # 纯预览没有 Commit/登记结果；成功历史确认后必须回收预约。
-            # 令牌、任务号及段号在锁内复核，避免晚到的完成事件结束新任务。
-            STORE.finish_preview(session_id, token, prompt_id)
-            if state.get("preview_parent"):
-                from .rounds import finish_trial
-                finish_trial(session_id, success=False)
-            return
-        if state.get("preview_parent"):
-            from .rounds import finish_trial
-            finish_trial(session_id)
-            return
-        if state["auto"] and not state["pause_after"]:
+    try:
+        while True:
+            await asyncio.sleep(0.5)
+            history = server.prompt_queue.get_history(prompt_id=prompt_id)
+            state = await asyncio.to_thread(STORE.read, session_id)
+            current = state.get("active")
+            if current and current["token"] != token:
+                return
+            if not current and not state.get("preview_parent") and not any(row["selected"] == token for row in state["segments"]):
+                return
+            if prompt_id not in history:
+                running, pending = server.prompt_queue.get_current_queue()
+                if any(item[1] == prompt_id for item in running + pending):
+                    continue
+                # Queue removal can precede history publication. A committed version
+                # is not enough to infer success: the downstream encoder can still fail.
+                missing_history += 1
+                if missing_history < (6 if current else 120):
+                    continue
+                if (state.get("active") or {}).get("token") == token:
+                    STORE.fail(session_id, "没有等到本次任务的执行结果（可能已被取消、队列被清空或服务重启）。点「开始」会从当前段继续。")
+                else:
+                    STORE.fail(session_id, "任务结束但没有收到执行记录（可能被取消或服务重启）。请点「开始」从当前段继续。")
+                if state.get("preview_parent"):
+                    from .rounds import finish_trial
+                    finish_trial(session_id, success=False)
+                return
+            entry = history[prompt_id]
+            if entry.get("status", {}).get("status_str") != "success":
+                messages = entry.get("status", {}).get("messages", [])
+                text = next((data.get("exception_message", "生成中断") for event, data in reversed(messages)
+                             if event in {"execution_error", "execution_interrupted"}), "生成任务未完成")
+                STORE.fail(session_id, text)
+                if state.get("preview_parent"):
+                    from .rounds import finish_trial
+                    finish_trial(session_id, success=False)
+                return
+            # 已确认任务成功；只释放插件缓存，不卸载模型、不重置执行器。
             try:
-                if state["status"] == "ready":
-                    await enqueue(session_id)
-                elif state["status"] == "completed":
-                    if not any(row.get("entry", {}).get("batch_source") for row in state["segments"]):
-                        await asyncio.to_thread(merge_session, session_id)
-            except Exception as exc:
-                STORE.fail(session_id, exc)
-        return
+                running, pending = server.prompt_queue.get_current_queue()
+                if not running and not pending:
+                    from .assets import PREPARED_MEDIA
+                    PREPARED_MEDIA.trim()
+                    from . import cleanup
+                    await asyncio.to_thread(cleanup.clean_frame_cache, 60)
+                    await asyncio.to_thread(cleanup.clean_trial_progress, 60)
+            except Exception:
+                pass
+            if current:
+                # 纯预览没有 Commit/登记结果；成功历史确认后必须回收预约。
+                # 令牌、任务号及段号在锁内复核，避免晚到的完成事件结束新任务。
+                STORE.finish_preview(session_id, token, prompt_id)
+                if state.get("preview_parent"):
+                    from .rounds import finish_trial
+                    finish_trial(session_id, success=False)
+                return
+            if state.get("preview_parent"):
+                from .rounds import finish_trial
+                finish_trial(session_id)
+                return
+            return
+    except Exception as exc:
+        # 监听任务不能静默死掉：记录一次日志后退出，用户点「开始」可从当前段继续。
+        print(f"AidenH3: 等待任务结果时出错，已停止监听本次任务：{exc}")
 
 
 def _discard_merge_intermediates(directory, merge_id):
@@ -380,8 +322,27 @@ def merge_session(session_id):
         with av.open(str(out)) as merged:
             stream = merged.streams.video[0]
             expected = sum(v["frames"] for v in versions)
-            if stream.frames != expected or stream.average_rate != 24:
+            rate = float(stream.average_rate or 0)
+            if abs(rate - 24) >= 1e-6:
                 raise ValueError("合并结果帧数或帧率不符合逐段锁帧记录")
+            actual = int(stream.frames or 0)
+            if actual:
+                if actual != expected:
+                    raise ValueError("合并结果帧数或帧率不符合逐段锁帧记录")
+            else:
+                # 部分容器不写帧数元数据：先按解码计数，再按时长估算，都取不到才报原错误。
+                counted = 0
+                try:
+                    counted = sum(1 for _ in merged.decode(video=0))
+                except Exception:
+                    counted = 0
+                if not counted:
+                    try:
+                        counted = int(round(float(merged.duration or 0) / 1_000_000 * rate))
+                    except (TypeError, ValueError):
+                        counted = 0
+                if counted != expected:
+                    raise ValueError("合并结果帧数或帧率不符合逐段锁帧记录")
         manifest_name = "manifest_"+merge_id+".json"
         manifest=export_manifest(state,options,out)
         manifest["final_audio"]=audio_info
