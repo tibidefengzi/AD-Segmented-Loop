@@ -176,7 +176,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 if ("only_b" in config) saveState.onlyB = !!config.only_b;
                 dirInput.value = saveState.dir;
                 nameInput.value = saveState.template;
-
+               
                 if (onlyBInput) onlyBInput.checked = saveState.onlyB;
             }
         } catch {}

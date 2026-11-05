@@ -3,7 +3,7 @@ from .h3_loop.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .h3_loop import routes  # noqa: F401
 from .h3_loop import final_routes  # noqa: F401
 
-__version__ = "0.5.7"
+__version__ = "0.5.11"
 
 WEB_DIRECTORY = "./web_glass"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

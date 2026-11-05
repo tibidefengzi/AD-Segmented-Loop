@@ -10,6 +10,7 @@ import uuid
 import hashlib
 from pathlib import Path
 
+from .spec import relay_parent_stage, relay_reanchor_interval, relay_reanchors
 from .storage import STORE, atomic_json, contained, identifier
 
 
@@ -141,8 +142,8 @@ def _pick_parent_version(origin_segments, target, target_version):
     return max(candidates, key=created)
 
 
-def _recover_old_round_chain(sid, parent, origin_state, target, trial_round, target_version):
-    """为旧轮准备独立潜桥链：旧数据共用链/缺父 stage 时，从唯一存盘目录恢复父 latent。"""
+def _recover_old_round_chain(sid, parent, origin_state, target, trial_round, target_version, reanchor=False):
+    """为旧轮恢复实际依赖的稳定 latent：上一段或第 1 段外观锚。"""
     from . import group_history
     origin_segments = origin_state.get("segments") or []
     relay_id = str(origin_state.get("relay_run_id") or "")
@@ -151,32 +152,30 @@ def _recover_old_round_chain(sid, parent, origin_state, target, trial_round, tar
     shared = bool(relay_id) and (
         relay_id == str(parent.get("relay_run_id") or "")
         or relay_id in group_history.shared_relay_run_ids(STORE, parent))
-    needs_recover = (not relay_id) or shared
-    if not needs_recover and target > 0 and not _stage_path(chain, target - 1).is_file():
-        needs_recover = True
-    if not needs_recover:
+    stage = relay_parent_stage(target, reanchor)
+    new_chain_required = not relay_id or shared
+    if not new_chain_required and (stage is None or _stage_path(chain, stage).is_file()):
         return chain
-    new_relay = uuid.uuid4().hex
+    new_relay = uuid.uuid4().hex if new_chain_required else relay_id
     new_chain = _stable_run(sid, new_relay)
-    if target > 0:
-        parent_version = _pick_parent_version(origin_segments, target, target_version)
+    if stage is not None:
+        parent_version = _pick_parent_version(origin_segments, stage + 1, target_version)
+        dependency = "第 1 段外观锚" if reanchor else f"第 {stage + 1} 段的 latent"
         if not parent_version:
             raise ValueError(
-                "第 %d 轮第 %d 段无法确定目标生成时使用的父版本（历史记录不足/时间戳缺失），"
-                "不能安全回抽；请先恢复该轮重跑第 %d 段。"
-                % (int(trial_round), int(target) + 1, int(target)))
-        stage = int(parent_version.get("relay_stage_index"))
-        if not _copy_stage(str(parent_version.get("relay_save_run_id") or ""), stage, new_chain):
-            raise ValueError(
-                "第 %d 轮第 %d 段的 latent 文件缺失，无法恢复父链，回抽已取消；"
-                "请先恢复该轮重跑第 %d 段。"
-                % (int(trial_round), int(target), int(target)))
-    origin_state["relay_run_id"] = new_relay
-    group_history.save_snapshot(STORE, parent, trial_round, origin_state)
+                f"第 {trial_round} 轮第 {target + 1} 段回抽无法确定{dependency}的版本。"
+                f"请先恢复该轮并重跑第 {stage + 1} 段。")
+        saved_stage = int(parent_version["relay_stage_index"])
+        if saved_stage != stage or not _copy_stage(str(parent_version["relay_save_run_id"]), stage, new_chain):
+            raise ValueError(f"第 {trial_round} 轮{dependency} 文件缺失或段号不一致，回抽已取消。"
+                             f"请先恢复该轮并重跑第 {stage + 1} 段。")
+    if new_chain_required:
+        origin_state["relay_run_id"] = new_relay
+        group_history.save_snapshot(STORE, parent, trial_round, origin_state)
     return new_chain
 
 
-def _plan_old_round_reroll(sid, parent, origin_state, target, preview, trial_round, relay_on):
+def _plan_old_round_reroll(sid, parent, origin_state, target, preview, trial_round, relay_on, reanchor=False):
     from . import group_history
     group_history.ensure_rerollable(parent, trial_round)
     target_version = _version_from_preview(origin_state.get("segments") or [], preview)
@@ -185,14 +184,10 @@ def _plan_old_round_reroll(sid, parent, origin_state, target, preview, trial_rou
                          % int(trial_round))
     if not relay_on:
         return ""
-    chain = _recover_old_round_chain(sid, parent, origin_state, target, trial_round, target_version)
-    if target > 0 and not _stage_path(chain, target - 1).is_file():
-        raise ValueError("第 %d 轮第 %d 段缺少上一段 latent，回抽已取消；请先在该轮重跑第 %d 段。"
-                         % (int(trial_round), int(target) + 1, int(target)))
-    return chain
+    return _recover_old_round_chain(sid, parent, origin_state, target, trial_round, target_version, reanchor)
 
 
-def _plan_current_reroll(sid, parent, target, preview, relay_on):
+def _plan_current_reroll(sid, parent, target, preview, relay_on, reanchor=False):
     if not relay_on:
         return ""
     chain = _stable_run(sid, parent.get("relay_run_id") or "")
@@ -203,7 +198,10 @@ def _plan_current_reroll(sid, parent, target, preview, relay_on):
             raise ValueError(
                 "该卡片属于清空重置前的旧批次，还没有归档为独立轮次，不能直接接到当前轮。"
                 "请先点一次「清空重置」（会把当前批次归档成历史轮），再回到该轮抽卡。")
-    if target > 0 and not _stage_path(chain, target - 1).is_file():
+    stage = relay_parent_stage(target, reanchor)
+    if stage is not None and not _stage_path(chain, stage).is_file():
+        if reanchor:
+            raise ValueError(f"第 {target + 1} 段重锚定需要本轮第 1 段外观锚。请先生成并通过第 1 段。")
         raise ValueError(
             "第 %d 段抽卡需要第 %d 段的 latent，但当前新一轮还没有 stage_%05d。"
             "请先在新一轮生成并通过第 %d 段，再抽第 %d 段。"
@@ -660,12 +658,14 @@ def start_trial(data):
             raise ValueError("当前编辑内容中已没有这个段号，请选择仍然存在的片段试跑")
         # 回抽锚点/潜桥链：旧轮锁该轮结构与父 latent；设置仍取当前编辑（提示词/参考/参数）。
         relay_on = _relay_choice(data.get("prompt") or {}, node_id)
+        interval = relay_reanchor_interval(graph[node_id]["inputs"].get("潜桥重锚定"))
+        reanchor = relay_reanchors(interval, target)
         if origin_state is not parent:
             _validate_old_round_plan(origin_segments, child.get("segments") or [], trial_round)
             chain_run = _plan_old_round_reroll(sid, parent, origin_state, target, preview,
-                                               trial_round, relay_on)
+                                               trial_round, relay_on, reanchor)
         else:
-            chain_run = _plan_current_reroll(sid, parent, target, preview, relay_on)
+            chain_run = _plan_current_reroll(sid, parent, target, preview, relay_on, reanchor)
         request = uuid.uuid4().hex
         # 前段尾帧只读原轮选用版本；将元数据拷入独立会话，文件仍由原轮保管。
         for index in range(target):

@@ -12,10 +12,11 @@ import { api } from "../../scripts/api.js";
 import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js";
 import { mountNativePlayer } from "./native_player.js";
 import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js";
+import { installVueNodesGuard } from "./compat_nodes2.js";
 import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js";
 
 import { installRoundQueue } from "./round_queue.js";
-import { migrateLegacyRelay, hideInternalNodeTypes, hideLegacyTypesAfterLoad, restoreLegacyTypesForGraph, prepareSegmentNode, normalizeRelayWidget, relayValue } from "./relay_hidden.js";
+import { migrateLegacyRelay, hideInternalNodeTypes, hideLegacyTypesAfterLoad, restoreLegacyTypesForGraph, prepareSegmentNode, hideLegacyWidgets, normalizeRelayWidget, relayValue } from "./relay_hidden.js";
 installRoundQueue(api, app);
 installProgressEvents(api);
 
@@ -154,7 +155,11 @@ function adSetWidgetReadOnly(widget, value){
     if("readOnly" in options || options.readOnly!==undefined) options.readOnly=!!value;
 }
 
-const AD_INITIAL_SIZES = {AidenH3AudioQueue: [1120, 1411], AidenH3Segment: [350, 0], AidenH3VideoPreview: [760, 785]};
+const SEGMENT_DEFAULT_WIDTH = 390;
+const SEGMENT_MIN_RESTORE_WIDTH = 350; // 保留旧版默认宽度及更宽的自定义尺寸。
+const RELAY_PANEL_HEIGHT = 164;
+const LEGACY_RELAY_HINT_HEIGHT = 30;
+const AD_INITIAL_SIZES = {AidenH3AudioQueue: [1120, 1411], AidenH3Segment: [SEGMENT_DEFAULT_WIDTH, 0], AidenH3VideoPreview: [760, 785]};
 function applyInitialNodeSize(node) {
     const target = AD_INITIAL_SIZES[node?.comfyClass];
     if (!target || !node.graph) return;
@@ -166,7 +171,8 @@ function applyInitialNodeSize(node) {
         let fit = null;
         try { fit = node.computeSize?.(); } catch {}
         const needed = fit && Number.isFinite(fit[1]) ? Math.max(240, Math.round(fit[1])) : height;
-        const nextWidth = Math.max(width, target[0]);
+        const nextWidth = node._adH3InitialSegmentSizeApplied ? width : target[0];
+        node._adH3InitialSegmentSizeApplied = true;
         if (Math.abs(width - nextWidth) > 0.5 || Math.abs(height - needed) > 1) node.setSize([nextWidth, needed]);
         try { node._adRenderResolution?.(); } catch {}
         node.setDirtyCanvas?.(true, true);
@@ -201,6 +207,8 @@ function localizeNode(node){
         const previousConnections=node.onConnectionsChange;
         node.onConnectionsChange=function(){
             const out=previousConnections?.apply(this,arguments);
+            updateSegmentIndexVisibility(this);
+            if (this._adH3Configured || app.configuringGraph) return out;
             try{
                 const need=Math.max(this.size?.[1]||0,this.computeSize?.()[1]||0);
                 if(need>((this.size?.[1])||0)) this.setSize([this.size[0],need]);
@@ -1360,6 +1368,9 @@ function mountRelayHint(node) {
             return link ? node.graph?.getNodeById?.(link.origin_id) : null;
         } catch (_error) { return null; }
     };
+    const selector = (node.widgets || []).find(item => item.name === "潜桥续接");
+    const reanchor = (node.widgets || []).find(item => item.name === "潜桥重锚定");
+    const colorMatch = (node.widgets || []).find(item => item.name === "参考首帧色彩匹配");
     const applyMaterialPlan = () => {
         if (app.configuringGraph) return;
         const value = relayValue(selector?.value);
@@ -1367,46 +1378,118 @@ function mountRelayHint(node) {
         const queue = connectedQueue();
         if (queue && typeof queue._adH3ApplyRelayPlan === "function") queue._adH3ApplyRelayPlan(value);
     };
-    const el = document.createElement("div");
-    el.className = "ad-h3-relay-hint";
-    const selector = (node.widgets || []).find(item => item.name === "潜桥续接");
     const messages = {
         0: "关闭：按原有逐段生成，不启用潜桥。",
         5: "开启 C=5：每段输出=17n，H3生成=输出+5，裁头5帧。",
         22: "开启 C=22（推荐）：每段输出=17n，H3生成=输出+22，裁头22帧。",
         39: "开启 C=39：每段输出=17n，H3生成=输出+39，裁头39帧。",
     };
-    const update = () => {
-        normalizeRelayWidget(node);
-        const value = relayValue(selector?.value);
-        el.textContent = messages[value] || messages[0];
+    const relayOptions = ["0 · 关闭", "5 · 上下文5帧", "22 · 上下文22帧（推荐）", "39 · 上下文39帧"];
+    const reanchorOptions = ["0 · 不重锚定", "2 · 每2段", "3 · 每3段", "5 · 每5段", "7 · 每7段", "10 · 每10段"];
+    const colorOptions = ["0 · 关闭", "0.5 · 半强", "1 · 全强"];
+    const optionsOf = (widget, fallback) => {
+        const values = widget?.options?.values;
+        return Array.isArray(values) && values.length ? values : fallback;
     };
-    const widget = node.addDOMWidget("ad_h3_relay_hint", "div", el, {
-        serialize: false, hideOnZoom: false, getHeight: () => 30,
+    const syncOptions = (select, widget, fallback) => {
+        const options = optionsOf(widget, fallback);
+        select.innerHTML = "";
+        for (const option of options) {
+            const el = document.createElement("option");
+            el.value = String(option);
+            el.textContent = String(option);
+            select.appendChild(el);
+        }
+        const current = String(widget?.value ?? options[0]);
+        if (![...select.options].some(option => option.value === current)) {
+            const el = document.createElement("option");
+            el.value = current;
+            el.textContent = current;
+            select.appendChild(el);
+        }
+        select.value = current;
+    };
+    const panel = document.createElement("div");
+    panel.className = "ad-h3-relay-panel";
+    panel.style.cssText = [
+        "width:calc(100% - 16px)", "margin:0 8px 4px", "box-sizing:border-box",
+        "padding:8px 10px", "border:1px solid rgba(255,255,255,.10)", "border-radius:8px",
+        "background:rgba(10,14,22,.42)", "display:flex", "flex-direction:column", "gap:6px",
+    ].join(";");
+    const hint = document.createElement("div");
+    hint.className = "ad-h3-relay-hint";
+    hint.style.cssText = [
+        "font:11px/1.5 'Microsoft YaHei',system-ui,sans-serif", "color:#9fb4cf",
+        "padding-top:5px", "border-top:1px solid rgba(255,255,255,.08)", "min-height:16px",
+    ].join(";");
+    const rows = [];
+    const addRow = (labelText, widget, fallback, onChange) => {
+        if (!widget) return null;
+        const row = document.createElement("div");
+        row.style.cssText = "display:grid;grid-template-columns:76px minmax(0,1fr);align-items:center;gap:8px;min-height:28px";
+        const label = document.createElement("span");
+        label.textContent = labelText;
+        label.style.cssText = "font:12px/1.3 'Microsoft YaHei',system-ui,sans-serif;color:#c7d3e3;white-space:nowrap";
+        const select = document.createElement("select");
+        select.style.cssText = [
+            "width:100%", "min-width:0", "height:26px", "box-sizing:border-box", "padding:2px 8px",
+            "border-radius:6px", "border:1px solid #4a658a", "background:#1b2534",
+            "color:#e8eef7", "font:12px/1.3 'Microsoft YaHei',system-ui,sans-serif", "outline:none",
+        ].join(";");
+        syncOptions(select, widget, fallback);
+        select.addEventListener("change", () => {
+            if (String(widget.value) === select.value) return;
+            widget.value = select.value;
+            try { widget.callback?.call(widget, select.value); } catch (_error) {}
+            try { node.properties.ad_relay_choice = relayValue(selector?.value); } catch (_error) {}
+            onChange?.(select.value);
+            syncFromNative();
+            node.setDirtyCanvas?.(true, true);
+        });
+        row.append(label, select);
+        panel.appendChild(row);
+        const item = { widget, select };
+        rows.push(item);
+        return item;
+    };
+    addRow("潜桥续接", selector, relayOptions, applyMaterialPlan);
+    addRow("重锚定", reanchor, reanchorOptions);
+    addRow("色彩匹配", colorMatch, colorOptions);
+    panel.appendChild(hint);
+    const updateHint = () => {
+        const value = relayValue(selector?.value);
+        hint.textContent = messages[value] || messages[0];
+    };
+    const syncFromNative = () => {
+        normalizeRelayWidget(node);
+        for (const item of rows) {
+            const current = String(item.widget?.value ?? "");
+            if (item.select.value !== current) item.select.value = current;
+        }
+        updateHint();
+    };
+    node._adH3SyncRelayPanel = syncFromNative;
+    const widget = node.addDOMWidget("ad_h3_relay_panel", "div", panel, {
+        serialize: false, hideOnZoom: false, getHeight: () => RELAY_PANEL_HEIGHT,
     });
     widget.serialize = false;
-    widget.computeSize = width => [width, 30];
-    bindWidgetWidth(node, widget);
+    widget.computeSize = width => [width, RELAY_PANEL_HEIGHT];
     try {
         const list = node.widgets || [];
         const index = list.indexOf(widget);
         if (index >= 0) list.splice(index, 1);
-        const selectorIndex = list.findIndex(item => item.name === "潜桥续接");
-        list.splice(selectorIndex >= 0 ? selectorIndex + 1 : list.length, 0, widget);
+        const prefixIndex = list.findIndex(item => item.name === "ad_h3_prefix_editor");
+        list.splice(prefixIndex >= 0 ? prefixIndex + 1 : list.length, 0, widget);
     } catch (_error) {}
-    if (selector) {
-        const original = selector.callback;
-        selector.callback = function (value) {
-            const result = original?.apply(this, arguments);
-            try { node.properties.ad_relay_choice = relayValue(value); } catch (_error) {}
-            update();
-            applyMaterialPlan();
-            return result;
-        };
+    node._adH3RelayPanelMounted = true;
+    hideLegacyWidgets(node);
+    for (const target of [reanchor, colorMatch]) {
+        if (!target) continue;
+        target.hidden = true;
+        target.type = "hidden";
+        target.computeSize = () => [0, -4];
     }
-    update();
-    for (const delay of [700, 1600, 3200]) setTimeout(() => { update(); applyMaterialPlan(); }, delay);
-    fitNodeToWidgets(node);
+    syncFromNative();
 }
 
 function updateSegmentIndexVisibility(node) {
@@ -1416,7 +1499,7 @@ function updateSegmentIndexVisibility(node) {
         widget.__adH3OriginalCompute = widget.computeSize || null;
         widget.__adH3OriginalHidden = !!widget.hidden;
     }
-    const connected = !!node.inputs?.find(input => input.name === "queue")?.link;
+    const connected = node.inputs?.find(input => input.name === "queue")?.link != null;
     if (connected) {
         widget.hidden = true;
         widget.computeSize = () => [0, -4];
@@ -1463,8 +1546,10 @@ function repairSegmentNode(node) {
     if(prefix&&document.activeElement!==prefix)prefix.value=String(nativePrefix?.value||"");
     node._adRenderResolution?.();
     try {
-        const target = node.computeSize?.();
-        if (target && Number(node.size?.[1]) < target[1] - 4) node.setSize([node.size[0], Math.round(target[1])]);
+        if (!node._adH3Configured && !app.configuringGraph) {
+            const target = node.computeSize?.();
+            if (target && Number(node.size?.[1]) < target[1] - 4) node.setSize([node.size[0], Math.round(target[1])]);
+        }
         node.setDirtyCanvas?.(true, false);
     } catch {}
 }
@@ -1516,7 +1601,14 @@ function setupNode(node) {
       const prevConfigure=node.onConfigure;
       const syncSegmentOutputs=()=>{normalizeSegmentOutputs(node);try{node._adH3ApplyDynamicOutputs?.();}catch(_error){}};
       node.onConfigure=function(){this._adH3Configured=true;this._adH3GraphReady=false;const info=arguments[0];const savedOutputs=(info&&schemasBySavedInfo.get(info))||savedSegmentSchemas.get(String(this.id))||(info&&Array.isArray(info.outputs)?info.outputs.map(output=>({...output,links:[...(output.links||[])]})):null);this._adH3SavedSchema=savedOutputs;const restoreNames=()=>{if(savedOutputs)node.outputs=savedOutputs.map((saved,index)=>{const output=node.outputs?.[index]||{links:[]};output.name=saved.name;output.type=saved.type;output.h3_key=undefined;output.slot_index=index;return output;});};restoreNames();const out=prevConfigure?.apply(this,arguments);restoreNames();
-        const savedValues=savedSegmentWidgetValues.get(info)||{};
+        const savedValues=savedSegmentWidgetValues.get(info)||info?.widgets_values_named||{};
+        const isLegacyPanel = (info?.widgets_values?.length ?? 0) < AD_SEG_WIDGET_NEW_ORDER.length
+            || savedLegacyRelayLayouts.has(info);
+        const savedHeight = Number(info?.size?.[1]);
+        if (isLegacyPanel && savedHeight > 0) {
+            node.setSize([node.size[0], savedHeight + RELAY_PANEL_HEIGHT - LEGACY_RELAY_HINT_HEIGHT]);
+        }
+        updateSegmentIndexVisibility(node);
         const savedSelector=(node.widgets||[]).find(widget=>widget.name==="潜桥续接");
         if(savedSelector&&Object.prototype.hasOwnProperty.call(savedValues,"潜桥续接")){try{savedSelector.value=savedValues["潜桥续接"];}catch(_error){}}
         const applyNamedValues=()=>{
@@ -1531,6 +1623,7 @@ function setupNode(node) {
             normalizeAspectWidget(node);
             reorderSegmentWidgets(node);
             normalizeRelayWidget(node);
+            node._adH3SyncRelayPanel?.();
         };
         applyNamedValues();
         normalizeAspectWidget(node);reorderSegmentWidgets(node);normalizeRelayWidget(node);syncSegmentOutputs();
@@ -1678,10 +1771,11 @@ function registerCustomSlotDefaults(){
     return true;
 }
 const AD_SEG_WIDGET_NEW_ORDER = ["潜桥续接", "aspect_ratio", "megapixels", "multiple",
-    "正向提示词", "统一提示词前缀", "反向提示词", "段索引", "ref_counts", "潜桥模式", "潜桥上下文帧数"];
+    "正向提示词", "统一提示词前缀", "反向提示词", "段索引", "ref_counts", "潜桥模式", "潜桥上下文帧数", "潜桥重锚定", "参考首帧色彩匹配"];
 const AD_SEG_WIDGET_OLD_ORDER = ["aspect_ratio", "megapixels", "multiple",
     "正向提示词", "统一提示词前缀", "反向提示词", "段索引", "ref_counts", "潜桥模式", "潜桥上下文帧数", "潜桥续接"];
-const AD_SEG_WIDGET_DEFAULTS = { "潜桥续接": "0 · 关闭", "潜桥模式": "关闭", "潜桥上下文帧数": "22" };
+const AD_SEG_WIDGET_DEFAULTS = { "潜桥续接": "0 · 关闭", "潜桥重锚定": "0 · 不重锚定", "参考首帧色彩匹配": "0 · 关闭", "潜桥模式": "关闭", "潜桥上下文帧数": "22" };
+const savedLegacyRelayLayouts = new WeakSet();
 
 function remapSegmentWidgetValues(info) {
     if (!info || info.type !== "AidenH3Segment") return;
@@ -1689,6 +1783,9 @@ function remapSegmentWidgetValues(info) {
     info.__adWidgetOrderRemapped = true;
     const oldValues = Array.isArray(info.widgets_values) ? info.widgets_values : [];
     const named = info.widgets_values_named && typeof info.widgets_values_named === "object" ? info.widgets_values_named : {};
+    if (oldValues.length < AD_SEG_WIDGET_NEW_ORDER.length && !Object.hasOwn(named, "潜桥重锚定")) {
+        savedLegacyRelayLayouts.add(info);
+    }
     const map = {};
     for (let i = 0; i < AD_SEG_WIDGET_OLD_ORDER.length; i++) {
         if (i < oldValues.length) map[AD_SEG_WIDGET_OLD_ORDER[i]] = oldValues[i];
@@ -1705,7 +1802,9 @@ function remapSegmentWidgetValues(info) {
 
 app.registerExtension({
     name:"Aiden.H3Loop",
-    async setup(app){
+    async setup(){
+        // 第一优先级：先装 Vue/Nodes 2.0 守卫，避免后面的初始化异常导致守卫静默失效。
+        try { installVueNodesGuard({ app }); } catch (_error) {}
         try { hideInternalNodeTypes(); } catch (_error) {}
         for (const delay of [500, 1500, 3000, 6000]) setTimeout(() => { try { hideLegacyTypesAfterLoad(); } catch (_error) {} }, delay);
         registerCustomSlotDefaults();
@@ -1713,6 +1812,7 @@ app.registerExtension({
         setTimeout(registerCustomSlotDefaults, 3000);
         // 兼容保护：本插件使用 LiteGraph 自定义 DOM 控件，Nodes 2.0 下布局/交互不受支持。
         // 检测到 Nodes 2.0 开启时自动切回经典节点设计，避免功能不可用。
+        // 注意：不能用 setup(app) 参数（ComfyUI 传入的是空参数，会遮蔽模块级 app）。
         for(let attempt=0;attempt<60;attempt++){
             const manager=app?.extensionManager;
             if(manager?.setting?.get){
@@ -1721,7 +1821,7 @@ app.registerExtension({
                         await manager.setting.set("Comfy.VueNodes.Enabled", false);
                         try{
                             manager.toast?.add?.({severity:"warn",summary:"AD-Segmented-Loop",
-                                detail:"已自动切回经典节点设计：本插件使用自定义 DOM 界面，暂不支持 Nodes 2.0。",
+                                detail:"已自动切回经典节点设计：本插件使用自定义 DOM 界面，暂不支持 Nodes 2.0。若界面仍异常请按 Ctrl+F5 刷新。",
                                 life:8000});
                         }catch(_error){}
                     }
@@ -1732,6 +1832,7 @@ app.registerExtension({
         }
     },
     afterLoadGraph(){
+        try { installVueNodesGuard({ app }); } catch (_error) {}
         try { migrateLegacyRelay(app.graph); } catch (error) { console.warn("AD legacy relay migration failed", error); }
         try { hideLegacyTypesAfterLoad(); } catch (_error) {}
         try { hideInternalNodeTypes(); } catch (_error) {}
@@ -1888,6 +1989,8 @@ app.registerExtension({
                     const previous=this.onConfigure;
                     this.onConfigure=function(){
                         const out=previous?.apply(this,arguments);
+                        const [width, height] = this.size;
+                        if (width < SEGMENT_MIN_RESTORE_WIDTH) this.setSize([SEGMENT_DEFAULT_WIDTH, height]);
                         dedupeSegmentOutputs(this);
                         fixReanchor(this);
                         try{this._adH3ApplyDynamicOutputs?.();}catch(_error){}
@@ -1906,6 +2009,7 @@ if(!chineseTitles[nodeData.name])return;
         };
     },
     async nodeCreated(node){
+        try { installVueNodesGuard({ app }); } catch (_error) {}
         try { registerCustomSlotDefaults(); } catch (_error) {}
         if (!app.configuringGraph && (node?.comfyClass || node?.type) === "AidenH3Segment") {
             try { prepareSegmentNode(node); } catch (_error) {}

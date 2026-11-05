@@ -1390,3 +1390,4 @@ try:
     _install_object_info_filter()
 except Exception:
     pass
+

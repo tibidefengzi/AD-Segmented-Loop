@@ -102,12 +102,19 @@ def normalize_video(video,context,state,directory,strict_sync=False):
         print(f"AidenH3: Continuum 已裁重叠（{why}），按目标 {commit_target} 帧入库（收到 {available}）")
         prefix = None
         overlap = 0
-        indices = list(range(commit_target))
     else:
         # 按参考视频帧序列裁剪：保留开头 target 帧，多生成的帧从尾部丢弃。
         prefix=images[:overlap] if overlap else None
-        indices=list(range(overlap, overlap+target))
-    body=images[indices]
+    body_slice=slice(overlap,overlap+commit_target)
+    body=images[body_slice]
+    color_info=None
+    try:
+        from .color_match import apply_reference_color_match
+        body,color_info=apply_reference_color_match(body,context.get("color_match_reference"),context.get("color_match_blend") or 0.0)
+        if color_info:
+            print("[AD-颜色] 参考首帧色彩匹配：%s" % color_info)
+    except Exception as exc:
+        print("[AD-颜色] 参考首帧色彩匹配失败（保留原画面）：%r" % (exc,))
     audio=components.audio or read_audio_entry(entry)
     if audio is not None:
         rate=int(audio["sample_rate"])
@@ -131,7 +138,7 @@ def normalize_video(video,context,state,directory,strict_sync=False):
             if waveform.shape[-1]<needed:waveform=torch.nn.functional.pad(waveform,(0,needed-waveform.shape[-1]))
         audio={"waveform":waveform,"sample_rate":rate}
     base_alpha = alpha_pre if alpha_pre is not None else components.alpha
-    alpha=base_alpha[indices] if base_alpha is not None else None
+    alpha=base_alpha[body_slice] if base_alpha is not None else None
     # 新版 comfy_api 移除了 bit_depth/color_space 参数；按当前签名按需传递。
     import inspect
     accepted=inspect.signature(VideoFromComponents.__init__).parameters
@@ -152,6 +159,8 @@ def normalize_video(video,context,state,directory,strict_sync=False):
     if snap_info:
         details["resolution_snap"]=snap_info
     details["reanchor"]=bool(context.get("reanchor"))
+    if color_info:
+        details["color_match"]=color_info
     details["references"]=context.get("references",{})
     if prefix is not None:
         name=f"overlap_{token}.npy"

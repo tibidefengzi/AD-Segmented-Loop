@@ -596,7 +596,7 @@ export function mountTimelineEditor(node) {
     <span class="h3-path-label" data-path-load>素材路径：</span>
     <button data-library="input" title="重新加载 ComfyUI/input/AD-Segmented-Loop-input 下的图片/音频/视频">重新加载</button>
     <button data-library="generated" title="生成加载 ComfyUI/output/AD-Segmented-Loop 下的图片/音频/视频">生成加载</button>
-    <input data-path-input type="text" placeholder="粘贴完整路径后回车导入" aria-label="素材文件路径">
+    <input data-path-input type="text" placeholder="粘贴完整路径后回车导入（如 E:\素材\a.mp4）" aria-label="素材文件路径">
   </div>
 </div>
 <div class="h3-player" data-player>
@@ -2982,7 +2982,7 @@ export function mountTimelineEditor(node) {
     }
     function dragClip(event, element) {
         if (event.button !== 0) return;
-
+        
         event.preventDefault();
         const resume = T.playing;
         if (resume) stopPlayback();
@@ -4060,7 +4060,7 @@ export function mountTimelineEditor(node) {
         for (const job of audioPending.values()) job.controller.abort();
         audioPending.clear(); audioCache.clear(); void audioCtx?.close(); T.buffers.clear();
         thumbCache.clear();
-
+        
         root.remove();  // 节点删除时必须移除控件，否则残留的幽灵层会截走全部点击
         if (activeEditorRoot === root) activeEditorRoot = null;
         return onRemoved?.apply(this, arguments);
@@ -4086,7 +4086,7 @@ export function mountTimelineEditor(node) {
         $("[data-count]").value = recipe.count || DEFAULT_SEG_COUNT;
     }
     render();
-
+    
     const prevConn = node.onConnectionsChange;
     node.onConnectionsChange = function () {
         const result = prevConn?.apply(this, arguments);

@@ -46,7 +46,7 @@ function relayChoice(node) {
     return mode && mode !== "关闭" && [5, 22, 39].includes(context) ? context : 0;
 }
 
-function hideLegacyWidgets(node) {
+export function hideLegacyWidgets(node) {
     for (const name of ["潜桥模式", "潜桥上下文帧数"]) {
         const w = widget(node, name);
         if (!w) continue;
@@ -56,11 +56,18 @@ function hideLegacyWidgets(node) {
     }
     const selector = widget(node, "潜桥续接");
     if (selector) {
-        selector.type = "combo";
-        selector.hidden = false;
-        try { delete selector.computeSize; } catch (_) {}
+        if (node._adH3RelayPanelMounted) {
+            // 新版 AD-分段生成 已用一整块 DOM 面板承载潜桥/重锚定/色彩匹配；
+            // 原生组合框隐藏，避免重复一行。
+            selector.type = "hidden";
+            selector.hidden = true;
+            try { selector.computeSize = () => [0, -4]; } catch (_) {}
+        } else {
+            selector.type = "combo";
+            selector.hidden = false;
+            try { delete selector.computeSize; } catch (_) {}
+        }
     }
-    try { node.setSize?.(node.computeSize?.() || node.size); } catch (_) {}
     try { node.graph?.setDirtyCanvas?.(true, true); } catch (_) {}
 }
 
@@ -205,6 +212,7 @@ export function migrateLegacyRelay(graph) {
     normalizeRelayWidget(segment);
     try { segment.properties.ad_relay_choice = relayValue(widget(segment, "潜桥续接")?.value); } catch (_error) {}
     hideLegacyWidgets(segment);
+    segment._adH3SyncRelayPanel?.();
 
     // 1b. 旧的 h3-relay ApplyEditMask 迁移到 AD 自己的 EditMask（不依赖外部插件）。
     const legacyEditMask = firstNode(graph, "H3RelayApplyEditMask");
@@ -427,3 +435,4 @@ export function prepareSegmentNode(node) {
     normalizeRelayWidget(node);
     hideLegacyWidgets(node);
 }
+

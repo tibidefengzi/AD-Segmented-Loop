@@ -1,10 +1,25 @@
 """MiniMax H3's timing and canvas contract."""
 import math
+import re
 
 FPS = 24
 MAX_FRAMES = 3600
 REVISION = 5  # 数据根、素材库与帧缓存格式变化参与生成身份
 MULTIPLE = 32
+
+
+def relay_reanchor_interval(raw):
+    match = re.match(r"^\s*(\d+)", str(raw or ""))
+    interval = int(match.group(1)) if match else 0
+    return interval if interval in (0, 2, 3, 5, 7, 10) else 0
+
+
+def relay_reanchors(interval, index):
+    return bool(interval and index > 0 and (index + 1) % interval == 0)
+
+
+def relay_parent_stage(index, reanchor):
+    return (0 if reanchor else index - 1) if index > 0 else None
 
 
 def frame_index(seconds):

@@ -7,6 +7,9 @@ import math
 
 from . import assets
 from . import compat
+from .color_match import COLOR_MATCH_CHOICES as _COLOR_MATCH_CHOICES, parse_blend as _color_match_blend, reference_frame_stats
+from .normalization import normalize_source
+from .spec import relay_reanchor_interval as _relay_reanchor_interval, relay_reanchors, relay_parent_stage
 from .audio import h3_window, read_audio_entry, read_pieces
 from .engine import reference_manifest, segment_signatures, template_for
 from .storage import ROOT, STORE, digest
@@ -61,6 +64,16 @@ RELAY_CHOICES = (
 )
 RELAY_CHOICE_VALUES = {"0 · 关闭": 0, "5 · 上下文5帧": 5,
                        "22 · 上下文22帧（推荐）": 22, "39 · 上下文39帧": 39}
+# 潜桥链重锚定：每 N 段清一次上一段 latent 上下文（第 N、2N…段从当前段源画面/提示词重新锚定）。
+# 用于抑制长链自回归累积的“越跑越糊 / 越跑越暗”；0=关闭。
+RELAY_REANCHOR_CHOICES = (
+    "0 · 不重锚定",
+    "2 · 每2段",
+    "3 · 每3段",
+    "5 · 每5段",
+    "7 · 每7段",
+    "10 · 每10段",
+)
 
 
 def _relay_choice_value(raw):
@@ -78,6 +91,7 @@ def _relay_choice_value(raw):
         if value in (0, 5, 22, 39):
             return value
     return 0
+
 
 # 参考视频口输出统一等比缩放到“最长边 864”像素（用户 2026-10-29 确认）。
 # H3 内部还会按自己的 adapt_canvas（短边 768 / 面积上限 768×1344 / 32 对齐）再重采样；
@@ -691,14 +705,17 @@ def _relay_stage_file(run_id, stage_index):
     return root / str(run_id) / ("stage_%05d.safetensors" % int(stage_index))
 
 
-def _require_parent_relay_stage(run_id, index, label=""):
-    """潜桥续接第 2 段起必须先有上一段稳定 stage，否则桥接会读到空父 latent。"""
-    previous = int(index) - 1
-    if previous < 0:
+def _require_parent_relay_stage(run_id, index, label="", reanchor=False):
+    """普通续接使用上一段，重锚定使用该轮第 1 段。"""
+    previous = relay_parent_stage(int(index), reanchor)
+    if previous is None:
         return
     path = _relay_stage_file(run_id, previous)
     if not path.is_file():
         scope = ("（%s）" % label) if label else ""
+        if reanchor:
+            raise ValueError(f"潜桥重锚定需要本轮第 1 段的外观锚{scope}，但稳定目录里还没有 stage_00000。"
+                             "请恢复或重新生成并通过第 1 段，再继续重锚定。")
         raise ValueError(
             "潜桥续接需要上一段（第 %d 段）的 latent%s，但稳定目录里还没有 stage_%05d。"
             "请先在第 %d 段所在轮次生成/通过该段，或用「运行此段」重跑后再抽卡。"
@@ -788,42 +805,73 @@ def relay_plan(target, context, mode=None):
             "trim_frames": context, "pre_roll_frames": context}
 
 
-def _reference_video_window_frames(lane, source_map, start, end):
-    """参考视频按当前段窗口裁剪：只解码与本段 [start,end] 相交的片段范围，按时间顺序拼接。
+def _reference_spans(lane, sources, start, end):
+    from .spec import frame_index
+    for clip in sorted(lane, key=lambda item: item["tl_start"]):
+        clip_start, clip_end = map(frame_index, clip_span(clip))
+        lo, hi = max(start, clip_start), min(end, clip_end)
+        if hi > lo:
+            yield clip, sources[clip["source"]], lo, hi, frame_index(clip["src_in"]) + lo - clip_start
 
-    - 帧数 = 本段在时间线上的实际帧数（与本段视频口一致），不再跟生成帧数（17k+5 上吸值）对齐；
-    - 单条铺满整条时间线的素材也会按段切开；
-    - 统一缩放到最长边 REF_VIDEO_LONG_EDGE；不足 5 帧用末帧补足（H3 参考视频下限）。
-    """
+
+def _normalized_reference(source, cache):
+    key = (source.get("origin"), source.get("file"))
+    if not all(key):
+        return source
+    if key not in cache:
+        cache[key] = normalize_source({**source, "kind": "video"})
+    return cache[key]
+
+
+def _reference_video_window_frames(lane, source_map, start, end, target_frames=None, *,
+                                   body_start=None, cache=None, canvas=None, stats=None):
+    """按 24 FPS 时间线帧位写入 G 帧。段内空隙留黑，缺失预卷前补，段尾余量保持末帧。"""
     import torch
-    pieces = []
-    for clip in sorted(lane or [], key=lambda item: clip_span(item)[0]):
-        lo = max(float(start), float(clip_span(clip)[0]))
-        hi = min(float(end), float(clip_span(clip)[1]))
-        if hi - lo <= .5 / FPS:
-            continue
-        source = source_map[clip["source"]]
-        first = float(clip["src_in"]) + (lo - float(clip_span(clip)[0]))
-        last = first + (hi - lo)
-        frames = _video_frames(source, start_time=first, end_time=last, long_edge=REF_VIDEO_LONG_EDGE)
-        if frames is not None and len(frames):
-            if frames.shape[0] < 5:
-                frames = torch.cat([frames, frames[-1:].expand(5 - frames.shape[0], -1, -1, -1)], dim=0)
-            pieces.append(frames)
-    if not pieces:
+    from .spec import frame_index
+    start, end = frame_index(start), frame_index(end)
+    count = int(target_frames or max(5, end - start))
+    end = min(end, start + count)
+    body_start = start if body_start is None else body_start
+    spans = list(_reference_spans(lane or [], source_map, start, end))
+    if not any(hi > body_start for _, _, _, hi, _ in spans):
         return None
-    if len(pieces) == 1:
-        return pieces[0]
-    height, width = int(pieces[0].shape[1]), int(pieces[0].shape[2])
-    # 直接写入拼接结果，避免同时保留各片段的整批缩放副本再cat。
-    result = torch.empty((sum(len(item) for item in pieces), height, width, 3), dtype=pieces[0].dtype)
-    chunk = max(1, (32 * 1024 * 1024) // max(1, height * width * 3 * result.element_size()))
-    offset = 0
-    for item in pieces:
-        for begin in range(0, len(item), chunk):
-            part = _fit_reference_frames(item[begin:begin + chunk], height, width)
-            result[offset:offset + len(part)] = part
-            offset += len(part)
+    cache = {} if cache is None else cache
+    result, cursor = None, 0
+    for _, source, lo, hi, first in spans:
+        normalized = _normalized_reference(source, cache)
+        frames = _video_frames(normalized, start_time=first / FPS, end_time=(first + hi - lo) / FPS,
+                               long_edge=REF_VIDEO_LONG_EDGE)
+        if frames is None or not len(frames):
+            continue
+        frames = frames[:hi - lo]
+        offset = lo - start
+        if stats is not None and not stats and lo + len(frames) > body_start:
+            first_body = max(body_start - lo, 0)
+            stats.update(reference_frame_stats(frames[first_body], normalized, first + first_body))
+        if result is None and not canvas and offset == 0 and len(frames) == count:
+            return frames
+        if result is None:
+            height, width = canvas or tuple(frames.shape[1:3])
+            result = torch.from_numpy(_frame_buffer((count, height, width, 3)))
+            chunk = max(1, (32 * 1024 * 1024) // (height * width * 3 * result.element_size()))
+        if cursor < offset:
+            result[cursor:offset].zero_()
+        for begin in range(0, len(frames), chunk):
+            part = _fit_reference_frames(frames[begin:begin + chunk], height, width)
+            result[offset + begin:offset + begin + len(part)].copy_(part)
+        if cursor == 0 and 0 < offset <= body_start - start:
+            result[:offset].copy_(result[offset:offset + 1].expand_as(result[:offset]))
+        written = offset + len(frames)
+        cursor = hi - start
+        if written < cursor:
+            result[written:cursor].copy_(result[written - 1:written].expand_as(result[written:cursor]))
+        del frames, part
+    if result is not None:
+        body_end = end - start
+        if cursor < body_end:
+            result[cursor:body_end].zero_()
+        if body_end < count:
+            result[body_end:].copy_(result[body_end - 1:body_end].expand_as(result[body_end:]))
     return result
 def _full_lane_audio_pieces(lane, source_map):
     """整条音频复用：按时间线顺序拼接该轨道所有片段，不受当前段起止范围裁剪。"""
@@ -843,27 +891,29 @@ def _lane_muted(state, kind, number):
     return number < len(flags) and bool(flags[number])
 
 
-def _reference_video_audio(state, number, lane, sources, start, end):
+def _reference_video_audio(state, number, lane, sources, start, end, target_frames=None, *, cache=None):
     import torch
+    from .spec import frame_index
     rate = 48000
-    result = torch.zeros((1, 2, max(1, round((end - start) * rate))))
+    samples_per_frame = rate // FPS
+    start, end = frame_index(start), frame_index(end)
+    frames = int(target_frames or max(1, end - start))
+    result = torch.zeros((1, 2, frames * samples_per_frame))
     if not _lane_muted(state, "video", number):
-        for clip in lane:
-            lo, hi = max(start, clip_span(clip)[0]), min(end, clip_span(clip)[1])
-            source = sources[clip["source"]]
-            flags = (state.get("muted_tracks") or {}).get("video_tracks") or []
-            if hi <= lo or clip.get("audio_muted") or (source.get("muted") and number >= len(flags)):
+        flags = (state.get("muted_tracks") or {}).get("video_tracks") or []
+        cache = {} if cache is None else cache
+        for clip, source, lo, hi, first in _reference_spans(lane, sources, start, min(end, start + frames)):
+            if clip.get("audio_muted") or (source.get("muted") and number >= len(flags)):
                 continue
-            path = assets.resolve_source(_original_source(source))
+            path = assets.resolve_source(_normalized_reference(source, cache))
             if not assets.has_audio_stream(path):
                 continue
-            begin = round((clip["src_in"] + lo - clip["tl_start"]) * rate)
-            count = round((hi - lo) * rate)
+            begin, count = first * samples_per_frame, (hi - lo) * samples_per_frame
             wave = _audio_window_seek(path, begin, count, rate)
             if wave is None:
                 wave = _audio_window_full(path, begin, count, rate)
             if wave is not None:
-                at = round((lo - start) * rate)
+                at = (lo - start) * samples_per_frame
                 chunk = torch.from_numpy(wave)
                 if chunk.shape[0] == 1:
                     chunk = chunk.expand(2, -1)
@@ -898,11 +948,13 @@ def _video_clip_audio(state, number, clip, source_map):
     return {"waveform": result, "sample_rate": rate}
 
 
-def _timeline_material_values(queue, used=None, index=None, window=None):
+def _timeline_material_values(queue, used=None, index=None, window=None, *,
+                              media_details=None, mask_size=None, mask_source=None, color_match=False):
     """紧凑顺序：图 -> 视频 -> 视频音频 -> 音频，末尾 None 垫满；与前端动态口一致。
 
     used 为下游实际连接的输出口序号集合；未连接的口不加载素材（避免无谓解码）。
     """
+    from .spec import frame_index
     state = output_timeline(queue.get("timeline") or {})
     sources = state.get("sources") or []
     image_sources = [source for source in sources if source.get("kind") == "image"]
@@ -913,10 +965,21 @@ def _timeline_material_values(queue, used=None, index=None, window=None):
     audio_lanes = list(enumerate(state.get("audio_tracks") or []))
     source_map = {source["id"]: source for source in sources}
     entry = (queue.get("entries") or [])[index or 0] if queue.get("entries") else None
-    start = float(entry.get("source_start") or 0) if entry else 0.0
+    segment_start = float(entry.get("source_start") or 0) if entry else 0.0
     seconds = (int(window["target_frames"]) / FPS if window else
                round(float(entry["seconds_float"]) * FPS) / FPS if entry else float(state.get("duration") or 0))
-    end = start + seconds
+    # 参考视频帧数跟本段生成帧数 G 一致：C=0 为 17k+5 向上取整，潜桥为 L+C。
+    # 多出的补充帧最终由 commit 裁掉；C>0 时窗口前移 C 帧，把上一段尾部作为参考上下文。
+    reference_count = int((window or {}).get("frame_count") or (window or {}).get("target_frames") or frame_index(seconds))
+    pre_roll = int((window or {}).get("pre_roll_frames") or 0)
+    body_start = frame_index(segment_start)
+    body_end = body_start + frame_index(seconds)
+    if entry:
+        body_end = min(body_end, frame_index(segment_start + float(entry["seconds_float"])))
+    reference_start = (body_start - pre_roll) / FPS
+    reference_end = body_end / FPS
+    normalized = {}
+    color_stats = {} if color_match else None
     def needed(slot):
         return used is None or slot in used
     values = []
@@ -929,16 +992,21 @@ def _timeline_material_values(queue, used=None, index=None, window=None):
         allowed = source is not None and image_scopes.get(source.get("id"), -1) in (-1, 0, segment_index + 1)
         values.append(assets.load_image_tensor(source) if needed(slot) and allowed else None)
     video_base = base + MAX_IMAGE_PORTS
-    # 参考视频帧数 = 本段在时间线上的实际帧数（与本段视频一致），不跟生成帧数对齐。
+    # 参考视频/参考视频音频帧数 = 本段生成帧数 G（C=0 为 17k+5 向上取整，潜桥为 L+C）；最终成片再裁回本段目标帧数。
     for index in range(MAX_VIDEO_PORTS):
         slot = video_base + index
         frames = None
         if needed(slot) and index < len(video_lanes) and seconds > 0:
-            number, lane = video_lanes[index]
+            _, lane = video_lanes[index]
             # 参考视频按段窗口裁剪 + 统一缩放到最长边 REF_VIDEO_LONG_EDGE；
             # 视频轨静音只影响声音，不隐藏画面。
             if lane:
-                frames = _reference_video_window_frames(lane, source_map, start, end)
+                stats = color_stats if color_stats is not None and not color_stats else None
+                frames = _reference_video_window_frames(lane, source_map, reference_start,
+                                                        reference_end, target_frames=reference_count,
+                                                        body_start=body_start, cache=normalized, stats=stats)
+                if stats:
+                    stats["track"] = index + 1
         values.append(frames)
     audio_video_base = base + MAX_IMAGE_PORTS + MAX_VIDEO_PORTS
     for index in range(MAX_VIDEO_PORTS):
@@ -946,7 +1014,9 @@ def _timeline_material_values(queue, used=None, index=None, window=None):
         if needed(slot) and index < len(video_lanes) and seconds > 0:
             number, lane = video_lanes[index]
             # 参考视频音频同样按当前段窗口取该轨道的音轨（空隙补静音，轨道静音则全静音）。
-            values.append(_reference_video_audio(state, number, lane, source_map, start, end) if lane else None)
+            values.append(_reference_video_audio(state, number, lane, source_map,
+                                                 reference_start, reference_end, reference_count,
+                                                 cache=normalized) if lane else None)
         else:
             values.append(None)
     audio_base = base + MAX_IMAGE_PORTS + 2 * MAX_VIDEO_PORTS
@@ -971,6 +1041,29 @@ def _timeline_material_values(queue, used=None, index=None, window=None):
             values.append(read_pieces(pieces) if pieces else None)
         else:
             values.append(None)
+    if media_details is not None and (mask_size or color_match):
+        primary = (entry or {}).get("video_source") or {}
+        primary_key = (primary.get("origin"), primary.get("file"))
+        primary_index, primary_lane = next(((number, lane) for number, lane in video_lanes if primary and any(
+            (source.get("origin"), source.get("file")) == primary_key
+            for _, source, _, _, _ in _reference_spans(lane, source_map, body_start, body_end))), (None, None))
+        if mask_size and mask_source and primary_lane and (mask_source.get("origin"), mask_source.get("file")) == primary_key:
+            media_details["mask_frames"] = _reference_video_window_frames(
+                primary_lane, source_map, reference_start, reference_end, reference_count,
+                body_start=body_start, cache=normalized, canvas=mask_size)
+        if color_match:
+            if not color_stats and primary_lane:
+                _, source, _, _, first = next(_reference_spans(primary_lane, source_map, body_start, body_end))
+                try:
+                    source = _normalized_reference(source, normalized)
+                    frame = _video_frames(source, start_time=first / FPS, end_time=(first + 1) / FPS,
+                                          long_edge=REF_VIDEO_LONG_EDGE)
+                    if frame is not None and len(frame):
+                        color_stats = reference_frame_stats(frame[0], source, first)
+                        color_stats["track"] = primary_index + 1
+                except Exception as exc:
+                    print("[AD-颜色] 读取本段参考色彩失败：%r" % (exc,))
+            media_details["color_match_reference"] = color_stats or None
     return values
 
 
@@ -1224,7 +1317,9 @@ class AidenH3Segment:
                              "段索引": ("INT", {"default": -1, "min": -1, "max": 9999, "tooltip": "独立模式下的起始段索引；-1 表示 0，由分段循环自动设置"}),
                              "ref_counts": ("STRING", {"default": "{}", "tooltip": "动态参考口数量（前端自动写入）"}),
                              "潜桥模式": (list(RELAY_MODES), {"default": "关闭", "tooltip": "关闭=原有逐段生成；普通多参考=自选17倍数段长做潜桥；动作迁移预卷=源视频动作迁移/人物替换，前置预卷后裁头，保持65帧等任意目标帧数"}),
-                             "潜桥上下文帧数": (list(RELAY_CONTEXTS), {"default": "22", "tooltip": "旧参数：兼容旧工作流，前端会自动迁移"})},
+                             "潜桥上下文帧数": (list(RELAY_CONTEXTS), {"default": "22", "tooltip": "旧参数：兼容旧工作流，前端会自动迁移"}),
+                             "潜桥重锚定": (list(RELAY_REANCHOR_CHOICES), {"default": "0 · 不重锚定", "tooltip": "每 N 段清一次潜桥上下文（第 N、2N…段不读取上一段 latent，从当前段源画面/提示词重新锚定）；可缓解长链越跑越糊/越跑越暗。0=关闭"}),
+                             "参考首帧色彩匹配": (list(_COLOR_MATCH_CHOICES), {"default": "0 · 关闭", "tooltip": "按本段参考视频首帧的亮度/白平衡校正生成画面（整段固定偏移，不逐帧自动增益，不做 VAE 往返）；0=关闭"})},
                 "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
     RETURN_TYPES = SegmentOutputTypes(SEGMENT_FIXED_TYPES + tuple(
@@ -1366,7 +1461,10 @@ class AidenH3Segment:
         relay_active = bool(relay_context > 0 and not batch_source)
         relay_pre_roll = 0
         relay_trim_frames = 0
+        relay_reanchor_every = 0
+        relay_reanchor = False
         relay_run_id = ""
+        color_match_blend = _color_match_blend(kwargs.get("参考首帧色彩匹配"))
         relay_save_run_id = ""
         relay_stage_index = int(index)
         if relay_active:
@@ -1390,10 +1488,15 @@ class AidenH3Segment:
             relay_trim_frames = plan["trim_frames"]
             relay_pre_roll = plan["pre_roll_frames"]
             relay_run_id, relay_save_run_id, relay_stage_index = _relay_identity(session_id, session, index)
+            # 分段重锚定：第 N、2N…段跳过上一段 latent，从当前段源画面/提示词重新起锚。
+            relay_reanchor_every = _relay_reanchor_interval(kwargs.get("潜桥重锚定"))
+            relay_reanchor = relay_reanchors(relay_reanchor_every, int(index))
+            if relay_reanchor:
+                print("[AD-潜桥] 第 %d 段重锚定：跳读上一段 latent，从当前段重新起锚" % (int(index) + 1))
             # 上一段的稳定 stage 是桥接的唯一父 latent 来源；缺失说明存盘/提升还没完成，
             # 必须显式报错，不能带着空父 latent 静默生成（预览子会话用父段号校验）。
             relay_label = str((session.get("preview_parent") or {}).get("group_label") or "")
-            _require_parent_relay_stage(relay_run_id, relay_stage_index, relay_label)
+            _require_parent_relay_stage(relay_run_id, relay_stage_index, relay_label, reanchor=relay_reanchor)
         used = None
         if isinstance(prompt, dict) and unique_id is not None:
             slots = set()
@@ -1420,6 +1523,7 @@ class AidenH3Segment:
             mapped = {"start_frame": round(timeline_video["src_in"] * FPS),
                       "end_frame": round(timeline_video["src_out"] * FPS)}
             window.update(video_window(mapped, window["target_frames"], window["overlap_frames"]))
+        window["pre_roll_frames"] = int(relay_pre_roll)
         prompts = state.get("prompts") or []
         state_prompt = str(prompts[index % len(prompts)]) if prompts else ""
         context = {"session_id": session_id, "token": run_token, "index": index,
@@ -1441,10 +1545,13 @@ class AidenH3Segment:
                    "relay_run_id": relay_run_id,
                    "relay_save_run_id": relay_save_run_id,
                    "relay_stage_index": relay_stage_index,
-                   # 裁头必须从 context 拿到 C，否则内部裁头会静默按 0 帧处理。
+                   # 裁头必须从 context 拿到 C，否则内部裁头会静默按 0 帧处理（v0.5.4 音频/画面裁切失效的根因）。
                    "relay_trim_frames": int(relay_trim_frames),
                    "relay_context_frames": int(relay_context),
                    "relay_pre_roll_frames": int(relay_pre_roll),
+                   "relay_reanchor": bool(relay_reanchor),
+                   "relay_reanchor_every": int(relay_reanchor_every),
+                   "color_match_blend": float(color_match_blend),
                    **window}
         source_video = _source_video(entry["source_video"], state) if (need(12) and entry.get("source_video")) else None
         original_audio = _original_audio(entry, state, index) if need(13) and not batch_source else None
@@ -1500,7 +1607,12 @@ class AidenH3Segment:
                 schema_used.update(canonical + part for part in range(active) if compact + part in used)
                 compact += active
                 canonical += size
-        refs = list(_timeline_material_values(queue, schema_used, index, window))
+        media_details = {}
+        refs = list(_timeline_material_values(
+            queue, schema_used, index, window, media_details=media_details,
+            mask_size=(height, width) if need(extra_slot) and not batch_source else None,
+            mask_source=segment_source, color_match=bool(color_match_blend and not batch_source)))
+        context["color_match_reference"] = media_details.get("color_match_reference")
         out_refs = []
         offset = 0
         for size, count in zip(sizes, wanted):
@@ -1510,8 +1622,8 @@ class AidenH3Segment:
                 out_refs.extend(refs[offset:offset + size])
             offset += size
         out_refs.extend(refs[offset:])
-        extra_frames = None
-        if need(extra_slot) and segment_source is not None and not batch_source:
+        extra_frames = media_details.get("mask_frames")
+        if "mask_frames" not in media_details and need(extra_slot) and segment_source is not None and not batch_source:
             if relay_active:
                 extra_frames = _relay_mask_frames(segment_source, window, width, height, relay_pre_roll)
             else:
@@ -2245,6 +2357,22 @@ class ADH3InternalBridge:
         run_id = str(ctx.get("relay_run_id") or "ad_relay")
         stage = int(ctx.get("relay_stage_index") or 0)
         upstream = _relay_vendor_runtime.H3RelayCopyBridge()
+        if ctx.get("relay_reanchor"):
+            # 分段重锚定：不再读“上一段”的尾 latent，但仍用第 1 段的稳定 stage 作为
+            # 全局外观锚（人物身份/服装/环境）。失败时明确停止，避免本段丢失角色身份。
+            _require_parent_relay_stage(run_id, stage, reanchor=True)
+            anchor_path = _relay_stage_file(run_id, 0)
+            try:
+                from ._relay_vendor import relay_core as _relay_core
+                anchor = _relay_core.load_av_latent(str(anchor_path))
+                result = upstream.bridge(latent, context_latent=anchor,
+                                         context_frames=int(context_frames),
+                                         mask_mode=str(mask_mode or "hard"),
+                                         pin_audio=bool(pin_audio),
+                                         run_id=run_id, stage_index=stage)
+            except Exception as exc:
+                raise ValueError(f"潜桥重锚定失败，本轮第 1 段外观锚无法读取或无法与本段续接：{exc}") from exc
+            return (result[0],)
         result = upstream.bridge(latent, context_frames=int(context_frames), mask_mode=str(mask_mode or "hard"),
                                  pin_audio=bool(pin_audio), run_id=run_id, stage_index=stage)
         return (result[0],)
@@ -2309,7 +2437,7 @@ class ADH3InternalTrim:
             # 兼容防线：旧前端/旧序列化没有携带裁头帧数时不能静默按 0 帧处理。
             raise ValueError(
                 "潜桥裁头缺少 relay_trim_frames：本次提交与后台版本不匹配。"
-                "请保存工作流后重新点「开始」；若仍出现，请重启 ComfyUI 并刷新网页后重试。")
+                "请保存工作流后重新点「开始」；若仍出现，请更新插件到 0.5.5 并重启 ComfyUI。")
         frames = int(ctx.get("relay_trim_frames") or 0)
         upstream = _relay_vendor_runtime.H3RelayTrimAV()
         before_images = int(images.shape[0])
