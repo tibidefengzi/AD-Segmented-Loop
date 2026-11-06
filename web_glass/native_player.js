@@ -224,6 +224,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         +   '<div class="ad-h3-ab-vpane" data-ab-vpane-a><video data-ab-va muted playsinline preload="metadata"></video></div>'
         +   '<div class="ad-h3-ab-vpane ad-h3-ab-vpane-b" data-ab-vpane-b><video data-ab-vb muted playsinline preload="metadata"></video></div>'
         +   '<div class="ad-h3-ab-vdivider" data-ab-vdivider></div>'
+        +   '<div class="ad-h3-ab-error" data-ab-error hidden></div>'
         + '</div>'
         + '<span class="ad-h3-ab-tag" style="left:8px">A</span><span class="ad-h3-ab-tag" style="right:8px">B</span>'
         + '<div class="ad-h3-ab-audios" hidden><div class="ad-h3-ab-acell"><audio data-ab-aa controls preload="metadata"></audio></div>'
@@ -270,6 +271,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const abFloatingFullscreen = abOverlay.querySelector(".ad-h3-ab-fullscreen");
     const abFloatingExit = abOverlay.querySelector(".ad-h3-ab-exit");
     const abVideoExit = abOverlay.querySelector("[data-ab-exit-video]");
+    const abErrorBanner = abOverlay.querySelector("[data-ab-error]");
     let abMode = "split";        // 图片：split=独立左右；slider=叠加滑杆
     let abVideoMode = "wipe";    // 视频：wipe=叠加擦除；side=独立左右
     let abFocus = "B";
@@ -280,14 +282,29 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     let abAudioMode = "muted";    // muted | a | b
     let abFrameSync = false, abFrameSyncing = false, abSeeking = false;
     let abSyncRaf = 0, abSyncToken = 0;
+    let abPairToken = 0;                 // 每换一组 A/B 就 +1，作废上一组迟到的异步回调
+    let abAlignOnTick = false;           // 播放开始后第一帧对齐一次，修正某一路晚起
+    const abVideoError = {A: false, B: false}; // 视频加载失败标记（界面提示用）
     let abOpenMenu = null, abOpenMenuFor = null;
     const isABVideo = () => !!(abSlots.A && abSlots.B && abSlots.A.kind === "video" && abSlots.B.kind === "video");
     const isABImage = () => !!(abSlots.A && abSlots.B && abSlots.A.kind === "image" && abSlots.B.kind === "image");
     const isABAudio = () => !!(abSlots.A && abSlots.B && abSlots.A.kind === "audio" && abSlots.B.kind === "audio");
     const markABMode = () => { abOverlay.dataset.zoom = isABVideo() ? "canvas" : (abMode === "split" ? "image" : "canvas"); };
+    // 两路总帧数相同且帧率可读时才允许按帧同步（同步后按帧率比维持对齐）。
+    const abFramePairReady = () => {
+        const infoA = abInfo.A, infoB = abInfo.B;
+        return !!(infoA.frames > 0 && infoA.frames === infoB.frames && infoA.fps > 0 && infoB.fps > 0);
+    };
+    const abVideoDuration = media => Number(media.duration) || 0;
     const abTimeline = () => {
-        const durations = [Number(abVideoA.duration) || Number(abInfo.A.duration) || 0,
-            Number(abVideoB.duration) || Number(abInfo.B.duration) || 0].filter(value => value > 0);
+        // 普通对比按两路较短时长；按帧同步后以 A 的时间线为准（B 用帧率比换算），
+        // 这样同帧数、不同帧率的两段也能拖到最后一帧，不会停在较短一路的末尾。
+        if (abFrameSync && abFramePairReady()) {
+            const infoA = abInfo.A;
+            return abVideoDuration(abVideoA) || Number(infoA.duration) || infoA.frames / infoA.fps || 0;
+        }
+        const durations = [abVideoDuration(abVideoA) || Number(abInfo.A.duration) || 0,
+            abVideoDuration(abVideoB) || Number(abInfo.B.duration) || 0].filter(value => value > 0);
         return durations.length ? Math.min(...durations) : 0;
     };
     const abStepSeconds = () => 1 / Math.max(abFps.A || 24, abFps.B || 24, 1);
@@ -327,17 +344,20 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const fetchMediaFps = async (record) => (await fetchMediaInfo(record)).fps;
     const updateABButtons = () => {
         const video = isABVideo();
+        const failed = video && (abVideoError.A || abVideoError.B);
         if (abSyncPlayButton) abSyncPlayButton.textContent = (video && (!abVideoA.paused || !abVideoB.paused)) ? "重新播放" : "同步播放";
         if (abSpeedButton) abSpeedButton.textContent = `播放速度 ${abSpeed}x`;
         if (abAudioButton) abAudioButton.textContent = abAudioMode === "a" ? "音频 A" : abAudioMode === "b" ? "音频 B" : "静音";
         if (abFrameSyncButton) {
-            const ready = !!(abInfo.A.frames > 0 && abInfo.A.frames === abInfo.B.frames && abInfo.A.fps > 0 && abInfo.B.fps > 0);
+            const ready = abFramePairReady() && !failed;
             abFrameSyncButton.disabled = !ready || abFrameSyncing;
-            abFrameSyncButton.title = ready ? "总帧数相同时按帧编号同步" : "两个视频总帧数不一致，无法按帧同步";
+            abFrameSyncButton.title = !abFramePairReady()
+                ? "两个视频总帧数不一致，无法按帧同步"
+                : failed ? "有一路视频加载失败，无法按帧同步" : "总帧数相同时按帧编号同步";
             abFrameSyncButton.classList.toggle("on", abFrameSync);
         }
         if (abVideoModeButton) abVideoModeButton.textContent = abVideoMode === "wipe" ? "独立左右" : "叠加擦除";
-        for (const button of abStepButtons) button.disabled = !video;
+        for (const button of abStepButtons) button.disabled = !video || failed;
     };
     const updateABProgress = (time, total = abTimeline()) => {
         const duration = Math.max(0, Number(total) || 0);
@@ -353,9 +373,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         abVideoA.muted = abAudioMode !== "a";
         abVideoB.muted = abAudioMode !== "b";
     };
+    // 帧同步后若两路帧率不同，用 A/B 帧率比补偿 B 的 playbackRate，
+    // 让两边保持同一帧号（例如 A=24fps、B=30fps 时 B 按 0.8 倍跟随 A）。
+    const abFrameRateRatio = () => (abFrameSync && abFramePairReady() && abFps.A > 0 && abFps.B > 0) ? abFps.A / abFps.B : 1;
     const applyABRates = () => {
         abVideoA.playbackRate = abSpeed;
-        abVideoB.playbackRate = abSpeed;
+        abVideoB.playbackRate = abSpeed * abFrameRateRatio();
     };
     const applyVideoLayout = () => {
         const side = abVideoMode === "side";
@@ -422,10 +445,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     };
     document.addEventListener("pointerdown", onABDocPointerDown, true);
     // 两路播放：暂停时对齐 B；播放中不做持续 seek 纠偏（避免卡顿），只按 TE 方式一起播放。
+    // 帧同步后按帧率比补偿 B 的播放速度；只有出现大漂移才补一次 seek。
     const stopABSyncLoop = () => {
         if (abSyncRaf) cancelAnimationFrame(abSyncRaf);
         abSyncRaf = 0;
     };
+    const abFrameIndexOf = (media, info) => Math.max(0, Math.round((media.currentTime || 0) * (Number(info.fps) || 24)));
     const alignBToTime = () => {
         if (!isABVideo()) return;
         const target = Math.min(abVideoA.currentTime || 0, abVideoB.duration || Infinity);
@@ -433,14 +458,38 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     };
     const alignBToFrame = () => {
         const infoA = abInfo.A, infoB = abInfo.B;
-        if (!(infoA.frames > 0 && infoA.frames === infoB.frames) || !(infoA.fps > 0 && infoB.fps > 0)) return false;
-        const frame = Math.max(0, Math.min(infoA.frames - 1, Math.round((abVideoA.currentTime || 0) * infoA.fps)));
+        if (!abFramePairReady()) return false;
+        const frame = Math.max(0, Math.min(infoA.frames - 1, abFrameIndexOf(abVideoA, infoA)));
         abVideoB.currentTime = Math.min(frame / infoB.fps, abVideoB.duration || Infinity);
         return true;
+    };
+    const paintABErrorBanner = () => {
+        if (!abErrorBanner) return;
+        const messages = [];
+        for (const side of ["A", "B"]) {
+            if (!abVideoError[side]) continue;
+            const name = String(abSlots[side]?.file || "").split("/").pop() || "文件不可用";
+            messages.push(`${side} 路视频加载失败：${name}`);
+        }
+        abErrorBanner.textContent = messages.join("；");
+        abErrorBanner.hidden = messages.length === 0;
+    };
+    const failABVideo = side => {
+        if (!isABVideo() || abVideoError[side]) return;
+        abVideoError[side] = true;
+        paintABErrorBanner();
+        pauseABVideos();
+        updateABProgress(abVideoA.currentTime || 0, abTimeline());
+        setABHint(`${side} 路视频加载失败：${String(abSlots[side]?.file || "").split("/").pop() || "文件不可用"}；请退出对比后重选或检查文件。`);
+    };
+    const clearABVideoErrors = () => {
+        abVideoError.A = false; abVideoError.B = false;
+        if (abErrorBanner) { abErrorBanner.hidden = true; abErrorBanner.textContent = ""; }
     };
     const pauseABVideos = () => {
         abSyncToken += 1;
         stopABSyncLoop();
+        abAlignOnTick = false;
         abVideoA.pause();
         abVideoB.pause();
         updateABButtons();
@@ -448,20 +497,31 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const runABSyncLoop = token => {
         const tick = () => {
             if (disposed || token !== abSyncToken) return;
+            if (abAlignOnTick) {
+                // 某一路 play() 晚一拍时，用首帧把 B 拉回 A；否则会从开始就持续错位。
+                abAlignOnTick = false;
+                if (abFrameSync) alignBToFrame(); else alignBToTime();
+            }
             const total = abTimeline();
             const current = Math.min(abVideoA.currentTime || 0, total || Infinity);
             if (!abSeeking) updateABProgress(current, total);
-            const finished = total > 0 && (
-                abVideoA.ended || abVideoB.ended
-                || (abVideoA.currentTime || 0) >= total - 0.03
-                || (abVideoB.currentTime || 0) >= total - 0.03);
-            if (finished) { void startABPlayback(true); return; }
+            // 帧同步模式下只补大漂移（>2 帧）；帧率比已让两路速度对齐。
+            if (abFrameSync && abFramePairReady() && !abVideoA.paused && !abVideoB.paused) {
+                const drift = Math.abs(abFrameIndexOf(abVideoA, abInfo.A) - abFrameIndexOf(abVideoB, abInfo.B));
+                if (drift > 2) alignBToFrame();
+            }
+            // 只按“真正播完”触发循环，避免在末帧显示前提前重播。
+            if (abVideoA.ended || abVideoB.ended) { void startABPlayback(true); return; }
             abSyncRaf = requestAnimationFrame(tick);
         };
         abSyncRaf = requestAnimationFrame(tick);
     };
     const startABPlayback = async (restart = false) => {
         if (!isABVideo()) return;
+        if (abVideoError.A || abVideoError.B) {
+            setABHint("有一路视频加载失败，无法同步播放；请退出对比后重选或检查文件。");
+            return;
+        }
         const token = ++abSyncToken;
         stopABSyncLoop();
         const total = abTimeline();
@@ -482,6 +542,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             updateABProgress(abVideoA.currentTime || 0, abTimeline());
             return;
         }
+        if (abVideoError.A || abVideoError.B) { pauseABVideos(); return; }
+        abAlignOnTick = true;
+        updateABButtons();
         runABSyncLoop(token);
     };
     const toggleABPlayback = () => {
@@ -516,27 +579,33 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const syncABFrames = async () => {
         if (!isABVideo() || abFrameSyncing) return;
         const infoA = abInfo.A, infoB = abInfo.B;
-        if (!(infoA.frames > 0 && infoA.frames === infoB.frames) || !(infoA.fps > 0 && infoB.fps > 0)) {
+        if (!abFramePairReady()) {
             setABHint("两个视频总帧数不一致，无法按帧同步");
             return;
         }
+        const token = abPairToken;
+        const slotA = abSlots.A, slotB = abSlots.B;
         const wasPlaying = !abVideoA.paused || !abVideoB.paused;
         abFrameSyncing = true;
         updateABButtons();
         pauseABVideos();
-        const frame = Math.max(0, Math.min(infoA.frames - 1, Math.round((abVideoA.currentTime || 0) * infoA.fps)));
+        const frame = Math.max(0, Math.min(infoA.frames - 1, abFrameIndexOf(abVideoA, infoA)));
         const ok = await Promise.all([
             seekABVideo(abVideoA, frame / infoA.fps),
             seekABVideo(abVideoB, frame / infoB.fps),
         ]);
+        // 定位期间退出对比或换了新组合：丢弃旧组合的迟到回调，不能把新组合标成已同步或自动播放。
+        if (token !== abPairToken || abSlots.A !== slotA || abSlots.B !== slotB) return;
         abFrameSyncing = false;
         if (ok[0] && ok[1]) {
             abFrameSync = true;
+            applyABRates();
             abFrameSyncButton.textContent = "已同步";
             setTimeout(() => {
-                if (!disposed && isABVideo()) abFrameSyncButton.textContent = "同步帧";
+                if (!disposed && token === abPairToken && isABVideo()) abFrameSyncButton.textContent = "同步帧";
             }, 1200);
-            setABHint(`已按第 ${frame + 1} 帧对齐 A / B`);
+            const ratio = abFrameRateRatio();
+            setABHint(`已按第 ${frame + 1} 帧对齐 A / B` + (Math.abs(ratio - 1) > 0.001 ? `（B 按 ${ratio.toFixed(3)}x 帧率比跟随）` : ""));
         } else {
             setABHint("按帧对齐失败：视频暂未定位成功");
         }
@@ -548,10 +617,17 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (!isABVideo()) return;
         const total = abTimeline();
         const target = Math.max(0, Math.min(total || Number(value) || 0, Number(value) || 0));
-        abVideoA.currentTime = Math.min(target, abVideoA.duration || target);
-        if (abFrameSync) alignBToFrame();
-        else abVideoB.currentTime = Math.min(target, abVideoB.duration || target);
-        if (abTime) abTime.textContent = `${formatABTime(target)} / ${formatABTime(total)}`;
+        if (abFrameSync && abFramePairReady()) {
+            // 按帧同步后按帧号定位；同帧数不同帧率时两路都能定位到最后一帧。
+            const infoA = abInfo.A, infoB = abInfo.B;
+            const frame = Math.max(0, Math.min(infoA.frames - 1, Math.round(target * infoA.fps)));
+            abVideoA.currentTime = Math.min(frame / infoA.fps, abVideoA.duration || Infinity);
+            abVideoB.currentTime = Math.min(frame / infoB.fps, abVideoB.duration || Infinity);
+        } else {
+            abVideoA.currentTime = Math.min(target, abVideoA.duration || target);
+            abVideoB.currentTime = Math.min(target, abVideoB.duration || target);
+        }
+        if (abTime) abTime.textContent = `${formatABTime(abVideoA.currentTime || target)} / ${formatABTime(total)}`;
     };
     abSeek.addEventListener("pointerdown", () => { abSeeking = true; });
     abSeek.addEventListener("input", () => { abSeeking = true; applyABSeek(Number(abSeek.value)); });
@@ -630,11 +706,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     });
     const exitAB = () => {
         if (document.fullscreenElement === abOverlay && document.exitFullscreen) { void document.exitFullscreen().catch(() => {}); }
+        abPairToken += 1;
         abSyncToken += 1;
         stopABSyncLoop();
         closeABMenus();
         abSlots.A = null; abSlots.B = null; abPicking = false;
-        abFrameSync = false; abFrameSyncing = false; abSeeking = false;
+        abFrameSync = false; abFrameSyncing = false; abSeeking = false; abAlignOnTick = false;
+        clearABVideoErrors();
         resetABView();
         for (const media of [abVideoA, abVideoB, abAudioA, abAudioB]) releaseMedia(media);
         abA.removeAttribute("src"); abB.removeAttribute("src");
@@ -692,6 +770,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         updateABWipe(event.clientX);
     });
     const paintAB = () => {
+        // 每次进入/退出/换组合都递增，作废上一组尚未完成的异步回调。
+        abPairToken += 1;
+        abAlignOnTick = false;
         const both = abSlots.A && abSlots.B;
         abOverlay.hidden = !both;
         layout.classList.toggle("is-comparing", !!both);
@@ -700,6 +781,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             abSyncToken += 1;
             stopABSyncLoop();
             closeABMenus();
+            clearABVideoErrors();
             abVideoA.pause(); abVideoB.pause();
             return;
         }
@@ -724,6 +806,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         abB.parentElement.style.display = (isVideo || isAudio) ? "none" : "";
         if (isVideo) {
             const slotA = abSlots.A, slotB = abSlots.B;
+            clearABVideoErrors();
             abVideoA.src = slotA.url;
             abVideoB.src = slotB.url;
             abVideoA.muted = true; abVideoB.muted = true;
@@ -754,6 +837,13 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
     };
     for (const media of [abVideoA, abVideoB]) {
+        media.addEventListener("error", () => {
+            if (!isABVideo()) return;
+            const side = media === abVideoA ? "A" : "B";
+            const expected = abSlots[side]?.url;
+            if (expected && media.getAttribute("src") !== expected) return; // 旧 src 的迟到 error 不算新组合
+            failABVideo(side);
+        });
         media.addEventListener("loadedmetadata", () => {
             if (!isABVideo()) return;
             updateABButtons();

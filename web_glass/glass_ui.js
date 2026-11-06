@@ -163,6 +163,8 @@ const CSS = `
 .ad-h3-ab-vpane{position:absolute;top:0;bottom:0;left:0;width:100%;overflow:hidden;background:#000;pointer-events:none}
 .ad-h3-ab-vpane video{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain!important;object-position:center center!important;background:#000;pointer-events:none!important}
 .ad-h3-ab-vdivider{position:absolute;top:0;bottom:0;left:50%;width:1px;z-index:3;background:rgba(255,255,255,.82);box-shadow:none;pointer-events:none;transform:translateX(-0.5px);will-change:left}
+.ad-h3-ab-error{position:absolute;left:50%;top:10px;transform:translateX(-50%);z-index:9;max-width:calc(100% - 24px);padding:6px 12px;border-radius:6px;background:rgba(150,30,30,.94);border:1px solid #ff8b8b;color:#fff;font-size:12px;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.ad-h3-ab-error[hidden]{display:none!important}
 .ad-h3-ab-audios{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px;background:#202c41;z-index:2;box-sizing:border-box}
 .ad-h3-ab-acell{display:flex;align-items:center;justify-content:center;background:#202d41;border:1px solid #3a4c65;border-radius:8px;padding:10px}
 .ad-h3-ab-acell audio{width:100%}
