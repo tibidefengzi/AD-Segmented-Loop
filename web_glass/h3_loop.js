@@ -1,4 +1,5 @@
 // CACHEBUST ref-link-preserve 20261025-053810
+// CACHEBUST 20261107-ab-te-man-video-compare：分段预览 A/B 视频改为叠加重合擦除，按钮全部在视频底部
 // cachebust 20261025-0440 segment-dedupe-materials
 // CACHEBUST 2026-10-25-restore-v027-approved-043100
 // CACHEBUST 20261102-group-v64：统一 web_glass 模块版本号，模块去重并避免沿用旧缓存
@@ -64,15 +65,16 @@ styles.textContent = `
 .ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen{
  position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;
  min-width:0!important;min-height:0!important;max-width:none!important;max-height:none!important;
- aspect-ratio:auto!important;display:block!important;margin:0!important;padding:0!important;
+ aspect-ratio:auto!important;margin:0!important;padding:0!important;
  border:0!important;border-radius:0!important;box-shadow:none!important;background:#000!important;box-sizing:border-box!important}
+.ad-h3-video.aiden-h3 .ad-h3-screen:fullscreen{display:block!important}
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen{display:flex!important;flex-direction:column!important}
 .ad-h3-screen:fullscreen::backdrop,.ad-h3-ab-overlay:fullscreen::backdrop{background:#000}
 .ad-h3-screen:fullscreen>.ad-h3-preview-title{display:none!important}
 .ad-h3-video.aiden-h3 .ad-h3-screen:fullscreen>.ad-h3-player-controls,
-.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen>.ad-h3-ab-controls{background:rgba(0,0,0,.7)!important;border:0!important}
-.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen>.ad-h3-ab-controls{padding-right:260px!important}
-.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-videos{gap:0!important;background:#000!important}
-.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-vcell,
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen>.ad-h3-ab-bar{background:rgba(0,0,0,.72)!important;border:0!important}
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-stage{background:#000!important}
+.ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-vpane{background:#000!important}
 .ad-h3-video.aiden-h3 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-acell{border:0!important;border-radius:0!important;background:#000!important}
 .ad-h3-lightbox:fullscreen{background:#000!important;border:0!important;border-radius:0!important;padding:0!important}
 .ad-h3-lightbox:fullscreen>.ad-h3-lightbox-video,.ad-h3-lightbox:fullscreen>.ad-h3-lightbox-img{width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;object-fit:contain;object-position:center}

@@ -1,4 +1,4 @@
-﻿AD-Segmented-Loop 0.5.11 第三方依赖说明
+AD-Segmented-Loop 0.5.12 第三方依赖说明
 
 插件自身采用 GPL-3.0-only，完整许可见本压缩包内 LICENSE。
 

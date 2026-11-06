@@ -212,107 +212,429 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const url = visible?.src || "";
         return url ? {...(fileFromUrl(url) || {}), url} : null;
     };
+    // ── A/B 对比 ──────────────────────────────────────────────
+    // 图片：沿用原有「独立左右 / 叠加滑杆」两套（本次不改）。
+    // 视频：改为 TE MAN 式「叠加重合 + 鼠标移动分界线擦除」，按钮全部放在视频底部控制条。
     const abOverlay = document.createElement("div");
     abOverlay.className = "ad-h3-ab-overlay"; abOverlay.hidden = true;
     abOverlay.innerHTML = '<div class="ad-h3-ab-layer"><img data-ab-a alt="A"></div>'
         + '<div class="ad-h3-ab-layer ad-h3-ab-top"><img data-ab-b alt="B"></div>'
         + '<div class="ad-h3-ab-divider"></div>'
+        + '<div class="ad-h3-ab-stage" hidden>'
+        +   '<div class="ad-h3-ab-vpane" data-ab-vpane-a><video data-ab-va muted playsinline preload="metadata"></video></div>'
+        +   '<div class="ad-h3-ab-vpane ad-h3-ab-vpane-b" data-ab-vpane-b><video data-ab-vb muted playsinline preload="metadata"></video></div>'
+        +   '<div class="ad-h3-ab-vdivider" data-ab-vdivider></div>'
+        + '</div>'
         + '<span class="ad-h3-ab-tag" style="left:8px">A</span><span class="ad-h3-ab-tag" style="right:8px">B</span>'
-        + '<div class="ad-h3-ab-videos" hidden><div class="ad-h3-ab-vcell"><video data-ab-va muted playsinline></video></div>'
-        + '<div class="ad-h3-ab-vcell"><video data-ab-vb muted playsinline></video></div></div>'
         + '<div class="ad-h3-ab-audios" hidden><div class="ad-h3-ab-acell"><audio data-ab-aa controls preload="metadata"></audio></div>'
         + '<div class="ad-h3-ab-acell"><audio data-ab-ab controls preload="metadata"></audio></div></div>'
         + '<button type="button" class="ad-h3-ab-mode" data-ab-mode>叠加滑杆</button>'
         + '<button type="button" class="ad-h3-ab-fullscreen" data-ab-fullscreen>全屏</button>'
         + '<button type="button" class="ad-h3-ab-exit" data-ab-exit>退出对比</button>'
-        + '<div class="ad-h3-ab-controls" hidden><button type="button" data-ab-play>播放</button>'
-        + '<button type="button" data-ab-step="-1">上一帧</button><button type="button" data-ab-step="1">下一帧</button>'
-        + '<input type="range" data-ab-seek min="0" max="0" step="0.001" value="0">'
-        + '<span data-ab-time>0.00 / 0.00 秒</span><button type="button" data-ab-audio="A">A声</button><button type="button" data-ab-audio="B">B声</button></div>';
+        + '<div class="ad-h3-ab-bar" hidden>'
+        +   '<button type="button" data-ab-syncplay title="从头同步播放两个视频">同步播放</button>'
+        +   '<button type="button" data-ab-speed title="选择播放速度">播放速度 1x</button>'
+        +   '<button type="button" data-ab-audio-choice title="选择静音、A 音频或 B 音频">静音</button>'
+        +   '<button type="button" data-ab-framesync title="总帧数相同时按帧编号同步">同步帧</button>'
+        +   '<button type="button" data-ab-fullscreen>全屏</button>'
+        +   '<button type="button" data-ab-vmode title="切换叠加擦除 / 独立左右">独立左右</button>'
+        +   '<button type="button" data-ab-step="-1">上一帧</button>'
+        +   '<button type="button" data-ab-step="1">下一帧</button>'
+        +   '<button type="button" data-ab-exit-video>退出对比</button>'
+        +   '<span class="ad-h3-ab-track"><input type="range" data-ab-seek min="0" max="0" step="0.001" value="0" aria-label="对比播放位置">'
+        +   '<span data-ab-time>0:00.00 / 0:00.00</span></span>'
+        + '</div>';
     (root.querySelector(".ad-h3-screen") || layout).append(abOverlay);
     const abA = abOverlay.querySelector("[data-ab-a]"), abB = abOverlay.querySelector("[data-ab-b]");
-    const abTop = abOverlay.querySelector(".ad-h3-ab-top"), abDivider = abOverlay.querySelector(".ad-h3-ab-divider");
+    const abDivider = abOverlay.querySelector(".ad-h3-ab-divider");
+    const abStage = abOverlay.querySelector(".ad-h3-ab-stage");
+    const abPaneA = abOverlay.querySelector("[data-ab-vpane-a]"), abPaneB = abOverlay.querySelector("[data-ab-vpane-b]");
+    const abVDivider = abOverlay.querySelector("[data-ab-vdivider]");
     const abSlots = {A: null, B: null};
     let abRatio = 0.5;
     let abPicking = false;
-    const abVideos = abOverlay.querySelector(".ad-h3-ab-videos");
-    const abControls = abOverlay.querySelector(".ad-h3-ab-controls");
     const abVideoA = abOverlay.querySelector("[data-ab-va]"), abVideoB = abOverlay.querySelector("[data-ab-vb]");
-    const abPlay = abOverlay.querySelector("[data-ab-play]"), abSeek = abOverlay.querySelector("[data-ab-seek]");
+    const abBar = abOverlay.querySelector(".ad-h3-ab-bar");
+    const abSyncPlayButton = abOverlay.querySelector("[data-ab-syncplay]");
+    const abSpeedButton = abOverlay.querySelector("[data-ab-speed]");
+    const abAudioButton = abOverlay.querySelector("[data-ab-audio-choice]");
+    const abFrameSyncButton = abOverlay.querySelector("[data-ab-framesync]");
+    const abVideoModeButton = abOverlay.querySelector("[data-ab-vmode]");
+    const abSeek = abOverlay.querySelector("[data-ab-seek]");
     const abTime = abOverlay.querySelector("[data-ab-time]");
-    const abAudioButtons = [...abOverlay.querySelectorAll("[data-ab-audio]")];
-    let abAudioChoice = null;
+    const abStepButtons = [...abOverlay.querySelectorAll("[data-ab-step]")];
+    const abFullscreenButtons = [...abOverlay.querySelectorAll("[data-ab-fullscreen]")];
     const abAudios = abOverlay.querySelector(".ad-h3-ab-audios");
     const abAudioA = abOverlay.querySelector("[data-ab-aa]"), abAudioB = abOverlay.querySelector("[data-ab-ab]");
-    const abModeButton = abOverlay.querySelector("[data-ab-mode]");
-    let abMode = "split";
-    const markABMode = () => { abOverlay.dataset.zoom = abMode === "split" ? "image" : "canvas"; };
+    const abImageModeButton = abOverlay.querySelector("[data-ab-mode]");
+    const abFloatingFullscreen = abOverlay.querySelector(".ad-h3-ab-fullscreen");
+    const abFloatingExit = abOverlay.querySelector(".ad-h3-ab-exit");
+    const abVideoExit = abOverlay.querySelector("[data-ab-exit-video]");
+    let abMode = "split";        // 图片：split=独立左右；slider=叠加滑杆
+    let abVideoMode = "wipe";    // 视频：wipe=叠加擦除；side=独立左右
     let abFocus = "B";
     const abFps = {A: 24, B: 24};
-    // 媒体帧率缓存：只缓存成功结果（失败下次重试），并限制条数避免长时间使用后无限增长。
+    const abInfo = {A: {fps: 24, frames: 0, duration: 0}, B: {fps: 24, frames: 0, duration: 0}};
+    let abSpeed = 1;
+    const AB_SPEEDS = [0.25, 0.5, 0.75, 1, 1.2, 1.5, 2];
+    let abAudioMode = "muted";    // muted | a | b
+    let abFrameSync = false, abFrameSyncing = false, abSeeking = false;
+    let abSyncRaf = 0, abSyncToken = 0;
+    let abOpenMenu = null, abOpenMenuFor = null;
+    const isABVideo = () => !!(abSlots.A && abSlots.B && abSlots.A.kind === "video" && abSlots.B.kind === "video");
+    const isABImage = () => !!(abSlots.A && abSlots.B && abSlots.A.kind === "image" && abSlots.B.kind === "image");
+    const isABAudio = () => !!(abSlots.A && abSlots.B && abSlots.A.kind === "audio" && abSlots.B.kind === "audio");
+    const markABMode = () => { abOverlay.dataset.zoom = isABVideo() ? "canvas" : (abMode === "split" ? "image" : "canvas"); };
+    const abTimeline = () => {
+        const durations = [Number(abVideoA.duration) || Number(abInfo.A.duration) || 0,
+            Number(abVideoB.duration) || Number(abInfo.B.duration) || 0].filter(value => value > 0);
+        return durations.length ? Math.min(...durations) : 0;
+    };
+    const abStepSeconds = () => 1 / Math.max(abFps.A || 24, abFps.B || 24, 1);
+    const formatABTime = value => {
+        const total = Math.max(0, Number(value) || 0);
+        const minutes = Math.floor(total / 60);
+        return `${minutes}:${(total - minutes * 60).toFixed(2).padStart(5, "0")}`;
+    };
+    // 媒体信息缓存：同时提供 fps / frames / duration；失败结果不缓存，下次重试。
     const MEDIA_INFO_CACHE_LIMIT = 64;
     const mediaInfoCache = new Map();
-    const rememberMediaFps = (key, fps) => {
+    const rememberMediaInfo = (key, info) => {
         if (mediaInfoCache.has(key)) mediaInfoCache.delete(key);
-        mediaInfoCache.set(key, fps);
+        mediaInfoCache.set(key, info);
         while (mediaInfoCache.size > MEDIA_INFO_CACHE_LIMIT) mediaInfoCache.delete(mediaInfoCache.keys().next().value);
     };
-    const fetchMediaFps = async (record) => {
+    const fetchMediaInfo = async (record) => {
         const origin = record?.origin || "media";
         const file = record?.file;
-        if (!file) return 24;
+        if (!file) return {fps: 24, frames: 0, duration: 0};
         const key = `${origin}/${file}`;
         if (mediaInfoCache.has(key)) return mediaInfoCache.get(key);
         try {
             const response = await api.fetchApi(`/aiden_h3/media_info/${encodeURIComponent(origin)}/${String(file).split("/").map(encodeURIComponent).join("/")}`);
             const data = await response.json();
-            const fps = Number(data?.fps) > 0 ? Number(data.fps) : 24;
-            // 失败结果不缓存，下次显示时重新读取；成功才写入 LRU。
-            if (response.ok && !data?.failed && Number(data?.fps) > 0) rememberMediaFps(key, fps);
-            return fps;
+            const info = {
+                fps: Number(data?.fps) > 0 ? Number(data.fps) : 24,
+                frames: Number(data?.frames) > 0 ? Number(data.frames) : 0,
+                duration: Number(data?.duration) > 0 ? Number(data.duration) : 0,
+            };
+            if (response.ok && !data?.failed) rememberMediaInfo(key, info);
+            return info;
         } catch {
-            return 24;
+            return {fps: 24, frames: 0, duration: 0};
         }
     };
-    const abStepSeconds = () => 1 / Math.max(abFps.A, abFps.B, 1);
-    const abTimeline = () => Math.min(abVideoA.duration || 0, abVideoB.duration || 0) || abVideoA.duration || abVideoB.duration || 0;
-    const abSync = (source, target) => {
-        if (Math.abs((target.currentTime || 0) - (source.currentTime || 0)) > 0.15) target.currentTime = source.currentTime;
+    const fetchMediaFps = async (record) => (await fetchMediaInfo(record)).fps;
+    const updateABButtons = () => {
+        const video = isABVideo();
+        if (abSyncPlayButton) abSyncPlayButton.textContent = (video && (!abVideoA.paused || !abVideoB.paused)) ? "重新播放" : "同步播放";
+        if (abSpeedButton) abSpeedButton.textContent = `播放速度 ${abSpeed}x`;
+        if (abAudioButton) abAudioButton.textContent = abAudioMode === "a" ? "音频 A" : abAudioMode === "b" ? "音频 B" : "静音";
+        if (abFrameSyncButton) {
+            const ready = !!(abInfo.A.frames > 0 && abInfo.A.frames === abInfo.B.frames && abInfo.A.fps > 0 && abInfo.B.fps > 0);
+            abFrameSyncButton.disabled = !ready || abFrameSyncing;
+            abFrameSyncButton.title = ready ? "总帧数相同时按帧编号同步" : "两个视频总帧数不一致，无法按帧同步";
+            abFrameSyncButton.classList.toggle("on", abFrameSync);
+        }
+        if (abVideoModeButton) abVideoModeButton.textContent = abVideoMode === "wipe" ? "独立左右" : "叠加擦除";
+        for (const button of abStepButtons) button.disabled = !video;
     };
-    for (const [videoEl, other] of [[abVideoA, abVideoB], [abVideoB, abVideoA]]) {
-        videoEl.addEventListener("play", () => { abPlay.textContent = "暂停"; if (other.paused) other.play().catch(() => {}); });
-        videoEl.addEventListener("pause", () => { abPlay.textContent = "播放"; if (!other.paused) other.pause(); });
-        videoEl.addEventListener("timeupdate", () => {
-            abSync(videoEl, other);
-            if (videoEl === abVideoA) {
-                abSeek.value = String(videoEl.currentTime || 0);
-                abTime.textContent = `${(videoEl.currentTime || 0).toFixed(2)} / ${abTimeline().toFixed(2)} 秒`;
-            }
-        });
-        videoEl.addEventListener("loadedmetadata", () => {
-            const duration = abTimeline();
-            abSeek.max = String(duration);
-            abTime.textContent = `${(videoEl.currentTime || 0).toFixed(2)} / ${duration.toFixed(2)} 秒`;
-        });
-    }
+    const updateABProgress = (time, total = abTimeline()) => {
+        const duration = Math.max(0, Number(total) || 0);
+        const current = Number.isFinite(Number(time)) ? Number(time) : (abVideoA.currentTime || 0);
+        if (abSeek) {
+            abSeek.max = duration > 0 ? String(duration) : "0";
+            abSeek.value = duration > 0 ? String(Math.min(current, duration)) : "0";
+        }
+        if (abTime) abTime.textContent = `${formatABTime(current)} / ${formatABTime(duration)}`;
+    };
+    const applyABAudio = () => {
+        if (!isABVideo()) return;
+        abVideoA.muted = abAudioMode !== "a";
+        abVideoB.muted = abAudioMode !== "b";
+    };
+    const applyABRates = () => {
+        abVideoA.playbackRate = abSpeed;
+        abVideoB.playbackRate = abSpeed;
+    };
+    const applyVideoLayout = () => {
+        const side = abVideoMode === "side";
+        abPaneA.style.left = "0";
+        abPaneA.style.width = side ? "50%" : "100%";
+        abPaneB.style.left = side ? "50%" : "0";
+        abPaneB.style.width = side ? "50%" : "100%";
+        if (side) {
+            abPaneB.style.clipPath = "none";
+            abVDivider.style.left = "50%";
+            abVDivider.style.cursor = "default";
+            abStage.style.cursor = "default";
+        } else {
+            const percent = Math.round(abRatio * 10000) / 100;
+            abPaneB.style.clipPath = `inset(0 0 0 ${percent}%)`;
+            abVDivider.style.left = `${percent}%`;
+            abVDivider.style.cursor = "ew-resize";
+            abStage.style.cursor = "ew-resize";
+        }
+    };
+    const closeABMenus = () => {
+        if (!abOpenMenu) { abOpenMenuFor = null; return; }
+        abOpenMenu.remove();
+        abOpenMenu = null;
+        abOpenMenuFor = null;
+    };
+    const openABMenu = (button, items, current, onPick) => {
+        closeABMenus();
+        if (!button) return;
+        const menu = document.createElement("div");
+        menu.className = "ad-h3-ab-menu";
+        menu.style.visibility = "hidden";
+        for (const item of items) {
+            const option = document.createElement("button");
+            option.type = "button";
+            option.textContent = item.label;
+            if (item.value === current) option.classList.add("on");
+            option.addEventListener("click", event => {
+                event.preventDefault(); event.stopPropagation();
+                onPick(item.value);
+                closeABMenus();
+            });
+            menu.append(option);
+        }
+        menu.addEventListener("pointerdown", event => event.stopPropagation());
+        const host = document.fullscreenElement || document.body;
+        host.append(menu);
+        const buttonRect = button.getBoundingClientRect();
+        const menuRect = menu.getBoundingClientRect();
+        const left = Math.max(4, Math.min(buttonRect.left + (buttonRect.width - menuRect.width) / 2, window.innerWidth - menuRect.width - 4));
+        let top = buttonRect.top - menuRect.height - 6;
+        if (top < 4) top = Math.min(buttonRect.bottom + 6, window.innerHeight - menuRect.height - 4);
+        menu.style.left = `${Math.round(left)}px`;
+        menu.style.top = `${Math.round(Math.max(4, top))}px`;
+        menu.style.visibility = "visible";
+        abOpenMenu = menu;
+        abOpenMenuFor = button;
+    };
+    const onABDocPointerDown = event => {
+        if (!abOpenMenu) return;
+        if (abOpenMenu.contains(event.target)) return;
+        if (abOpenMenuFor && abOpenMenuFor.contains(event.target)) return;
+        closeABMenus();
+    };
+    document.addEventListener("pointerdown", onABDocPointerDown, true);
+    // 两路播放：暂停时对齐 B；播放中不做持续 seek 纠偏（避免卡顿），只按 TE 方式一起播放。
+    const stopABSyncLoop = () => {
+        if (abSyncRaf) cancelAnimationFrame(abSyncRaf);
+        abSyncRaf = 0;
+    };
+    const alignBToTime = () => {
+        if (!isABVideo()) return;
+        const target = Math.min(abVideoA.currentTime || 0, abVideoB.duration || Infinity);
+        if (Number.isFinite(target)) abVideoB.currentTime = target;
+    };
+    const alignBToFrame = () => {
+        const infoA = abInfo.A, infoB = abInfo.B;
+        if (!(infoA.frames > 0 && infoA.frames === infoB.frames) || !(infoA.fps > 0 && infoB.fps > 0)) return false;
+        const frame = Math.max(0, Math.min(infoA.frames - 1, Math.round((abVideoA.currentTime || 0) * infoA.fps)));
+        abVideoB.currentTime = Math.min(frame / infoB.fps, abVideoB.duration || Infinity);
+        return true;
+    };
+    const pauseABVideos = () => {
+        abSyncToken += 1;
+        stopABSyncLoop();
+        abVideoA.pause();
+        abVideoB.pause();
+        updateABButtons();
+    };
+    const runABSyncLoop = token => {
+        const tick = () => {
+            if (disposed || token !== abSyncToken) return;
+            const total = abTimeline();
+            const current = Math.min(abVideoA.currentTime || 0, total || Infinity);
+            if (!abSeeking) updateABProgress(current, total);
+            const finished = total > 0 && (
+                abVideoA.ended || abVideoB.ended
+                || (abVideoA.currentTime || 0) >= total - 0.03
+                || (abVideoB.currentTime || 0) >= total - 0.03);
+            if (finished) { void startABPlayback(true); return; }
+            abSyncRaf = requestAnimationFrame(tick);
+        };
+        abSyncRaf = requestAnimationFrame(tick);
+    };
+    const startABPlayback = async (restart = false) => {
+        if (!isABVideo()) return;
+        const token = ++abSyncToken;
+        stopABSyncLoop();
+        const total = abTimeline();
+        const atEnd = total > 0 && ((abVideoA.currentTime || 0) >= total - 0.03 || abVideoB.ended);
+        if (restart || atEnd || abVideoA.ended) {
+            abVideoA.currentTime = 0;
+            abVideoB.currentTime = 0;
+        } else if (!abFrameSync) {
+            alignBToTime();
+        }
+        applyABRates();
+        applyABAudio();
+        updateABButtons();
+        await Promise.all([abVideoA.play().catch(() => {}), abVideoB.play().catch(() => {})]);
+        if (disposed || token !== abSyncToken) return;
+        if (abVideoA.paused || abVideoB.paused) {
+            pauseABVideos();
+            updateABProgress(abVideoA.currentTime || 0, abTimeline());
+            return;
+        }
+        runABSyncLoop(token);
+    };
     const toggleABPlayback = () => {
-        if (abSlots.A?.kind !== "video" || abSlots.B?.kind !== "video") return;
-        if (abVideoA.paused) { abVideoA.play().catch(() => {}); abVideoB.play().catch(() => {}); abPlay.textContent = "暂停"; }
-        else { abVideoA.pause(); abVideoB.pause(); abPlay.textContent = "播放"; }
-    };
-    abPlay.addEventListener("click", toggleABPlayback);
-    abOverlay.querySelectorAll("[data-ab-step]").forEach(button => button.addEventListener("click", () => {
-        const step = Number(button.dataset.abStep) * abStepSeconds();
-        for (const videoEl of [abVideoA, abVideoB]) {
-            videoEl.pause();
-            videoEl.currentTime = Math.max(0, Math.min(abTimeline(), (videoEl.currentTime || 0) + step));
+        if (!isABVideo()) return;
+        if (!abVideoA.paused || !abVideoB.paused) {
+            pauseABVideos();
+            updateABProgress(abVideoA.currentTime || 0, abTimeline());
+        } else {
+            void startABPlayback(false);
         }
-        abSeek.value = String(abVideoA.currentTime || 0);
-        abTime.textContent = `${(abVideoA.currentTime || 0).toFixed(2)} / ${abTimeline().toFixed(2)} 秒`;
-    }));
+    };
+    const seekABVideo = (media, time) => new Promise(resolve => {
+        let done = false;
+        let timer = 0;
+        const finish = ok => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            media.removeEventListener("seeked", onSeeked);
+            media.removeEventListener("error", onError);
+            resolve(ok);
+        };
+        const onSeeked = () => finish(true);
+        const onError = () => finish(false);
+        timer = setTimeout(() => finish(false), 2000);
+        const target = Math.max(0, Number(time) || 0);
+        if (Math.abs((media.currentTime || 0) - target) < 0.001) { finish(true); return; }
+        media.addEventListener("seeked", onSeeked, {once: true});
+        media.addEventListener("error", onError, {once: true});
+        try { media.currentTime = target; } catch { finish(false); }
+    });
+    const syncABFrames = async () => {
+        if (!isABVideo() || abFrameSyncing) return;
+        const infoA = abInfo.A, infoB = abInfo.B;
+        if (!(infoA.frames > 0 && infoA.frames === infoB.frames) || !(infoA.fps > 0 && infoB.fps > 0)) {
+            setABHint("两个视频总帧数不一致，无法按帧同步");
+            return;
+        }
+        const wasPlaying = !abVideoA.paused || !abVideoB.paused;
+        abFrameSyncing = true;
+        updateABButtons();
+        pauseABVideos();
+        const frame = Math.max(0, Math.min(infoA.frames - 1, Math.round((abVideoA.currentTime || 0) * infoA.fps)));
+        const ok = await Promise.all([
+            seekABVideo(abVideoA, frame / infoA.fps),
+            seekABVideo(abVideoB, frame / infoB.fps),
+        ]);
+        abFrameSyncing = false;
+        if (ok[0] && ok[1]) {
+            abFrameSync = true;
+            abFrameSyncButton.textContent = "已同步";
+            setTimeout(() => {
+                if (!disposed && isABVideo()) abFrameSyncButton.textContent = "同步帧";
+            }, 1200);
+            setABHint(`已按第 ${frame + 1} 帧对齐 A / B`);
+        } else {
+            setABHint("按帧对齐失败：视频暂未定位成功");
+        }
+        updateABButtons();
+        updateABProgress(abVideoA.currentTime || 0, abTimeline());
+        if (wasPlaying && ok[0] && ok[1]) void startABPlayback(false);
+    };
+    const applyABSeek = value => {
+        if (!isABVideo()) return;
+        const total = abTimeline();
+        const target = Math.max(0, Math.min(total || Number(value) || 0, Number(value) || 0));
+        abVideoA.currentTime = Math.min(target, abVideoA.duration || target);
+        if (abFrameSync) alignBToFrame();
+        else abVideoB.currentTime = Math.min(target, abVideoB.duration || target);
+        if (abTime) abTime.textContent = `${formatABTime(target)} / ${formatABTime(total)}`;
+    };
+    abSeek.addEventListener("pointerdown", () => { abSeeking = true; });
+    abSeek.addEventListener("input", () => { abSeeking = true; applyABSeek(Number(abSeek.value)); });
+    abSeek.addEventListener("change", () => {
+        applyABSeek(Number(abSeek.value));
+        abSeeking = false;
+        updateABProgress(abVideoA.currentTime || 0, abTimeline());
+    });
+    abSyncPlayButton?.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        void startABPlayback(true);
+    });
+    abSpeedButton?.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        if (abOpenMenuFor === abSpeedButton) { closeABMenus(); return; }
+        openABMenu(abSpeedButton, AB_SPEEDS.map(speed => ({label: `${speed}x`, value: speed})), abSpeed, value => {
+            abSpeed = Number(value) || 1;
+            applyABRates();
+            updateABButtons();
+        });
+    });
+    abAudioButton?.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        if (abOpenMenuFor === abAudioButton) { closeABMenus(); return; }
+        openABMenu(abAudioButton, [
+            {label: "静音", value: "muted"},
+            {label: "音频 A", value: "a"},
+            {label: "音频 B", value: "b"},
+        ], abAudioMode, value => {
+            abAudioMode = value;
+            applyABAudio();
+            updateABButtons();
+        });
+    });
+    abFrameSyncButton?.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        void syncABFrames();
+    });
+    abVideoModeButton?.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        abVideoMode = abVideoMode === "wipe" ? "side" : "wipe";
+        applyVideoLayout();
+        updateABButtons();
+    });
+    for (const button of abStepButtons) button.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        if (!isABVideo()) return;
+        pauseABVideos();
+        const step = Number(button.dataset.abStep) * abStepSeconds();
+        const total = abTimeline();
+        for (const media of [abVideoA, abVideoB]) {
+            media.pause();
+            const target = Math.max(0, Math.min(total || media.duration || 0, (media.currentTime || 0) + step));
+            media.currentTime = Math.min(target, media.duration || target);
+        }
+        if (abFrameSync) alignBToFrame();
+        updateABProgress(abVideoA.currentTime || 0, abTimeline());
+    });
+    for (const button of abFullscreenButtons) button.addEventListener("click", event => {
+        event.stopPropagation();
+        void toggleABFullscreen();
+    });
+    abImageModeButton.addEventListener("click", event => {
+        event.stopPropagation();
+        abMode = abMode === "split" ? "slider" : "split";
+        markABMode();
+        abImageModeButton.textContent = abMode === "split" ? "叠加滑杆" : "独立左右";
+        resetABView();
+        applyAB();
+    });
+    abFloatingExit.addEventListener("click", event => {
+        event.stopPropagation(); exitAB();
+    });
+    abVideoExit.addEventListener("click", event => {
+        event.stopPropagation(); exitAB();
+    });
     const exitAB = () => {
         if (document.fullscreenElement === abOverlay && document.exitFullscreen) { void document.exitFullscreen().catch(() => {}); }
+        abSyncToken += 1;
+        stopABSyncLoop();
+        closeABMenus();
         abSlots.A = null; abSlots.B = null; abPicking = false;
+        abFrameSync = false; abFrameSyncing = false; abSeeking = false;
         resetABView();
         for (const media of [abVideoA, abVideoB, abAudioA, abAudioB]) releaseMedia(media);
         abA.removeAttribute("src"); abB.removeAttribute("src");
@@ -329,12 +651,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         finally { fullscreenBusy = false; onFullscreenChange(); }
     }
     function toggleABFullscreen() { void toggleFullscreen(abOverlay); }
-    abOverlay.querySelector("[data-ab-fullscreen]").addEventListener("click", event => {
-        event.stopPropagation();
-        toggleABFullscreen();
-    });
     abOverlay.addEventListener("click", event => {
-        if (event.target.closest("button,input,select,a,.ad-h3-ab-controls")) return;
+        if (event.target.closest("button,input,select,a,.ad-h3-ab-bar,.ad-h3-ab-audios")) return;
         if (!abSlots.A || !abSlots.B) return;
         const rect = abOverlay.getBoundingClientRect();
         const ratio = (event.clientX - rect.left) / (rect.width || 1);
@@ -342,24 +660,14 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         const tags = abOverlay.querySelectorAll(".ad-h3-ab-tag");
         if (tags[0]) tags[0].classList.toggle("on", abFocus === "A");
         if (tags[1]) tags[1].classList.toggle("on", abFocus === "B");
-        if (abSlots.A.kind === "video" && abSlots.B.kind === "video") {
+        if (isABVideo()) {
             event.preventDefault(); event.stopPropagation();
             toggleABPlayback();
         }
     });
-    abModeButton.addEventListener("click", event => {
-        event.stopPropagation();
-        abMode = abMode === "split" ? "slider" : "split";
-        markABMode();
-        abModeButton.textContent = abMode === "split" ? "叠加滑杆" : "独立左右";
-        resetABView();
-        applyAB();
-    });
-    abOverlay.querySelector("[data-ab-exit]").addEventListener("click", event => {
-        event.stopPropagation(); exitAB();
-    });
     const onPreviewEscape = event => {
         if (event.key !== "Escape") return;
+        closeABMenus();
         const current = document.fullscreenElement;
         if (current && root.contains(current)) {
             event.preventDefault(); event.stopPropagation();
@@ -369,19 +677,19 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (!abOverlay.hidden) exitAB();
     };
     window.addEventListener("keydown", onPreviewEscape, true);
-    abSeek.addEventListener("input", () => {
-        const value = Number(abSeek.value) || 0;
-        for (const videoEl of [abVideoA, abVideoB]) videoEl.currentTime = Math.min(value, videoEl.duration || value);
-        abTime.textContent = `${value.toFixed(2)} / ${abTimeline().toFixed(2)} 秒`;
-    });
-    const applyAudioChoice = () => {
-        abVideoA.muted = abAudioChoice !== "A";
-        abVideoB.muted = abAudioChoice !== "B";
-        for (const button of abAudioButtons) button.classList.toggle("on", button.dataset.abAudio === abAudioChoice);
+    const updateABWipe = clientX => {
+        const rect = abStage.getBoundingClientRect();
+        if (!rect.width) return;
+        abRatio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        applyVideoLayout();
     };
-    for (const button of abAudioButtons) button.addEventListener("click", () => {
-        abAudioChoice = abAudioChoice === button.dataset.abAudio ? null : button.dataset.abAudio;
-        applyAudioChoice();
+    abStage.addEventListener("pointerdown", event => {
+        if (!isABVideo() || abVideoMode !== "wipe") return;
+        updateABWipe(event.clientX);
+    });
+    abStage.addEventListener("pointermove", event => {
+        if (!isABVideo() || abVideoMode !== "wipe") return;
+        updateABWipe(event.clientX);
     });
     const paintAB = () => {
         const both = abSlots.A && abSlots.B;
@@ -389,34 +697,54 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         layout.classList.toggle("is-comparing", !!both);
         paintABButton();
         if (!both) {
+            abSyncToken += 1;
+            stopABSyncLoop();
+            closeABMenus();
             abVideoA.pause(); abVideoB.pause();
             return;
         }
         video.pause(); audioView.pause();
-        const isVideo = abSlots.A.kind === "video" && abSlots.B.kind === "video";
-        const isAudio = abSlots.A.kind === "audio" && abSlots.B.kind === "audio";
-        const isImage = abSlots.A.kind === "image" && abSlots.B.kind === "image";
-        abVideos.hidden = !isVideo; abControls.hidden = !isVideo;
+        const isVideo = isABVideo();
+        const isAudio = isABAudio();
+        const isImage = isABImage();
+        abStage.hidden = !isVideo;
+        abBar.hidden = !isVideo;
         abAudios.hidden = !isAudio;
         markABMode();
-        abModeButton.hidden = !isImage;
-        abModeButton.textContent = abMode === "split" ? "叠加滑杆" : "独立左右";
-        abA.parentElement.style.display = isVideo || isAudio ? "none" : "";
-        abB.parentElement.style.display = isVideo || isAudio ? "none" : "";
+        abImageModeButton.hidden = !isImage;
+        abImageModeButton.textContent = abMode === "split" ? "叠加滑杆" : "独立左右";
+        abFloatingFullscreen.hidden = isVideo;
+        abFloatingExit.hidden = isVideo;
         abDivider.style.display = isImage ? "" : "none";
         const tags = abOverlay.querySelectorAll(".ad-h3-ab-tag");
         const tagLabel = (slot, side) => `${side}-${Number(slot?.serial) > 0 ? String(Number(slot.serial)).padStart(2, "0") : "-"}`;
         if (tags[0]) { tags[0].textContent = tagLabel(abSlots.A, "A"); tags[0].title = String(abSlots.A.file || ""); }
         if (tags[1]) { tags[1].textContent = tagLabel(abSlots.B, "B"); tags[1].title = String(abSlots.B.file || ""); }
+        abA.parentElement.style.display = (isVideo || isAudio) ? "none" : "";
+        abB.parentElement.style.display = (isVideo || isAudio) ? "none" : "";
         if (isVideo) {
-            abVideoA.src = abSlots.A.url; abVideoB.src = abSlots.B.url;
-            abVideoA.volume = 1; abVideoB.volume = 1;
-            abAudioChoice = null;
-            applyAudioChoice();
-            abPlay.textContent = "播放";
-            Promise.all([fetchMediaFps(abSlots.A), fetchMediaFps(abSlots.B)]).then(([fpsA, fpsB]) => {
-                abFps.A = fpsA; abFps.B = fpsB;
-            });
+            const slotA = abSlots.A, slotB = abSlots.B;
+            abVideoA.src = slotA.url;
+            abVideoB.src = slotB.url;
+            abVideoA.muted = true; abVideoB.muted = true;
+            abSpeed = 1; abAudioMode = "muted"; abFrameSync = false; abFrameSyncing = false;
+            abRatio = 0.5; abVideoMode = "wipe"; abSeeking = false;
+            abInfo.A = {fps: 24, frames: 0, duration: 0};
+            abInfo.B = {fps: 24, frames: 0, duration: 0};
+            abFps.A = 24; abFps.B = 24;
+            applyABRates();
+            applyABAudio();
+            if (abFrameSyncButton) abFrameSyncButton.textContent = "同步帧";
+            updateABButtons();
+            updateABProgress(0, 0);
+            applyVideoLayout();
+            Promise.all([fetchMediaInfo(slotA), fetchMediaInfo(slotB)]).then(([infoA, infoB]) => {
+                if (abSlots.A !== slotA || abSlots.B !== slotB) return;
+                abInfo.A = infoA; abInfo.B = infoB;
+                abFps.A = infoA.fps; abFps.B = infoB.fps;
+                updateABButtons();
+                updateABProgress(abVideoA.currentTime || 0, abTimeline());
+            }).catch(() => {});
         } else if (isAudio) {
             abAudioA.src = abSlots.A.url; abAudioB.src = abSlots.B.url;
         } else {
@@ -425,6 +753,17 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             applyAB();
         }
     };
+    for (const media of [abVideoA, abVideoB]) {
+        media.addEventListener("loadedmetadata", () => {
+            if (!isABVideo()) return;
+            updateABButtons();
+            updateABProgress(abVideoA.currentTime || 0, abTimeline());
+        });
+        media.addEventListener("durationchange", () => {
+            if (!isABVideo()) return;
+            updateABProgress(abVideoA.currentTime || 0, abTimeline());
+        });
+    }
     const applyABView = () => {
         const transform = `translate(${Math.round(abView.x)}px, ${Math.round(abView.y)}px) scale(${abView.zoom.toFixed(3)})`;
         for (const image of [abA, abB]) {
@@ -434,6 +773,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     };
     const resetABView = () => { abView.zoom = 1; abView.x = 0; abView.y = 0; applyABView(); };
     const applyAB = () => {
+        if (isABVideo()) { applyVideoLayout(); return; }
         const width = abOverlay.clientWidth || root.querySelector(".ad-h3-screen")?.clientWidth || 0;
         if (!width) return;
         const layerA = abA.parentElement, layerB = abB.parentElement;
@@ -477,7 +817,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             abSlots.B = info;
             abPicking = false;
             paintAB();
-            setABHint(kind === "video" ? "A/B 视频对比已开启：同步播放 / 逐帧对照" : "A/B 图片对比已开启：拖动分界线对比");
+            setABHint(kind === "video" ? "A/B 视频对比已开启：移动鼠标擦除分界，点击画面播放/暂停" : "A/B 图片对比已开启：拖动分界线对比");
         }
         paintABButton();
         return true;
@@ -491,7 +831,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         return (clientX - rect.left) / (rect.width / (abOverlay.offsetWidth || 1));
     };
     abOverlay.addEventListener("wheel", event => {
-        if (abOverlay.hidden || abMode !== "split") return;
+        if (abOverlay.hidden || isABVideo()) return;
+        if (abMode !== "split") return;
         if (abSlots.A?.kind !== "image" || abSlots.B?.kind !== "image") return;
         event.preventDefault();
         event.stopPropagation();
@@ -507,7 +848,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     }, {passive: false});
 
     abOverlay.addEventListener("pointerdown", event => {
-        if (event.target.closest("button,input,select,a,.ad-h3-ab-controls")) return;
+        if (event.target.closest("button,input,select,a,.ad-h3-ab-bar,.ad-h3-ab-stage")) return;
         if ((abSlots.A?.kind === "image" && abSlots.B?.kind === "image") && event.button === 0) {
             const rect = abOverlay.getBoundingClientRect();
             const localX = event.clientX - rect.left;
@@ -581,6 +922,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             setTimeout(() => { previewDownload.textContent = "下载"; }, 1600);
         }
     });
+
     // 走 ComfyUI 原生“运行”按钮，保证顶部队列/活动任务状态同步显示
     node._adH3Run = () => {
         if (node._adH3AffectedRunning) { node._adH3Hint?.("正在运行所选段，请等待完成或先点停止。", true); return false; }
@@ -2177,6 +2519,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         dispose(){
             if (disposed) return;
             disposed=true;
+            abSyncToken += 1;
+            stopABSyncLoop();
+            closeABMenus();
+            document.removeEventListener("pointerdown",onABDocPointerDown,true);
             document.removeEventListener("fullscreenchange",onFullscreenChange);
             window.removeEventListener("keydown",onPreviewEscape,true);
             setPlaylistEnabled(false); setIdle(true);

@@ -133,7 +133,7 @@ const CSS = `
 .ad-h3-screen{position:relative!important}
 .ad-h3-ab-overlay{position:absolute!important;inset:0!important;top:0!important;left:0!important;right:0!important;bottom:0!important;
  width:100%!important;height:100%!important;aspect-ratio:auto!important;max-height:none!important;margin:0!important;z-index:25;background:#202c41;
- border:0;border-radius:8px;overflow:hidden;touch-action:none;pointer-events:auto!important;cursor:ew-resize}
+ border:0;border-radius:8px;overflow:hidden;touch-action:none;pointer-events:auto!important;cursor:ew-resize;display:flex!important;flex-direction:column}
 .ad-h3-ab-overlay *{pointer-events:auto}
 .ad-h3-ab-overlay img,.ad-h3-ab-overlay .ad-h3-ab-tag{pointer-events:none!important}
 .ad-h3-ab-layer{position:absolute;inset:0;overflow:hidden}
@@ -151,22 +151,37 @@ const CSS = `
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-fullscreen,.ad-h3-ab-overlay:fullscreen .ad-h3-ab-exit{transform:none;bottom:16px;font-size:13px;height:32px;min-height:32px}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-fullscreen{right:150px}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-exit{right:24px}
+.ad-h3-ab-overlay:fullscreen .ad-h3-ab-stage{min-height:0}
+.ad-h3-ab-overlay:fullscreen .ad-h3-ab-bar{padding:8px 12px;gap:7px;background:#0b0e13e6}
+.ad-h3-ab-overlay:fullscreen .ad-h3-ab-bar button{height:30px;min-height:30px;font-size:13px;padding:0 12px}
+.ad-h3-ab-overlay:fullscreen .ad-h3-ab-bar input[type=range]{flex:1 1 220px}
+.ad-h3-ab-overlay:fullscreen .ad-h3-ab-bar [data-ab-time]{font-size:13px;min-width:150px}
 .ad-h3-ab-tag{position:absolute;top:8px;max-width:40%;padding:1px 6px;border-radius:4px;background:#000a;color:#fff;font:9px system-ui;z-index:4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
 .ad-h3-ab-tag.on{background:#376496!important;border:1px solid #a6c9ff;color:#fff}
-.ad-h3-ab-videos{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:6px;background:#202c41;z-index:1}
+.ad-h3-ab-stage{position:relative;flex:1 1 auto;min-height:0;width:100%;overflow:hidden;background:#050505;z-index:1;touch-action:none;cursor:ew-resize}
+.ad-h3-ab-stage[hidden]{display:none!important}
+.ad-h3-ab-vpane{position:absolute;top:0;bottom:0;left:0;width:100%;overflow:hidden;background:#000;pointer-events:none}
+.ad-h3-ab-vpane video{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain!important;object-position:center center!important;background:#000;pointer-events:none!important}
+.ad-h3-ab-vdivider{position:absolute;top:0;bottom:0;left:50%;width:1px;z-index:3;background:rgba(255,255,255,.82);box-shadow:none;pointer-events:none;transform:translateX(-0.5px);will-change:left}
 .ad-h3-ab-audios{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px;background:#202c41;z-index:2;box-sizing:border-box}
 .ad-h3-ab-acell{display:flex;align-items:center;justify-content:center;background:#202d41;border:1px solid #3a4c65;border-radius:8px;padding:10px}
 .ad-h3-ab-acell audio{width:100%}
 .ad-h3-ab-mode{position:absolute;top:auto!important;left:auto!important;bottom:8px;right:76px;z-index:8;min-height:26px;height:26px;padding:0 10px;font-size:12px;border-radius:6px;background:#23354fe6!important;border:1px solid #98a6ba!important;color:#f0f6ff!important;cursor:pointer;transform:scale(.65)!important;transform-origin:right bottom}
-.ad-h3-ab-vcell{position:relative;background:#1b2b46;overflow:hidden;border:1px solid #3a4c65;border-radius:6px}
-.ad-h3-video.aiden-h3 .ad-h3-ab-vcell video{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain!important;object-position:center center!important;background:#000}
+.ad-h3-ab-bar{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:5px 8px;box-sizing:border-box;background:#191e25e6;border-top:1px solid rgba(255,255,255,.14);z-index:6;flex:0 0 auto;cursor:default}
+.ad-h3-ab-bar[hidden]{display:none!important}
+.ad-h3-ab-bar button{min-height:26px;height:26px;padding:0 8px;font-size:12px;border-radius:5px;border:1px solid #4a658a;background:#23354f;color:#e8f0fb;cursor:pointer;white-space:nowrap;flex:0 0 auto}
+.ad-h3-ab-bar button:hover{background:#324969}
+.ad-h3-ab-bar button:disabled{opacity:.45;cursor:default}
+.ad-h3-ab-bar button.on{background:#c76819;border-color:#e99143;color:#fff}
+.ad-h3-ab-bar input[type=range]{flex:1 1 150px;min-width:110px;height:22px;margin:0;accent-color:#4da3ff}
+.ad-h3-ab-track{display:flex;align-items:center;gap:8px;flex:1 1 220px;min-width:200px}
+.ad-h3-ab-bar [data-ab-time]{font-size:11px;color:#dfe9f6;white-space:nowrap;font-variant-numeric:tabular-nums;flex:0 0 auto;min-width:112px;text-align:right}
+.ad-h3-ab-menu{position:fixed;z-index:100000;display:flex;flex-direction:column;gap:3px;min-width:88px;padding:4px;box-sizing:border-box;border:1px solid rgba(255,255,255,.24);border-radius:5px;background:#191e25;box-shadow:0 5px 16px rgba(0,0,0,.45);pointer-events:auto}
+.ad-h3-ab-menu button{height:27px;padding:0 9px;font-size:12px;border:1px solid rgba(255,255,255,.15);border-radius:3px;background:#2a3038;color:#fff;cursor:pointer;white-space:nowrap;text-align:left}
+.ad-h3-ab-menu button:hover{background:#33405a}
+.ad-h3-ab-menu button.on{background:#c76819;border-color:#e99143;color:#fff}
 .ad-h3-video.aiden-h3 .ad-h3-ab-layer img{width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain!important;object-position:center center!important}
-.ad-h3-ab-controls{position:absolute;left:0;right:0;bottom:0;height:44px;display:flex;align-items:center;gap:6px;padding:6px 100px 6px 8px;background:#202d41e6;border-top:1px solid #3a4c65;z-index:3;box-sizing:border-box}
-.ad-h3-ab-controls input[type=range]{flex:1;min-width:80px}
-.ad-h3-ab-controls button{min-height:26px;height:26px;font-size:12px;padding:0 8px}
-.ad-h3-ab-controls [data-ab-time]{font-size:11px;color:#dfe9f6;white-space:nowrap}
-.ad-h3-ab-controls [data-ab-audio]{font-weight:700}
-.ad-h3-ab-controls [data-ab-audio].on{background:#376496!important;border-color:#a6c9ff!important;color:#f0f7ff!important}
+
 .ad-glass .h3-load-row{flex-wrap:nowrap!important;align-items:center!important;gap:6px!important;overflow-x:auto!important;overflow-y:hidden!important}
 .ad-glass .h3-load-row>button{flex:0 0 auto}
 .ad-glass .h3-folder-btn{background:#3B7DC4!important;border:1px solid #5b8cc5!important;color:#fff!important;font-weight:600!important}
